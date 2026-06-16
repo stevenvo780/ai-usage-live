@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ai-usage-live"
+CONFIG_FILE="$CONFIG_DIR/quotas.json"
+
+init_config() {
+  mkdir -p "$CONFIG_DIR"
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    umask 077
+    cat > "$CONFIG_FILE" <<'JSON'
+{
+  "version": 1,
+  "notes": [
+    "Put your real plan limits here. Leave null when the provider does not expose a stable local limit.",
+    "Token limits are local-dashboard limits, not official billing unless you copy them from the provider UI."
+  ],
+  "claude": {
+    "liveUsage": true,
+    "liveUsageCacheSeconds": 60,
+    "fiveHourTokens": null,
+    "weeklyTokens": null
+  },
+  "codex": {
+    "useDetectedRateLimits": true,
+    "dailyTokens": null
+  },
+  "gemini": {
+    "liveCapture": true,
+    "liveCaptureCacheMinutes": 15,
+    "dailyTokens": null,
+    "dailyRequests": null
+  },
+  "antigravity": {
+    "monthlyCredits": null,
+    "usedCredits": null,
+    "resetsAt": null
+  }
+}
+JSON
+  fi
+  node - "$CONFIG_FILE" <<'NODE' >/dev/null 2>&1 || true
+const fs = require("fs");
+const file = process.argv[2];
+const defaults = {
+  version: 1,
+  notes: [
+    "Put your real plan limits here. Leave null when the provider does not expose a stable local limit.",
+    "Token limits are local-dashboard limits, not official billing unless you copy them from the provider UI."
+  ],
+  claude: {
+    liveUsage: true,
+    liveUsageCacheSeconds: 60,
+    fiveHourTokens: null,
+    weeklyTokens: null
+  },
+  codex: {
+    useDetectedRateLimits: true,
+    dailyTokens: null
+  },
+  gemini: {
+    liveCapture: true,
+    liveCaptureCacheMinutes: 15,
+    dailyTokens: null,
+    dailyRequests: null
+  },
+  antigravity: {
+    monthlyCredits: null,
+    usedCredits: null,
+    resetsAt: null
+  }
+};
+function merge(base, override) {
+  const output = Array.isArray(base) ? [...base] : { ...base };
+  for (const [key, value] of Object.entries(override || {})) {
+    if (
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      base[key] &&
+      typeof base[key] === "object" &&
+      !Array.isArray(base[key])
+    ) {
+      output[key] = merge(base[key], value);
+    } else {
+      output[key] = value;
+    }
+  }
+  return output;
+}
+const current = JSON.parse(fs.readFileSync(file, "utf8"));
+const merged = merge(defaults, current);
+if (JSON.stringify(current) !== JSON.stringify(merged)) {
+  fs.writeFileSync(file, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+}
+NODE
+}
+
+case "${1:-show}" in
+  path)
+    init_config
+    printf '%s\n' "$CONFIG_FILE"
+    ;;
+  show)
+    init_config
+    cat "$CONFIG_FILE"
+    ;;
+  edit)
+    init_config
+    "${EDITOR:-nano}" "$CONFIG_FILE"
+    ;;
+  init)
+    init_config
+    printf 'Config listo: %s\n' "$CONFIG_FILE"
+    ;;
+  *)
+    cat <<EOF
+Uso:
+  ai-usage-quota show
+  ai-usage-quota edit
+  ai-usage-quota path
+  ai-usage-quota init
+
+Config: $CONFIG_FILE
+EOF
+    exit 2
+    ;;
+esac
