@@ -41,6 +41,7 @@ const SOURCE_META = {
 const ALL_SOURCES = ["claude", "codex", "gemini"];
 const SOURCE_KEYS = ["all", "claude", "codex", "gemini", "antigravity"];
 const VIEW_KEYS = ["daily", "weekly", "monthly", "session", "blocks"];
+const TAB_KEYS = ["cuotas", "consumo"];
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_DIR = path.join(homedir(), ".config", "ai-usage-live");
 const QUOTA_CONFIG_PATH = path.join(CONFIG_DIR, "quotas.json");
@@ -49,6 +50,7 @@ const GEMINI_QUOTA_CACHE_PATH = path.join(CONFIG_DIR, "gemini-quota-cache.json")
 
 const args = parseArgs(process.argv.slice(2));
 const state = {
+  tab: args.tab ?? "cuotas",
   view: args.view ?? "daily",
   source: args.source ?? "all",
   since: args.since ?? today(),
@@ -505,38 +507,49 @@ function buildCodexQuota(usage, config = {}) {
   const manual = buildTokenQuota("codex", usage, config.dailyTokens, "dia");
   if (!detected) return manual;
 
+  const entries = Array.isArray(detected) ? detected : [detected];
   const windows = [];
-  for (const [name, label] of [
-    ["primary", "5h"],
-    ["secondary", "semana"],
-  ]) {
-    const item = detected[name];
-    if (!item || typeof item.used_percent !== "number") continue;
-    windows.push({
-      label,
-      usedPercent: item.used_percent,
-      remainingPercent: Math.max(0, 100 - item.used_percent),
-      reset: item.resets_at ? new Date(item.resets_at * 1000) : null,
-      windowMinutes: item.window_minutes,
-    });
+  const creditsList = [];
+
+  for (const entry of entries) {
+    const limitId = entry.limit_id || "codex";
+    const planType = entry.plan_type || limitId;
+
+    for (const [name, defaultLabel] of [
+      ["primary", "5h"],
+      ["secondary", "semana"],
+    ]) {
+      const item = entry[name];
+      if (!item || typeof item.used_percent !== "number") continue;
+      const label = limitId === "premium" ? `mini-${defaultLabel}` : defaultLabel;
+      windows.push({
+        label,
+        limitId,
+        usedPercent: item.used_percent,
+        remainingPercent: Math.max(0, 100 - item.used_percent),
+        reset: item.resets_at ? new Date(item.resets_at * 1000) : null,
+        windowMinutes: item.window_minutes,
+      });
+    }
+
+    const credits = entry.credits;
+    if (credits && typeof credits.has_credits === "boolean") {
+      creditsList.push({ limitId, planType, ...credits });
+    }
   }
 
-  const credits = detected.credits || null;
-  const hasCredits = credits && typeof credits.has_credits === "boolean";
-
-  if (!windows.length && hasCredits) {
+  if (!windows.length && creditsList.length) {
     return {
       source: "codex",
       kind: "detected-credits",
       ok: true,
-      plan: detected.plan_type || detected.limit_id || "",
-      credits,
+      plan: entries[0]?.plan_type || entries[0]?.limit_id || "",
+      creditsList,
       manual,
-      note: credits.unlimited
-        ? "Codex: creditos ilimitados."
-        : credits.has_credits
-          ? `Codex: creditos disponibles (balance: ${credits.balance}).`
-          : `Codex: sin creditos disponibles (plan: ${detected.plan_type || detected.limit_id || "desconocido"}).`,
+      note: creditsList.map((c) => {
+        const name = c.limitId === "premium" ? "mini" : c.limitId;
+        return c.unlimited ? `${name}: ilimitado` : c.has_credits ? `${name}: balance ${c.balance}` : `${name}: sin creditos`;
+      }).join(" | "),
     };
   }
 
@@ -544,8 +557,9 @@ function buildCodexQuota(usage, config = {}) {
     source: "codex",
     kind: "detected-percent",
     ok: true,
-    plan: detected.plan_type || "",
+    plan: entries[0]?.plan_type || "",
     windows,
+    creditsList,
     manual,
     note: windows.length ? "Rate limit detectado desde sesiones Codex." : "Codex sin rate_limits recientes.",
   };
@@ -684,8 +698,8 @@ function collectCodexRateLimits() {
   });
   files.sort((a, b) => (safeStat(b)?.mtimeMs || 0) - (safeStat(a)?.mtimeMs || 0));
 
-  let bestWithWindows = null;
-  let bestAny = null;
+  // Collect best entry per limit_id
+  const bestByLimitId = new Map();
 
   for (const file of files.slice(0, 250)) {
     const lines = tailLines(file, 1500);
@@ -695,26 +709,32 @@ function collectCodexRateLimits() {
         const rateLimits = item.payload?.rate_limits;
         if (!rateLimits) continue;
 
+        const limitId = rateLimits.limit_id || "codex";
         const entry = { ...rateLimits, detectedAt: item.timestamp, file };
-
-        // Prefer entries with actual primary/secondary window data
         const hasPrimary = rateLimits.primary && typeof rateLimits.primary.used_percent === "number";
-        if (hasPrimary && !bestWithWindows) {
-          bestWithWindows = entry;
-        }
-        // Keep any rate_limits as fallback (may have credits info)
-        if (!bestAny) {
-          bestAny = entry;
-        }
 
-        if (bestWithWindows) return bestWithWindows;
+        if (!bestByLimitId.has(limitId)) {
+          bestByLimitId.set(limitId, { best: null, any: entry });
+        }
+        const bucket = bestByLimitId.get(limitId);
+        if (hasPrimary && !bucket.best) {
+          bucket.best = entry;
+        }
       } catch {
         // Ignore non-JSON or partial lines.
       }
     }
+    // Stop early if we have good data for all known limit_ids
+    if (bestByLimitId.size >= 2) {
+      const allHaveBest = [...bestByLimitId.values()].every((b) => b.best);
+      if (allHaveBest) break;
+    }
   }
 
-  return bestWithWindows || bestAny;
+  if (!bestByLimitId.size) return null;
+
+  const results = [...bestByLimitId.values()].map((b) => b.best || b.any);
+  return results.length === 1 ? results[0] : results;
 }
 
 async function collectClaudeUsageLive(config = {}) {
@@ -985,6 +1005,7 @@ function onKey(buffer) {
   const key = buffer.toString("utf8");
   if (key === "\u0003" || key === "q") exit(0);
   else if (key === "r") refresh();
+  else if (key === "\t" || key === "t") toggleTab();
   else if (key === "1") setView("daily");
   else if (key === "2") setView("weekly");
   else if (key === "3") setView("monthly");
@@ -997,6 +1018,12 @@ function onKey(buffer) {
   else if (key === "v") setSource("antigravity");
   else if (key === "\x1b[A") moveModel(-1);
   else if (key === "\x1b[B") moveModel(1);
+}
+
+function toggleTab() {
+  const idx = TAB_KEYS.indexOf(state.tab);
+  state.tab = TAB_KEYS[(idx + 1) % TAB_KEYS.length];
+  render();
 }
 
 function setView(view) {
@@ -1033,7 +1060,7 @@ function draw(width, height) {
   lines.push(padLine(title, width));
   lines.push(
     padLine(
-      `${tabBar(VIEW_KEYS, state.view)}   ${tabBar(SOURCE_KEYS, state.source)}   ${colors.gray}since ${state.since}${state.until ? ` until ${state.until}` : ""} | refresh ${state.refreshSec}s | ${state.loading ? "loading" : `updated ${timeOnly(snap?.refreshedAt)}`}${RESET}`,
+      `${tabBar(TAB_KEYS, state.tab, true)}   ${state.tab === "consumo" ? `${tabBar(VIEW_KEYS, state.view)} ${tabBar(SOURCE_KEYS, state.source)}   ` : ""}${colors.gray}since ${state.since}${state.until ? ` until ${state.until}` : ""} | refresh ${state.refreshSec}s | ${state.loading ? "loading" : `updated ${timeOnly(snap?.refreshedAt)}`}${RESET}`,
       width,
     ),
   );
@@ -1044,19 +1071,10 @@ function draw(width, height) {
     return lines;
   }
 
-  const visible = visibleSources();
-  const total = state.source === "all" ? snap.sources.all?.totals : visible[0]?.totals;
-  lines.push(...summaryCards(width, total, snap));
-  lines.push(hr(width));
-  lines.push(...quotaCards(width, snap));
-  lines.push(hr(width));
-  lines.push(...sourceCards(width, snap));
-  lines.push(hr(width));
-
-  if (state.source === "antigravity") {
-    lines.push(...antigravityPanel(width, snap.sources.antigravity));
+  if (state.tab === "cuotas") {
+    lines.push(...drawQuotaTab(width, height - lines.length - 3, snap));
   } else {
-    lines.push(...modelPanel(width, height - lines.length - 5));
+    lines.push(...drawConsumoTab(width, height - lines.length - 3, snap));
   }
 
   if (state.error) {
@@ -1065,13 +1083,156 @@ function draw(width, height) {
 
   while (lines.length < height - 2) lines.push("");
   lines.push(hr(width));
-  lines.push(
-    fit(
-      `${colors.gray}q salir | r refrescar | 1 daily 2 weekly 3 monthly 4 session 5 blocks | a all c claude x codex g gemini v antigravity | flechas modelos${RESET}`,
-      width,
-    ),
-  );
+  const helpText = state.tab === "cuotas"
+    ? `${colors.gray}q salir | r refrescar | Tab cambiar pestaña${RESET}`
+    : `${colors.gray}q salir | r refrescar | Tab pestaña | 1-5 vista | a/c/x/g/v fuente | flechas modelos${RESET}`;
+  lines.push(fit(helpText, width));
   return lines.slice(0, height);
+}
+
+function drawQuotaTab(width, maxHeight, snap) {
+  const lines = [];
+  const quotas = snap.quotas || {};
+  const halfWidth = Math.max(30, Math.floor((width - 4) / 2));
+
+  // Claude quota
+  lines.push(...quotaSection("Claude", colors.magenta, quotas.claude, halfWidth, width));
+  lines.push("");
+
+  // Codex quota
+  lines.push(...quotaSection("Codex", colors.green, quotas.codex, halfWidth, width));
+  lines.push("");
+
+  // Gemini quota
+  lines.push(...quotaSection("Gemini", colors.blue, quotas.gemini, halfWidth, width));
+  lines.push("");
+
+  // Antigravity quota
+  lines.push(...quotaSection("Antigravity", colors.yellow, quotas.antigravity, halfWidth, width));
+
+  return lines.slice(0, maxHeight);
+}
+
+function quotaSection(label, color, quota, barWidth, totalWidth) {
+  const lines = [];
+  const sectionBar = Math.max(10, barWidth - 2);
+  lines.push(`${color}${colors.bold}${label}${RESET}`);
+
+  if (!quota || quota.kind === "unknown") {
+    lines.push(fit(`  ${colors.gray}sin limite configurado — ejecuta ai-usage-quota edit${RESET}`, totalWidth));
+    return lines;
+  }
+
+  if (quota.kind === "detected-percent" && quota.windows?.length) {
+    for (const w of quota.windows) {
+      const pct = w.remainingPercent;
+      const label2 = (w.label || w.key || "").padEnd(12);
+      lines.push(fit(`  ${label2} ${bar(w.usedPercent, 100, sectionBar, quotaColor(pct))} ${fmtPct(pct)} queda  reset ${fmtReset(w.reset)}${w.resetText ? ` (${shortText(w.resetText, 30)})` : ""}`, totalWidth));
+    }
+    if (quota.creditsList?.length) {
+      for (const c of quota.creditsList) {
+        const name = c.limitId === "premium" ? "mini" : c.limitId;
+        const status = c.unlimited ? "ilimitado" : c.has_credits ? `balance: ${c.balance}` : "sin creditos";
+        lines.push(fit(`  ${name.padEnd(12)} ${colors.gray}${status}${RESET}`, totalWidth));
+      }
+    }
+    return lines;
+  }
+
+  if (quota.kind === "detected-credits" && quota.creditsList?.length) {
+    for (const c of quota.creditsList) {
+      const name = (c.limitId === "premium" ? "mini" : c.limitId).padEnd(12);
+      if (c.unlimited) {
+        lines.push(fit(`  ${name} ${bar(0, 100, sectionBar, colors.green)} ilimitado`, totalWidth));
+      } else if (c.has_credits) {
+        lines.push(fit(`  ${name} ${bar(30, 100, sectionBar, colors.green)} balance: ${c.balance}`, totalWidth));
+      } else {
+        lines.push(fit(`  ${name} ${bar(100, 100, sectionBar, colors.red)} sin creditos`, totalWidth));
+      }
+    }
+    return lines;
+  }
+
+  if (quota.activeBlock && quota.kind === "detected-percent" || (quota.windows?.length)) {
+    // Already handled above
+  }
+
+  if (quota.kind === "configured-tokens" && quota.limit) {
+    const pct = 100 - Number(quota.usedPercent || 0);
+    lines.push(fit(`  ${(quota.windowLabel || "periodo").padEnd(12)} ${bar(quota.used, quota.limit, sectionBar, quotaColor(pct))} ${fmtPct(pct)} queda (${fmtInt(quota.remaining)}/${fmtInt(quota.limit)})`, totalWidth));
+    return lines;
+  }
+
+  if (quota.kind === "configured-requests" && quota.limitRequests) {
+    lines.push(fit(`  ${'requests'.padEnd(12)} limite: ${fmtInt(quota.limitRequests)} req/dia`, totalWidth));
+    return lines;
+  }
+
+  if (quota.kind === "configured-credits" && quota.limit) {
+    const pct = 100 - Number(quota.usedPercent || 0);
+    lines.push(fit(`  ${'creditos'.padEnd(12)} ${bar(quota.used, quota.limit, sectionBar, quotaColor(pct))} ${fmtPct(pct)} queda (${fmtNumber(quota.remaining)}/${fmtNumber(quota.limit)})`, totalWidth));
+    if (quota.resetsAt) lines.push(fit(`  reset: ${quota.resetsAt}`, totalWidth));
+    return lines;
+  }
+
+  // Claude with live windows
+  if (quota.windows?.length) {
+    for (const w of quota.windows) {
+      const pct = w.remainingPercent;
+      const label2 = (w.label || w.rawLabel || w.key || "").padEnd(12);
+      lines.push(fit(`  ${label2} ${bar(w.usedPercent, 100, sectionBar, quotaColor(pct))} ${fmtPct(pct)} queda  ${w.resetText ? shortText(w.resetText, 35) : `reset ${fmtReset(w.reset)}`}`, totalWidth));
+    }
+    return lines;
+  }
+
+  // Gemini detected-requests
+  if (quota.kind === "detected-requests") {
+    const pct = quota.remainingPercent ?? 0;
+    const reqLabel = quota.remainingRequests != null && quota.limitRequests
+      ? `${fmtInt(quota.remainingRequests)}/${fmtInt(quota.limitRequests)} req`
+      : `${fmtPct(pct)} queda`;
+    lines.push(fit(`  ${'global'.padEnd(12)} ${bar(quota.usedPercent, 100, sectionBar, quotaColor(pct))} ${reqLabel}  ${quota.resetText ? shortText(quota.resetText, 20) : ""}`, totalWidth));
+    if (quota.modelQuotas?.length) {
+      for (const mq of quota.modelQuotas) {
+        const mpct = mq.remainingPercent;
+        lines.push(fit(`  ${shortText(mq.model, 12).padEnd(12)} ${bar(mq.usedPercent, 100, sectionBar, quotaColor(mpct))} ${fmtPct(mpct)} queda  ${mq.resetText ? shortText(mq.resetText, 20) : ""}`, totalWidth));
+      }
+    }
+    return lines;
+  }
+
+  // Claude active block fallback
+  if (quota.activeBlock) {
+    if (quota.limit) {
+      const pct = 100 - Number(quota.usedPercent || 0);
+      lines.push(fit(`  ${'bloque'.padEnd(12)} ${bar(quota.used, quota.limit, sectionBar, quotaColor(pct))} ${fmtPct(pct)} queda  reset ${fmtReset(quota.activeBlock.end)}`, totalWidth));
+    } else {
+      lines.push(fit(`  ${'bloque'.padEnd(12)} ${fmtInt(quota.activeBlock.used)} usados  reset ${fmtReset(quota.activeBlock.end)}`, totalWidth));
+      lines.push(fit(`  ${colors.gray}configura fiveHourTokens en quotas.json para barra${RESET}`, totalWidth));
+    }
+    return lines;
+  }
+
+  lines.push(fit(`  ${quota.note || "sin datos"}`, totalWidth));
+  return lines;
+}
+
+function drawConsumoTab(width, maxHeight, snap) {
+  const lines = [];
+  const visible = visibleSources();
+  const total = state.source === "all" ? snap.sources.all?.totals : visible[0]?.totals;
+  lines.push(...summaryCards(width, total, snap));
+  lines.push(hr(width));
+  lines.push(...sourceCards(width, snap));
+  lines.push(hr(width));
+
+  if (state.source === "antigravity") {
+    lines.push(...antigravityPanel(width, snap.sources.antigravity));
+  } else {
+    lines.push(...modelPanel(width, maxHeight - lines.length - 2));
+  }
+
+  return lines.slice(0, maxHeight);
 }
 
 function summaryCards(width, total, snap) {
@@ -1125,15 +1286,8 @@ function sourceCards(width, snap) {
 }
 
 function quotaCards(width, snap) {
-  const cardWidth = Math.max(18, Math.floor((width - 6) / 4));
-  const quotas = snap.quotas || {};
-  const cards = [
-    boxed("Claude quota", quotaBody("claude", quotas.claude, cardWidth), cardWidth, colors.magenta),
-    boxed("Codex quota", quotaBody("codex", quotas.codex, cardWidth), cardWidth, colors.green),
-    boxed("Gemini quota", quotaBody("gemini", quotas.gemini, cardWidth), cardWidth, colors.blue),
-    boxed("Antigravity quota", quotaBody("antigravity", quotas.antigravity, cardWidth), cardWidth, colors.yellow),
-  ];
-  return zipCards(cards, width);
+  // Now handled by drawQuotaTab — kept for plain text compatibility
+  return [];
 }
 
 function quotaBody(source, quota, width) {
@@ -1357,11 +1511,11 @@ function renderPlainSummary(snap) {
   return lines.join("\n");
 }
 
-function tabBar(items, active) {
+function tabBar(items, active, isTab = false) {
   return items
     .map((item) => {
-      const label = SOURCE_META[item]?.label || item;
-      if (item === active) return `${colors.inverse} ${label} ${RESET}`;
+      const label = SOURCE_META[item]?.label || item.charAt(0).toUpperCase() + item.slice(1);
+      if (item === active) return `${isTab ? colors.bold : ""}${colors.inverse} ${label} ${RESET}`;
       return `${colors.gray}${label}${RESET}`;
     })
     .join(" ");
