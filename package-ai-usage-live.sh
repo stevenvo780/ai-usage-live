@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="${VERSION:-0.5.0}"
+VERSION="${VERSION:-0.5.1}"
 PKG_NAME="ai-usage-live"
 BUILD_DIR="$ROOT/build/${PKG_NAME}_${VERSION}_all"
 DIST_DIR="$ROOT/dist"

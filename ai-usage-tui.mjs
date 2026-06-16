@@ -498,7 +498,6 @@ function buildQuotaState(sources, config) {
     codex: buildCodexQuota(sources.codex, config.codex),
     claude: buildClaudeQuota(sources.claude, sources.claudeBlocks, config.claude, sources.claudeLive),
     gemini: buildGeminiQuota(sources.gemini, config.gemini, sources.geminiLive),
-    antigravity: buildAntigravityQuota(sources.antigravity, config.antigravity),
   };
 }
 
@@ -582,18 +581,27 @@ function buildClaudeQuota(usage, blocksRaw, config = {}, live = null) {
       }
     : null;
 
-  if (live?.ok && Array.isArray(live.windows) && live.windows.length) {
-    return {
-      source: "claude",
-      kind: "detected-percent",
-      ok: true,
-      windows: live.windows,
-      activeBlock,
-      live,
-      note: live.cacheHit
-        ? "Claude /usage desde cache local."
-        : "Claude /usage detectado desde el CLI.",
-    };
+  if (live?.ok) {
+    if (Array.isArray(live.windows) && live.windows.length) {
+      return {
+        source: "claude",
+        kind: "detected-percent",
+        ok: true,
+        windows: live.windows,
+        activeBlock,
+        live,
+        note: live.cacheHit ? "Claude /usage desde cache local." : "Claude /usage detectado desde el CLI.",
+      };
+    } else if (live.plan === "subscription") {
+      return {
+        source: "claude",
+        kind: "subscription",
+        ok: true,
+        activeBlock,
+        live,
+        note: "Claude Code con suscripcion activa (sin limites reportados actualmente).",
+      };
+    }
   }
 
   return {
@@ -672,22 +680,7 @@ function buildTokenQuota(source, usage, limit, windowLabel) {
   };
 }
 
-function buildAntigravityQuota(activity, config = {}) {
-  const limit = Number(config.monthlyCredits || 0);
-  const used = Number(config.usedCredits || 0);
-  return {
-    source: "antigravity",
-    kind: limit ? "configured-credits" : "unknown",
-    ok: Boolean(limit && Number.isFinite(used)),
-    limit: limit || null,
-    used: Number.isFinite(used) ? used : null,
-    remaining: limit && Number.isFinite(used) ? Math.max(0, limit - used) : null,
-    usedPercent: limit && Number.isFinite(used) ? Math.min(999, (used / limit) * 100) : null,
-    resetsAt: config.resetsAt || null,
-    activity,
-    note: limit ? "Creditos Antigravity configurados manualmente." : "Antigravity no expone creditos locales estables.",
-  };
-}
+// removed buildAntigravityQuota as it lacks local api data
 
 function collectCodexRateLimits() {
   const root = path.join(homedir(), ".codex", "sessions");
@@ -766,11 +759,11 @@ async function collectClaudeUsageLive(config = {}) {
     const parsed = parseClaudeUsageOutput(resultText);
     const output = {
       source: "claude",
-      ok: parsed.windows.length > 0,
+      ok: parsed.windows.length > 0 || parsed.plan === "subscription",
       ...parsed,
       capturedAt: new Date().toISOString(),
       cacheHit: false,
-      note: parsed.windows.length ? "Claude /usage detectado." : "Claude /usage no devolvio barras de plan.",
+      note: parsed.windows.length ? "Claude /usage detectado." : parsed.plan === "subscription" ? "Claude suscripcion detectada." : "Claude /usage no devolvio datos.",
     };
     writeJsonCache(CLAUDE_USAGE_CACHE_PATH, output);
     return output;
@@ -1105,10 +1098,6 @@ function drawQuotaTab(width, maxHeight, snap) {
 
   // Gemini quota
   lines.push(...quotaSection("Gemini", colors.blue, quotas.gemini, halfWidth, width));
-  lines.push("");
-
-  // Antigravity quota
-  lines.push(...quotaSection("Antigravity", colors.yellow, quotas.antigravity, halfWidth, width));
 
   return lines.slice(0, maxHeight);
 }
@@ -1120,6 +1109,14 @@ function quotaSection(label, color, quota, barWidth, totalWidth) {
 
   if (!quota || quota.kind === "unknown") {
     lines.push(fit(`  ${colors.gray}sin limite configurado — ejecuta ai-usage-quota edit${RESET}`, totalWidth));
+    return lines;
+  }
+
+  if (quota.kind === "subscription") {
+    lines.push(fit(`  ${"Suscripcion".padEnd(12)} ${bar(0, 100, sectionBar, colors.green)} Pro / Ilimitado (sin limites activos detectados)`, totalWidth));
+    if (quota.activeBlock) {
+      lines.push(fit(`  ${'bloque act.'.padEnd(12)} ${fmtInt(quota.activeBlock.used)} usados  reset ${fmtReset(quota.activeBlock.end)}`, totalWidth));
+    }
     return lines;
   }
 
@@ -1489,6 +1486,8 @@ function renderPlainSummary(snap) {
         `Claude quota ${window.label}: used=${fmtPct(window.usedPercent)} remaining=${fmtPct(window.remainingPercent)}${window.resetText ? ` reset="${window.resetText}"` : ""}`,
       );
     }
+  } else if (snap.quotas?.claude?.kind === "subscription") {
+    lines.push(`Claude quota: subscription active (no limits detected)`);
   }
   if (snap.quotas?.claude?.activeBlock) {
     const q = snap.quotas.claude;
