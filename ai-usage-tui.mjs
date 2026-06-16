@@ -735,7 +735,7 @@ async function collectClaudeUsageLive(config = {}) {
     return { source: "claude", ok: false, disabled: true, note: "Claude /usage desactivado." };
   }
 
-  const cacheSeconds = Number(config.liveUsageCacheSeconds ?? 60);
+  const cacheSeconds = Number(config.liveUsageCacheSeconds ?? 300);
   const cached = readJsonCache(CLAUDE_USAGE_CACHE_PATH, Math.max(0, cacheSeconds) * 1000);
   if (cached) return { ...cached, cacheHit: true };
 
@@ -757,13 +757,29 @@ async function collectClaudeUsageLive(config = {}) {
       // Some older builds may print plain text.
     }
     const parsed = parseClaudeUsageOutput(resultText);
+    const stale = readJsonSafe(CLAUDE_USAGE_CACHE_PATH);
+
+    // If new fetch has no bars but old cache had them, assume Claude API is rate limiting
+    // and silently dropped the bars. We reuse the old cache to prevent the UI from glitching.
+    if (parsed.windows.length === 0 && stale?.windows?.length > 0) {
+      const fallback = {
+        ...stale,
+        capturedAt: new Date().toISOString(),
+        cacheHit: true,
+        cacheStale: true,
+        note: "Claude API en rate-limit (barras ocultas); mostrando ultimo dato conocido.",
+      };
+      writeJsonCache(CLAUDE_USAGE_CACHE_PATH, fallback);
+      return fallback;
+    }
+
     const output = {
       source: "claude",
       ok: parsed.windows.length > 0 || parsed.plan === "subscription",
       ...parsed,
       capturedAt: new Date().toISOString(),
       cacheHit: false,
-      note: parsed.windows.length ? "Claude /usage detectado." : parsed.plan === "subscription" ? "Claude suscripcion detectada." : "Claude /usage no devolvio datos.",
+      note: parsed.windows.length ? "Claude /usage detectado." : parsed.plan === "subscription" ? "Claude suscripcion detectada (sin limites activos)." : "Claude /usage no devolvio datos.",
     };
     writeJsonCache(CLAUDE_USAGE_CACHE_PATH, output);
     return output;
