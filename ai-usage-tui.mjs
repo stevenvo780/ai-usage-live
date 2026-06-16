@@ -521,6 +521,25 @@ function buildCodexQuota(usage, config = {}) {
     });
   }
 
+  const credits = detected.credits || null;
+  const hasCredits = credits && typeof credits.has_credits === "boolean";
+
+  if (!windows.length && hasCredits) {
+    return {
+      source: "codex",
+      kind: "detected-credits",
+      ok: true,
+      plan: detected.plan_type || detected.limit_id || "",
+      credits,
+      manual,
+      note: credits.unlimited
+        ? "Codex: creditos ilimitados."
+        : credits.has_credits
+          ? `Codex: creditos disponibles (balance: ${credits.balance}).`
+          : `Codex: sin creditos disponibles (plan: ${detected.plan_type || detected.limit_id || "desconocido"}).`,
+    };
+  }
+
   return {
     source: "codex",
     kind: "detected-percent",
@@ -665,19 +684,37 @@ function collectCodexRateLimits() {
   });
   files.sort((a, b) => (safeStat(b)?.mtimeMs || 0) - (safeStat(a)?.mtimeMs || 0));
 
+  let bestWithWindows = null;
+  let bestAny = null;
+
   for (const file of files.slice(0, 250)) {
     const lines = tailLines(file, 1500);
     for (let i = lines.length - 1; i >= 0; i -= 1) {
       try {
         const item = JSON.parse(lines[i]);
         const rateLimits = item.payload?.rate_limits;
-        if (rateLimits) return { ...rateLimits, detectedAt: item.timestamp, file };
+        if (!rateLimits) continue;
+
+        const entry = { ...rateLimits, detectedAt: item.timestamp, file };
+
+        // Prefer entries with actual primary/secondary window data
+        const hasPrimary = rateLimits.primary && typeof rateLimits.primary.used_percent === "number";
+        if (hasPrimary && !bestWithWindows) {
+          bestWithWindows = entry;
+        }
+        // Keep any rate_limits as fallback (may have credits info)
+        if (!bestAny) {
+          bestAny = entry;
+        }
+
+        if (bestWithWindows) return bestWithWindows;
       } catch {
         // Ignore non-JSON or partial lines.
       }
     }
   }
-  return null;
+
+  return bestWithWindows || bestAny;
 }
 
 async function collectClaudeUsageLive(config = {}) {
@@ -1112,6 +1149,12 @@ function quotaBody(source, quota, width) {
         : `reset ${fmtReset(primary.reset)}`,
     ];
   }
+  if (source === "codex" && quota.kind === "detected-credits") {
+    const c = quota.credits;
+    if (c.unlimited) return ["ilimitado", bar(0, 100, width - 4, colors.green), `plan: ${quota.plan || "premium"}`];
+    if (c.has_credits) return [`balance: ${c.balance}`, bar(30, 100, width - 4, colors.green), `plan: ${quota.plan || "premium"}`];
+    return ["sin creditos", bar(100, 100, width - 4, colors.red), `plan: ${quota.plan || "premium"}`];
+  }
   if (source === "claude" && quota.kind === "detected-percent" && quota.windows?.length) {
     const session = quota.windows.find((window) => window.key === "session") || quota.windows[0];
     const week = quota.windows.find((window) => window.key === "week_all");
@@ -1281,6 +1324,10 @@ function renderPlainSummary(snap) {
     const secondary = snap.quotas.codex.windows[1];
     lines.push(`Codex quota ${primary.label}: used=${fmtPct(primary.usedPercent)} remaining=${fmtPct(primary.remainingPercent)} reset=${fmtReset(primary.reset)}`);
     if (secondary) lines.push(`Codex quota ${secondary.label}: used=${fmtPct(secondary.usedPercent)} remaining=${fmtPct(secondary.remainingPercent)} reset=${fmtReset(secondary.reset)}`);
+  } else if (snap.quotas?.codex?.kind === "detected-credits") {
+    const c = snap.quotas.codex.credits;
+    const status = c.unlimited ? "unlimited" : c.has_credits ? `balance=${c.balance}` : "no_credits";
+    lines.push(`Codex quota credits: ${status} plan=${snap.quotas.codex.plan || "unknown"}`);
   }
   if (snap.quotas?.claude?.kind === "detected-percent") {
     for (const window of snap.quotas.claude.windows) {
