@@ -1327,12 +1327,26 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
 
     const rows = stdout.trim() ? JSON.parse(stdout) : [];
     const now = Date.now();
+    const nowDate = new Date();
     const HOUR = 3600000;
     const DAY = 86400000;
-    // Rolling windows (Go plan tracks last 5h / 7d / 30d, not calendar boundaries)
+
+    // 5h = rolling window (last 5h from now)
     const fiveHoursAgo = now - 5 * HOUR;
-    const sevenDaysAgo = now - 7 * DAY;
-    const thirtyDaysAgo = now - 30 * DAY;
+
+    // Week = calendar week (Monday 00:00 UTC → next Monday 00:00 UTC)
+    // Matches opencode.ai console's getWeekBounds(): offset = (day + 6) % 7
+    const weekStart = new Date(nowDate);
+    const weekOffset = (nowDate.getUTCDay() + 6) % 7;
+    weekStart.setUTCDate(nowDate.getUTCDate() - weekOffset);
+    weekStart.setUTCHours(0, 0, 0, 0);
+    const weekStartMs = weekStart.getTime();
+
+    // Month = calendar month (1st 00:00 UTC → next 1st 00:00 UTC)
+    // We don't have timeSubscribed locally, so we use the 1st of the month.
+    // The server uses subscription date for the monthly window, but locally
+    // we approximate to "this calendar month" which is close enough.
+    const monthStartMs = Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth(), 1);
 
     let cost5h = 0, costWeek = 0, costMonth = 0, totalCost = 0;
     let totalTokens = 0, totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0;
@@ -1348,13 +1362,21 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
       totalCacheWrite += Number(row.tokens_cache_write || 0);
 
       if (ts >= fiveHoursAgo) cost5h += cost;
-      if (ts >= sevenDaysAgo) costWeek += cost;
-      if (ts >= thirtyDaysAgo) costMonth += cost;
+      if (ts >= weekStartMs) costWeek += cost;
+      if (ts >= monthStartMs) costMonth += cost;
     }
 
     const fiveHourCost = Number(configEntry.fiveHourCost || 12);
     const weeklyCost = Number(configEntry.weeklyCost || 30);
     const monthlyCost = Number(configEntry.monthlyCost || 60);
+
+    // Reset times match opencode.ai console:
+    // - 5h: rolling, no fixed reset (next "rolling end" = now + 5h if no usage, or timeUpdated + 5h)
+    // - Week: next Monday 00:00 UTC
+    // - Month: 1st of next month 00:00 UTC
+    const nextWeek = new Date(weekStartMs);
+    nextWeek.setUTCDate(weekStart.getUTCDate() + 7);
+    const nextMonth = Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth() + 1, 1);
 
     const output = {
       source: "opencode",
@@ -1371,18 +1393,18 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
         totalCacheWrite: totalCacheWrite,
         sessionCount: rows.length,
         reset5h: new Date(now + 5 * HOUR).toISOString(),
-        resetWeek: new Date(now + 7 * DAY).toISOString(),
-        resetMonth: new Date(now + 30 * DAY).toISOString(),
+        resetWeek: nextWeek.toISOString(),
+        resetMonth: new Date(nextMonth).toISOString(),
       },
       limits: {
         fiveHourCost: fiveHourCost || null,
         weeklyCost: weeklyCost || null,
         monthlyCost: monthlyCost || null,
-        note: !fiveHourCost ? "Los limites por defecto son $12/5h, $30/sem, $60/mes. Configuralos en quotas.json." : "",
+        note: "Estimado local (opencode.db). Valores reales del servidor: opencode.ai/auth (pueden diferir).",
       },
       capturedAt: new Date().toISOString(),
       cacheHit: false,
-      note: "OpenCode Go DB local.",
+      note: "Estimado local (opencode.db). Para valores exactos ve a opencode.ai/auth.",
     };
     writeJsonCache(OPENCODE_USAGE_CACHE_PATH, output);
     return output;
