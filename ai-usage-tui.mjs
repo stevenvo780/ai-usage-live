@@ -36,17 +36,23 @@ const SOURCE_META = {
   codex: { label: "Codex", color: colors.green },
   gemini: { label: "Gemini", color: colors.blue },
   antigravity: { label: "Antigravity", color: colors.yellow },
+  minimax: { label: "MiniMax", color: colors.cyan },
+  opencode: { label: "OpenCode", color: colors.green },
 };
 
-const ALL_SOURCES = ["claude", "codex", "gemini"];
-const SOURCE_KEYS = ["all", "claude", "codex", "gemini", "antigravity"];
+const ALL_SOURCES = ["claude", "codex", "gemini", "opencode"];
+const SOURCE_KEYS = ["all", "claude", "codex", "gemini", "antigravity", "minimax", "opencode"];
 const VIEW_KEYS = ["daily", "weekly", "monthly", "session", "blocks"];
 const TAB_KEYS = ["cuotas", "consumo"];
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_DIR = path.join(homedir(), ".config", "ai-usage-live");
+const CONFIG_BASE_DIR = process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config");
+const CONFIG_DIR = path.join(CONFIG_BASE_DIR, "ai-usage-live");
 const QUOTA_CONFIG_PATH = path.join(CONFIG_DIR, "quotas.json");
 const CLAUDE_USAGE_CACHE_PATH = path.join(CONFIG_DIR, "claude-usage-cache.json");
 const GEMINI_QUOTA_CACHE_PATH = path.join(CONFIG_DIR, "gemini-quota-cache.json");
+const MINIMAX_USAGE_CACHE_PATH = path.join(CONFIG_DIR, "minimax-usage-cache.json");
+const OPENCODE_USAGE_CACHE_PATH = path.join(CONFIG_DIR, "opencode-usage-cache.json");
+const OPENCODE_DB_PATH = path.join(homedir(), ".local", "share", "opencode", "opencode.db");
 
 const args = parseArgs(process.argv.slice(2));
 const state = {
@@ -65,6 +71,7 @@ const state = {
 
 let ccusageCommand = null;
 let refreshTimer = null;
+let pendingRefresh = null;
 
 main().catch((error) => {
   cleanup();
@@ -74,9 +81,12 @@ main().catch((error) => {
 
 async function main() {
   ccusageCommand = detectCcusage();
-  state.lastSnapshot = await collectSnapshot();
+  const interactive = !state.once && process.stdin.isTTY && process.stdout.isTTY;
+  state.lastSnapshot = interactive
+    ? await collectSnapshot({ includeLive: false })
+    : await collectSnapshot({ includeLive: true, ignoreMiniMaxCache: true });
 
-  if (state.once || !process.stdin.isTTY || !process.stdout.isTTY) {
+  if (!interactive) {
     console.log(renderPlainSummary(state.lastSnapshot));
     return;
   }
@@ -90,6 +100,7 @@ async function main() {
   process.on("SIGTERM", () => exit(0));
 
   render();
+  refresh({ forceMiniMax: true });
   scheduleRefresh();
 }
 
@@ -125,7 +136,7 @@ Views:
   daily, weekly, monthly, session, blocks
 
 Sources:
-  all, claude, codex, gemini, antigravity
+  all, claude, codex, gemini, antigravity, minimax
 
 Opciones:
   --since YYYY-MM-DD
@@ -135,7 +146,7 @@ Opciones:
 
 Teclas:
   q salir, r refrescar, 1 daily, 2 weekly, 3 monthly, 4 session, 5 blocks
-  a todos, c Claude, x Codex, g Gemini, v Antigravity, flechas mover modelo
+  a todos, c Claude, x Codex, g Gemini, v Antigravity, m MiniMax, o OpenCode, flechas mover modelo
 `);
 }
 
@@ -163,30 +174,69 @@ async function scheduleRefresh() {
   }, state.refreshSec * 1000);
 }
 
-async function refresh() {
-  if (state.loading) return;
+function mergeRefreshOptions(current, next) {
+  return {
+    forceProviders: Boolean(current?.forceProviders || next?.forceProviders),
+    forceMiniMax: Boolean(current?.forceMiniMax || next?.forceMiniMax),
+  };
+}
+
+async function refresh(options = {}) {
+  if (state.loading) {
+    pendingRefresh = mergeRefreshOptions(pendingRefresh, options);
+    return;
+  }
   state.loading = true;
   render();
   try {
-    state.lastSnapshot = await collectSnapshot();
+    state.lastSnapshot = await collectSnapshot({
+      ignoreLiveCache: Boolean(options.forceProviders),
+      ignoreMiniMaxCache: Boolean(options.forceProviders || options.forceMiniMax),
+    });
     state.error = "";
   } catch (error) {
     state.error = error?.message || String(error);
   } finally {
     state.loading = false;
     render();
+    if (pendingRefresh) {
+      const nextRefresh = pendingRefresh;
+      pendingRefresh = null;
+      await refresh(nextRefresh);
+    }
   }
 }
 
-async function collectSnapshot() {
+async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ignoreMiniMaxCache = false } = {}) {
   const startedAt = new Date();
   const sources = {};
   const view = state.view;
   const quotaConfig = loadQuotaConfig();
-  const liveQuotaPromise = Promise.allSettled([
-    collectClaudeUsageLive(quotaConfig.claude),
-    collectGeminiQuotaLive(quotaConfig.gemini),
-  ]);
+  const liveQuotaPromise = includeLive
+    ? Promise.allSettled([
+        collectClaudeUsageLive(quotaConfig.claude, { ignoreCache: ignoreLiveCache }),
+        collectGeminiQuotaLive(quotaConfig.gemini, { ignoreCache: ignoreLiveCache }),
+      ])
+    : Promise.resolve([
+        {
+          status: "fulfilled",
+          value: staleLiveQuota(
+            "claude",
+            CLAUDE_USAGE_CACHE_PATH,
+            "Claude /usage se esta capturando; mostrando ultimo dato conocido.",
+            "Claude /usage se esta capturando en segundo plano.",
+          ),
+        },
+        {
+          status: "fulfilled",
+          value: staleLiveQuota(
+            "gemini",
+            GEMINI_QUOTA_CACHE_PATH,
+            "Gemini /stats model se esta capturando; mostrando ultimo dato conocido.",
+            "Gemini /stats model se esta capturando en segundo plano.",
+          ),
+        },
+      ]);
 
   const ccusageJobs = [];
   ccusageJobs.push(["all", ccusageJson([], view)]);
@@ -210,6 +260,14 @@ async function collectSnapshot() {
 
   fillFocusedModelGaps(sources);
   sources.antigravity = collectAntigravity();
+  sources.minimax = includeLive
+    ? await collectMiniMaxUsage(quotaConfig, { ignoreCache: ignoreMiniMaxCache })
+    : staleMiniMaxUsage("MiniMax se esta capturando; mostrando ultimo dato conocido.")
+      || { source: "minimax", ok: false, note: "MiniMax se esta capturando en segundo plano." };
+  sources.opencodeLive = includeLive
+    ? await collectOpenCodeUsage(quotaConfig, { ignoreCache: ignoreLiveCache || ignoreMiniMaxCache })
+    : staleOpenCodeUsage("OpenCode Go se esta capturando; mostrando ultimo dato conocido.")
+      || { source: "opencode", ok: false, note: "OpenCode Go se esta capturando en segundo plano." };
   const liveQuotaSettled = await liveQuotaPromise;
   sources.claudeLive = liveQuotaSettled[0].status === "fulfilled" ? liveQuotaSettled[0].value : { ok: false };
   sources.geminiLive = liveQuotaSettled[1].status === "fulfilled" ? liveQuotaSettled[1].value : { ok: false };
@@ -228,9 +286,24 @@ async function collectSnapshot() {
   };
 }
 
+function staleLiveQuota(source, cachePath, cacheNote, emptyNote) {
+  const cached = readJsonSafe(cachePath);
+  if (cached?.ok) {
+    return {
+      ...cached,
+      source,
+      cacheHit: true,
+      cacheStale: true,
+      note: cacheNote,
+    };
+  }
+  return { source, ok: false, note: emptyNote };
+}
+
 function sourceSupportsView(source, view) {
   if (source === "claude") return true;
   if (source === "codex" || source === "gemini") return ["daily", "monthly", "session"].includes(view);
+  if (source === "opencode") return ["daily", "weekly", "monthly", "session"].includes(view);
   return true;
 }
 
@@ -443,7 +516,7 @@ function defaultQuotaConfig() {
     ],
     claude: {
       liveUsage: true,
-      liveUsageCacheSeconds: 60,
+      liveUsageCacheSeconds: 300,
       fiveHourTokens: null,
       weeklyTokens: null,
     },
@@ -461,6 +534,19 @@ function defaultQuotaConfig() {
       monthlyCredits: null,
       usedCredits: null,
       resetsAt: null,
+    },
+    minimax: {
+      liveCaptureCacheMinutes: 0,
+      monthlyCredits: null,
+      resetsAt: null,
+      apiKey: null,
+    },
+    opencode: {
+      liveCaptureCacheMinutes: 5,
+      fiveHourCost: 12,
+      weeklyCost: 30,
+      monthlyCost: 60,
+      apiKey: null,
     },
   };
 }
@@ -498,6 +584,8 @@ function buildQuotaState(sources, config) {
     codex: buildCodexQuota(sources.codex, config.codex),
     claude: buildClaudeQuota(sources.claude, sources.claudeBlocks, config.claude, sources.claudeLive),
     gemini: buildGeminiQuota(sources.gemini, config.gemini, sources.geminiLive),
+    minimax: buildMiniMaxQuota(sources.minimax, config.minimax),
+    opencode: buildOpenCodeQuota(sources.opencodeLive, config.opencode),
   };
 }
 
@@ -581,27 +669,20 @@ function buildClaudeQuota(usage, blocksRaw, config = {}, live = null) {
       }
     : null;
 
-  if (live?.ok) {
-    if (Array.isArray(live.windows) && live.windows.length) {
-      return {
-        source: "claude",
-        kind: "detected-percent",
-        ok: true,
-        windows: live.windows,
-        activeBlock,
-        live,
-        note: live.cacheHit ? "Claude /usage desde cache local." : "Claude /usage detectado desde el CLI.",
-      };
-    } else if (live.plan === "subscription") {
-      return {
-        source: "claude",
-        kind: "subscription",
-        ok: true,
-        activeBlock,
-        live,
-        note: "Claude Code con suscripcion activa (sin limites reportados actualmente).",
-      };
-    }
+  if (live?.ok && Array.isArray(live.windows) && live.windows.length) {
+    return {
+      source: "claude",
+      kind: "detected-percent",
+      ok: true,
+      windows: live.windows,
+      activeBlock,
+      live,
+      note: live.cacheHit
+        ? live.cacheStale
+          ? "Claude /usage (ultimo dato conocido)."
+          : "Claude /usage desde cache local."
+        : "Claude /usage detectado desde el CLI.",
+    };
   }
 
   return {
@@ -640,6 +721,7 @@ function buildGeminiQuota(usage, config = {}, live = null) {
       limitRequests,
       remainingRequests,
       resetText: live.resetText || "",
+      resetAt: live.resetAt ? new Date(live.resetAt) : null,
       tier: live.tier || "",
       modelQuotas: Array.isArray(live.modelQuotas) ? live.modelQuotas : [],
       live,
@@ -680,7 +762,178 @@ function buildTokenQuota(source, usage, limit, windowLabel) {
   };
 }
 
+function buildMiniMaxQuota(usage, config = {}) {
+  if (!usage) {
+    return { source: "minimax", kind: "unknown", ok: false, note: "Sin datos." };
+  }
+  if (usage.ok === false) {
+    return { source: "minimax", kind: "unknown", ok: false, note: usage.note || "MiniMax no configurado." };
+  }
+
+  const data = usage.data || usage;
+
+  // Format 1: model_remains array (Coding Plan API) — per-model 5h + weekly windows
+  if (Array.isArray(data.model_remains) && data.model_remains.length) {
+    const windows = [];
+    for (const m of data.model_remains) {
+      const modelName = m.model_name || "model";
+      const intervalPct = Number(m.current_interval_remaining_percent);
+      const weeklyPct = Number(m.current_weekly_remaining_percent);
+      if (Number.isFinite(intervalPct)) {
+        windows.push({
+          key: `interval_${modelName}`,
+          label: `${modelName} 5h`,
+          usedPercent: Math.max(0, Math.min(100, 100 - intervalPct)),
+          remainingPercent: Math.max(0, Math.min(100, intervalPct)),
+          reset: Number.isFinite(Number(m.end_time)) ? new Date(Number(m.end_time)) : null,
+        });
+      }
+      if (Number.isFinite(weeklyPct)) {
+        windows.push({
+          key: `weekly_${modelName}`,
+          label: `${modelName} sem`,
+          usedPercent: Math.max(0, Math.min(100, 100 - weeklyPct)),
+          remainingPercent: Math.max(0, Math.min(100, weeklyPct)),
+          reset: Number.isFinite(Number(m.weekly_end_time)) ? new Date(Number(m.weekly_end_time)) : null,
+        });
+      }
+    }
+    if (windows.length) {
+      return {
+        source: "minimax",
+        kind: "detected-percent",
+        ok: true,
+        windows,
+        raw: usage.raw || null,
+        note: usage.note || (usage.cacheHit ? "MiniMax desde cache local." : "MiniMax Coding Plan."),
+      };
+    }
+  }
+
+  // Format 2: flat object (limit + used/remaining)
+  const limit = numberFromAny(data, ["limit", "quota", "total", "monthlyCredits", "credit_limit", "creditLimit", "current_package_count", "packageCount", "totalQuota"])
+    || (config.monthlyCredits ? Number(config.monthlyCredits) : 0);
+  const remaining = numberFromAny(data, ["remaining", "remainingCredits", "remaining_credits", "balance", "credits_left", "remains", "current_balance"]);
+  const used = numberFromAny(data, ["used", "usedCredits", "total_usage", "totalUsage", "usage", "consumed", "usedQuota"])
+    ?? (limit > 0 && remaining != null ? Math.max(0, limit - remaining) : null);
+  const resetAtRaw = data.resetAt || data.reset_at || data.resetsAt || data.resets_at || data.cycle_end_time || data.cycleEndTime || data.next_reset_time || config.resetsAt || null;
+  const resetAt = resetAtRaw ? new Date(resetAtRaw) : null;
+  const resetText = data.resetText || data.reset_text || data.resetIn || data.reset_in || data.next_reset_text || "";
+  const usedPercent = numberFromAny(data, ["usedPercent", "used_percent", "usedRatio", "usagePercent"]);
+  const computedPercent = limit > 0 && used != null ? Math.min(999, (used / limit) * 100) : null;
+  const finalUsedPercent = usedPercent != null ? usedPercent : computedPercent;
+  const remainingPercent = finalUsedPercent != null ? Math.max(0, 100 - finalUsedPercent) : null;
+  const computedRemaining = limit > 0 && used != null ? Math.max(0, limit - used) : null;
+  const finalRemaining = remaining != null ? remaining : computedRemaining;
+
+  const plan = data.current_package_name || data.planName || data.plan_name || data.packageName || "";
+
+  return {
+    source: "minimax",
+    kind: limit > 0 ? "configured-credits" : "detected-percent",
+    ok: true,
+    used,
+    limit: limit || null,
+    remaining: finalRemaining,
+    usedPercent: finalUsedPercent,
+    remainingPercent,
+    resetAt,
+    resetText,
+    plan,
+    raw: usage.raw || null,
+    note: usage.note || (usage.cacheHit ? "MiniMax desde cache local." : "MiniMax API consultada."),
+  };
+}
+
+function numberFromAny(obj, keys) {
+  for (const key of keys) {
+    const value = obj?.[key];
+    if (value == null) continue;
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
 // removed buildAntigravityQuota as it lacks local api data
+
+function buildOpenCodeQuota(usage, config = {}) {
+  if (!usage) {
+    return { source: "opencode", kind: "unknown", ok: false, note: "Sin datos." };
+  }
+  if (usage.ok === false) {
+    return { source: "opencode", kind: "unknown", ok: false, note: usage.note || "OpenCode Go no configurado." };
+  }
+
+  const data = usage.data || usage;
+  const fiveHourCost = Number(config.fiveHourCost || 0);
+  const weeklyCost = Number(config.weeklyCost || 0);
+  const monthlyCost = Number(config.monthlyCost || 0);
+
+  const windows = [];
+
+  if (fiveHourCost > 0 && typeof data.cost5h === "number") {
+    const usedPct = Math.min(999, (data.cost5h / fiveHourCost) * 100);
+    windows.push({
+      key: "5h",
+      label: "5 horas",
+      usedPercent: usedPct,
+      remainingPercent: Math.max(0, 100 - usedPct),
+      reset: data.reset5h ? new Date(data.reset5h) : null,
+      used: data.cost5h,
+      limit: fiveHourCost,
+    });
+  }
+
+  if (weeklyCost > 0 && typeof data.costWeek === "number") {
+    const usedPct = Math.min(999, (data.costWeek / weeklyCost) * 100);
+    windows.push({
+      key: "week",
+      label: "semanal",
+      usedPercent: usedPct,
+      remainingPercent: Math.max(0, 100 - usedPct),
+      reset: data.resetWeek ? new Date(data.resetWeek) : null,
+      used: data.costWeek,
+      limit: weeklyCost,
+    });
+  }
+
+  if (monthlyCost > 0 && typeof data.costMonth === "number") {
+    const usedPct = Math.min(999, (data.costMonth / monthlyCost) * 100);
+    windows.push({
+      key: "month",
+      label: "mensual",
+      usedPercent: usedPct,
+      remainingPercent: Math.max(0, 100 - usedPct),
+      reset: data.resetMonth ? new Date(data.resetMonth) : null,
+      used: data.costMonth,
+      limit: monthlyCost,
+    });
+  }
+
+  if (windows.length) {
+    return {
+      source: "opencode",
+      kind: "detected-percent",
+      ok: true,
+      windows,
+      totalCost: data.totalCost || 0,
+      totalTokens: data.totalTokens || 0,
+      sessionCount: data.sessionCount || 0,
+      note: usage.note || (usage.cacheHit ? "OpenCode Go desde cache local." : "OpenCode Go DB local."),
+    };
+  }
+
+  return {
+    source: "opencode",
+    kind: "unknown",
+    ok: true,
+    totalCost: data.totalCost || 0,
+    totalTokens: data.totalTokens || 0,
+    sessionCount: data.sessionCount || 0,
+    note: "Configura fiveHourCost, weeklyCost o monthlyCost en quotas.json para ver barras de cuota Go.",
+  };
+}
 
 function collectCodexRateLimits() {
   const root = path.join(homedir(), ".codex", "sessions");
@@ -730,14 +983,16 @@ function collectCodexRateLimits() {
   return results.length === 1 ? results[0] : results;
 }
 
-async function collectClaudeUsageLive(config = {}) {
+async function collectClaudeUsageLive(config = {}, { ignoreCache = false } = {}) {
   if (process.env.AI_USAGE_CLAUDE_LIVE === "0" || config.liveUsage === false) {
     return { source: "claude", ok: false, disabled: true, note: "Claude /usage desactivado." };
   }
 
   const cacheSeconds = Number(config.liveUsageCacheSeconds ?? 300);
-  const cached = readJsonCache(CLAUDE_USAGE_CACHE_PATH, Math.max(0, cacheSeconds) * 1000);
-  if (cached) return { ...cached, cacheHit: true };
+  if (!ignoreCache) {
+    const cached = readJsonCache(CLAUDE_USAGE_CACHE_PATH, Math.max(0, cacheSeconds) * 1000);
+    if (cached) return { ...cached, cacheHit: true };
+  }
 
   if (!commandExists("claude")) {
     return { source: "claude", ok: false, note: "No encuentro el comando claude." };
@@ -759,27 +1014,45 @@ async function collectClaudeUsageLive(config = {}) {
     const parsed = parseClaudeUsageOutput(resultText);
     const stale = readJsonSafe(CLAUDE_USAGE_CACHE_PATH);
 
-    // If new fetch has no bars but old cache had them, assume Claude API is rate limiting
-    // and silently dropped the bars. We reuse the old cache to prevent the UI from glitching.
-    if (parsed.windows.length === 0 && stale?.windows?.length > 0) {
-      const fallback = {
-        ...stale,
+    // Claude /usage frequently omits the per-window bars when it is called too often (it
+    // throttles them). Missing bars do NOT mean the plan is unlimited: every response now
+    // starts with "using your subscription", so we must never read that as "no limits".
+    if (parsed.windows.length === 0) {
+      // Prefer the last known windows so a throttled response does not blank the UI, and
+      // never overwrite good windows with an empty result.
+      if (stale?.windows?.length > 0) {
+        const fallback = {
+          ...stale,
+          plan: parsed.plan || stale.plan || "",
+          capturedAt: new Date().toISOString(),
+          cacheHit: true,
+          cacheStale: true,
+          note: "Claude no devolvio barras (limitado); mostrando ultimo dato conocido.",
+        };
+        writeJsonCache(CLAUDE_USAGE_CACHE_PATH, fallback);
+        return fallback;
+      }
+      // No prior windows to fall back on: report honestly instead of faking "unlimited".
+      const output = {
+        source: "claude",
+        ok: false,
+        plan: parsed.plan,
+        windows: [],
         capturedAt: new Date().toISOString(),
-        cacheHit: true,
-        cacheStale: true,
-        note: "Claude API en rate-limit (barras ocultas); mostrando ultimo dato conocido.",
+        cacheHit: false,
+        note: "Claude no devolvio el uso por ventana; reintenta en unos minutos.",
       };
-      writeJsonCache(CLAUDE_USAGE_CACHE_PATH, fallback);
-      return fallback;
+      writeJsonCache(CLAUDE_USAGE_CACHE_PATH, output);
+      return output;
     }
 
     const output = {
       source: "claude",
-      ok: parsed.windows.length > 0 || parsed.plan === "subscription",
+      ok: true,
       ...parsed,
       capturedAt: new Date().toISOString(),
       cacheHit: false,
-      note: parsed.windows.length ? "Claude /usage detectado." : parsed.plan === "subscription" ? "Claude suscripcion detectada (sin limites activos)." : "Claude /usage no devolvio datos.",
+      note: "Claude /usage detectado.",
     };
     writeJsonCache(CLAUDE_USAGE_CACHE_PATH, output);
     return output;
@@ -837,14 +1110,16 @@ function claudeWindowLabel(label) {
   return label;
 }
 
-async function collectGeminiQuotaLive(config = {}) {
+async function collectGeminiQuotaLive(config = {}, { ignoreCache = false } = {}) {
   if (process.env.AI_USAGE_GEMINI_LIVE === "0" || config.liveCapture === false) {
     return { source: "gemini", ok: false, disabled: true, note: "Gemini /stats model desactivado." };
   }
 
   const cacheMinutes = Number(config.liveCaptureCacheMinutes ?? 15);
-  const cached = readJsonCache(GEMINI_QUOTA_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
-  if (cached) return { ...cached, cacheHit: true };
+  if (!ignoreCache) {
+    const cached = readJsonCache(GEMINI_QUOTA_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
+    if (cached) return { ...cached, cacheHit: true };
+  }
 
   if (!commandExists("gemini")) {
     return { source: "gemini", ok: false, note: "No encuentro el comando gemini." };
@@ -886,7 +1161,241 @@ async function collectGeminiQuotaLive(config = {}) {
   }
 }
 
+async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false } = {}) {
+  const config = quotaConfig || loadQuotaConfig();
+  const configEntry = config?.minimax || {};
+  const keyFromEnv = process.env.MINIMAX_API_KEY || "";
+  const keyFromFile = configEntry.apiKey || "";
+  const apiKey = keyFromEnv || keyFromFile;
+  const debug = process.env.AI_USAGE_MINIMAX_DEBUG === "1";
+  const liveDisabled = process.env.AI_USAGE_MINIMAX_LIVE === "0" || configEntry.liveCapture === false;
+  const cacheMinutes = Number(process.env.MINIMAX_USAGE_CACHE_MINUTES ?? configEntry.liveCaptureCacheMinutes ?? 0);
+  const cached = readJsonCache(MINIMAX_USAGE_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
+  if (cached && (!ignoreCache || liveDisabled)) {
+    if (debug) process.stderr.write(`[minimax] cache hit (age < ${cacheMinutes}m)\n`);
+    return { ...cached, cacheHit: true };
+  }
+  if (liveDisabled) {
+    const stale = readJsonSafe(MINIMAX_USAGE_CACHE_PATH);
+    if (stale?.ok) {
+      return {
+        ...stale,
+        cacheHit: true,
+        cacheStale: true,
+        note: "MiniMax API desactivada; usando cache local.",
+      };
+    }
+    return { source: "minimax", ok: false, disabled: true, note: "MiniMax API desactivada." };
+  }
+
+  if (debug) {
+    process.stderr.write(`[minimax] key source: ${keyFromEnv ? "env" : keyFromFile ? "quotas.json" : "none"} (${apiKey ? apiKey.slice(0, 8) + "…" : "empty"})\n`);
+  }
+  if (!apiKey) {
+    return {
+      source: "minimax",
+      ok: false,
+      note: "MINIMAX_API_KEY no definida. Define la env var o agrega minimax.apiKey en quotas.json (ai-usage-quota edit).",
+    };
+  }
+
+  const url = process.env.MINIMAX_USAGE_URL || "https://api.minimax.io/v1/api/openplatform/coding_plan/remains";
+  if (debug) {
+    process.stderr.write(`[minimax] GET ${url}\n[minimax] Authorization: Bearer ${apiKey.slice(0, 8)}…\n`);
+  }
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+    const text = await response.text();
+    if (debug) {
+      process.stderr.write(`[minimax] HTTP ${response.status}\n[minimax] body: ${text.slice(0, 800)}\n`);
+    }
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return staleMiniMaxUsage(`MiniMax devolvio no-JSON; usando cache anterior (${shortError(text)}).`)
+        || { source: "minimax", ok: false, note: `MiniMax devolvio no-JSON: ${shortError(text)}` };
+    }
+
+    const baseResp = data?.base_resp || {};
+    if (baseResp.status_code && baseResp.status_code !== 0 && baseResp.status_code !== 200) {
+      const msg = baseResp.status_msg || `status_code ${baseResp.status_code}`;
+      const stale = readJsonSafe(MINIMAX_USAGE_CACHE_PATH);
+      if (stale?.ok) {
+        return {
+          ...stale,
+          cacheHit: true,
+          cacheStale: true,
+          note: `MiniMax: ${msg}; usando cache anterior.`,
+        };
+      }
+      return { source: "minimax", ok: false, note: `MiniMax: ${msg}` };
+    }
+
+    if (!response.ok) {
+      return staleMiniMaxUsage(`MiniMax API HTTP ${response.status}; usando cache anterior (${shortError(text)}).`)
+        || {
+          source: "minimax",
+          ok: false,
+          note: `MiniMax API HTTP ${response.status}: ${shortError(text)}`,
+        };
+    }
+
+    const output = {
+      source: "minimax",
+      ok: true,
+      ...data,
+      raw: data,
+      capturedAt: new Date().toISOString(),
+      cacheHit: false,
+    };
+    writeJsonCache(MINIMAX_USAGE_CACHE_PATH, output);
+    return output;
+  } catch (error) {
+    const stale = readJsonSafe(MINIMAX_USAGE_CACHE_PATH);
+    if (stale?.ok) {
+      return {
+        ...stale,
+        cacheHit: true,
+        cacheStale: true,
+        note: `MiniMax API fallo; usando cache anterior (${shortError(error)}).`,
+      };
+    }
+    return { source: "minimax", ok: false, note: `MiniMax API fallo: ${shortError(error)}` };
+  }
+}
+
+function staleMiniMaxUsage(note) {
+  const stale = readJsonSafe(MINIMAX_USAGE_CACHE_PATH);
+  if (!stale?.ok) return null;
+  return {
+    ...stale,
+    cacheHit: true,
+    cacheStale: true,
+    note,
+  };
+}
+
+function staleOpenCodeUsage(note) {
+  const stale = readJsonSafe(OPENCODE_USAGE_CACHE_PATH);
+  if (!stale?.ok) return null;
+  return {
+    ...stale,
+    cacheHit: true,
+    cacheStale: true,
+    note,
+  };
+}
+
+async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } = {}) {
+  const config = quotaConfig || loadQuotaConfig();
+  const configEntry = config?.opencode || {};
+  const liveDisabled = process.env.AI_USAGE_OPENCODE_LIVE === "0" || configEntry.liveCapture === false;
+  const cacheMinutes = Number(process.env.OPENCODE_USAGE_CACHE_MINUTES ?? configEntry.liveCaptureCacheMinutes ?? 5);
+  const cached = readJsonCache(OPENCODE_USAGE_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
+  if (cached && (!ignoreCache || liveDisabled)) {
+    return { ...cached, cacheHit: true };
+  }
+  if (liveDisabled) {
+    const stale = readJsonSafe(OPENCODE_USAGE_CACHE_PATH);
+    if (stale?.ok) {
+      return { ...stale, cacheHit: true, cacheStale: true, note: "OpenCode Go DB desactivado; usando cache local." };
+    }
+    return { source: "opencode", ok: false, disabled: true, note: "OpenCode Go DB desactivado." };
+  }
+
+  if (!existsSync(OPENCODE_DB_PATH)) {
+    return { source: "opencode", ok: false, note: "No encuentro opencode.db; corre opencode al menos una vez." };
+  }
+
+  try {
+    const { stdout } = await execFileAsync("sqlite3", [OPENCODE_DB_PATH, "-json",
+      "SELECT s.model, s.cost, s.tokens_input, s.tokens_output, s.tokens_cache_read, s.tokens_cache_write, s.time_created " +
+      "FROM session s WHERE json_extract(s.model, '$.providerID') = 'opencode-go' " +
+      "ORDER BY s.time_created DESC"], {
+      encoding: "utf8",
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 15000,
+    });
+
+    const rows = stdout.trim() ? JSON.parse(stdout) : [];
+    const now = Date.now();
+    const nowDate = new Date();
+    const dayStart = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate()).getTime();
+    const weekStart = dayStart - (nowDate.getDay() || 7) * 86400000 + 86400000;
+    const monthStart = new Date(nowDate.getFullYear(), nowDate.getMonth(), 1).getTime();
+    const fiveHoursAgo = now - 5 * 3600000;
+
+    let cost5h = 0, costWeek = 0, costMonth = 0, totalCost = 0;
+    let totalTokens = 0, totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0;
+
+    for (const row of rows) {
+      const ts = row.time_created;
+      const cost = Number(row.cost || 0);
+      totalCost += cost;
+      totalTokens += Number(row.tokens_input || 0) + Number(row.tokens_output || 0);
+      totalInput += Number(row.tokens_input || 0);
+      totalOutput += Number(row.tokens_output || 0);
+      totalCacheRead += Number(row.tokens_cache_read || 0);
+      totalCacheWrite += Number(row.tokens_cache_write || 0);
+
+      if (ts >= fiveHoursAgo) cost5h += cost;
+      if (ts >= weekStart) costWeek += cost;
+      if (ts >= monthStart) costMonth += cost;
+    }
+
+    const fiveHourCost = Number(configEntry.fiveHourCost || 12);
+    const weeklyCost = Number(configEntry.weeklyCost || 30);
+    const monthlyCost = Number(configEntry.monthlyCost || 60);
+
+    const output = {
+      source: "opencode",
+      ok: true,
+      data: {
+        cost5h: cost5h,
+        costWeek: costWeek,
+        costMonth: costMonth,
+        totalCost: totalCost,
+        totalTokens: totalTokens,
+        totalInput: totalInput,
+        totalOutput: totalOutput,
+        totalCacheRead: totalCacheRead,
+        totalCacheWrite: totalCacheWrite,
+        sessionCount: rows.length,
+        reset5h: new Date(now + 5 * 3600000).toISOString(),
+        resetWeek: new Date(weekStart + 7 * 86400000).toISOString(),
+        resetMonth: new Date(nowDate.getFullYear(), nowDate.getMonth() + 1, 1).toISOString(),
+      },
+      limits: {
+        fiveHourCost: fiveHourCost || null,
+        weeklyCost: weeklyCost || null,
+        monthlyCost: monthlyCost || null,
+        note: !fiveHourCost ? "Los limites por defecto son $12/5h, $30/sem, $60/mes. Configuralos en quotas.json." : "",
+      },
+      capturedAt: new Date().toISOString(),
+      cacheHit: false,
+      note: "OpenCode Go DB local.",
+    };
+    writeJsonCache(OPENCODE_USAGE_CACHE_PATH, output);
+    return output;
+  } catch (error) {
+    const stale = readJsonSafe(OPENCODE_USAGE_CACHE_PATH);
+    if (stale?.ok) {
+      return { ...stale, cacheHit: true, cacheStale: true, note: `OpenCode Go DB fallo; usando cache anterior (${shortError(error)}).` };
+    }
+    return { source: "opencode", ok: false, note: `OpenCode Go DB fallo: ${shortError(error)}` };
+  }
+}
+
 function readJsonCache(file, maxAgeMs) {
+  if (maxAgeMs <= 0) return null;
   const data = readJsonSafe(file);
   if (!data) return null;
   const timestamp = Date.parse(data.capturedAt || data.cachedAt || "");
@@ -1011,9 +1520,25 @@ function safeStat(file) {
 }
 
 function onKey(buffer) {
-  const key = buffer.toString("utf8");
+  const input = buffer.toString("utf8");
+  for (let i = 0; i < input.length; i += 1) {
+    if (input.startsWith("\x1b[A", i)) {
+      handleKey("\x1b[A");
+      i += 2;
+      continue;
+    }
+    if (input.startsWith("\x1b[B", i)) {
+      handleKey("\x1b[B");
+      i += 2;
+      continue;
+    }
+    handleKey(input[i]);
+  }
+}
+
+function handleKey(key) {
   if (key === "\u0003" || key === "q") exit(0);
-  else if (key === "r") refresh();
+  else if (key === "r") refresh({ forceProviders: true });
   else if (key === "\t" || key === "t") toggleTab();
   else if (key === "1") setView("daily");
   else if (key === "2") setView("weekly");
@@ -1025,6 +1550,8 @@ function onKey(buffer) {
   else if (key === "x") setSource("codex");
   else if (key === "g") setSource("gemini");
   else if (key === "v") setSource("antigravity");
+  else if (key === "m") setSource("minimax");
+  else if (key === "o") setSource("opencode");
   else if (key === "\x1b[A") moveModel(-1);
   else if (key === "\x1b[B") moveModel(1);
 }
@@ -1094,7 +1621,7 @@ function draw(width, height) {
   lines.push(hr(width));
   const helpText = state.tab === "cuotas"
     ? `${colors.gray}q salir | r refrescar | Tab cambiar pestaña${RESET}`
-    : `${colors.gray}q salir | r refrescar | Tab pestaña | 1-5 vista | a/c/x/g/v fuente | flechas modelos${RESET}`;
+    : `${colors.gray}q salir | r refrescar | Tab pestaña | 1-5 vista | a/c/x/g/v/m fuente | flechas modelos${RESET}`;
   lines.push(fit(helpText, width));
   return lines.slice(0, height);
 }
@@ -1114,6 +1641,14 @@ function drawQuotaTab(width, maxHeight, snap) {
 
   // Gemini quota
   lines.push(...quotaSection("Gemini", colors.blue, quotas.gemini, halfWidth, width));
+  lines.push("");
+
+  // MiniMax quota
+  lines.push(...quotaSection("MiniMax", colors.cyan, quotas.minimax, halfWidth, width));
+  lines.push("");
+
+  // OpenCode quota
+  lines.push(...quotaSection("OpenCode", colors.green, quotas.opencode, halfWidth, width));
 
   return lines.slice(0, maxHeight);
 }
@@ -1124,7 +1659,8 @@ function quotaSection(label, color, quota, barWidth, totalWidth) {
   lines.push(`${color}${colors.bold}${label}${RESET}`);
 
   if (!quota || quota.kind === "unknown") {
-    lines.push(fit(`  ${colors.gray}sin limite configurado — ejecuta ai-usage-quota edit${RESET}`, totalWidth));
+    const msg = quota?.note || "sin limite configurado — ejecuta ai-usage-quota edit";
+    lines.push(fit(`  ${colors.gray}${msg}${RESET}`, totalWidth));
     return lines;
   }
 
@@ -1166,10 +1702,6 @@ function quotaSection(label, color, quota, barWidth, totalWidth) {
     return lines;
   }
 
-  if (quota.activeBlock && quota.kind === "detected-percent" || (quota.windows?.length)) {
-    // Already handled above
-  }
-
   if (quota.kind === "configured-tokens" && quota.limit) {
     const pct = 100 - Number(quota.usedPercent || 0);
     lines.push(fit(`  ${(quota.windowLabel || "periodo").padEnd(12)} ${bar(quota.used, quota.limit, sectionBar, quotaColor(pct))} ${fmtPct(pct)} queda (${fmtInt(quota.remaining)}/${fmtInt(quota.limit)})`, totalWidth));
@@ -1184,7 +1716,7 @@ function quotaSection(label, color, quota, barWidth, totalWidth) {
   if (quota.kind === "configured-credits" && quota.limit) {
     const pct = 100 - Number(quota.usedPercent || 0);
     lines.push(fit(`  ${'creditos'.padEnd(12)} ${bar(quota.used, quota.limit, sectionBar, quotaColor(pct))} ${fmtPct(pct)} queda (${fmtNumber(quota.remaining)}/${fmtNumber(quota.limit)})`, totalWidth));
-    if (quota.resetsAt) lines.push(fit(`  reset: ${quota.resetsAt}`, totalWidth));
+    if (quota.resetsAt) lines.push(fit(`  reset: ${fmtReset(quota.resetsAt)}`, totalWidth));
     return lines;
   }
 
@@ -1204,11 +1736,17 @@ function quotaSection(label, color, quota, barWidth, totalWidth) {
     const reqLabel = quota.remainingRequests != null && quota.limitRequests
       ? `${fmtInt(quota.remainingRequests)}/${fmtInt(quota.limitRequests)} req`
       : `${fmtPct(pct)} queda`;
-    lines.push(fit(`  ${'global'.padEnd(12)} ${bar(quota.usedPercent, 100, sectionBar, quotaColor(pct))} ${reqLabel}  ${quota.resetText ? shortText(quota.resetText, 20) : ""}`, totalWidth));
+    const globalReset = quota.resetAt
+      ? `reset ${fmtReset(quota.resetAt)}`
+      : (quota.resetText ? `reset ${shortText(quota.resetText, 20)}` : "");
+    lines.push(fit(`  ${'global'.padEnd(12)} ${bar(quota.usedPercent, 100, sectionBar, quotaColor(pct))} ${reqLabel}  ${globalReset}`, totalWidth));
     if (quota.modelQuotas?.length) {
       for (const mq of quota.modelQuotas) {
         const mpct = mq.remainingPercent;
-        lines.push(fit(`  ${shortText(mq.model, 12).padEnd(12)} ${bar(mq.usedPercent, 100, sectionBar, quotaColor(mpct))} ${fmtPct(mpct)} queda  ${mq.resetText ? shortText(mq.resetText, 20) : ""}`, totalWidth));
+        const mqReset = mq.resetAt
+          ? `reset ${fmtReset(mq.resetAt)}`
+          : (mq.resetText ? `reset ${shortText(mq.resetText, 20)}` : "");
+        lines.push(fit(`  ${shortText(mq.model, 12).padEnd(12)} ${bar(mq.usedPercent, 100, sectionBar, quotaColor(mpct))} ${fmtPct(mpct)} queda  ${mqReset}`, totalWidth));
       }
     }
     return lines;
@@ -1222,6 +1760,22 @@ function quotaSection(label, color, quota, barWidth, totalWidth) {
     } else {
       lines.push(fit(`  ${'bloque'.padEnd(12)} ${fmtInt(quota.activeBlock.used)} usados  reset ${fmtReset(quota.activeBlock.end)}`, totalWidth));
       lines.push(fit(`  ${colors.gray}configura fiveHourTokens en quotas.json para barra${RESET}`, totalWidth));
+    }
+    return lines;
+  }
+
+  // MiniMax (API-based: limit + used, or percent only, or with reset)
+  if (quota.source === "minimax" && quota.ok) {
+    const pct = quota.usedPercent != null ? Math.max(0, 100 - quota.usedPercent) : (quota.remainingPercent || 0);
+    const resetInfo = quota.resetAt
+      ? `reset ${fmtReset(quota.resetAt)}`
+      : (quota.resetText ? `reset ${shortText(quota.resetText, 20)}` : "");
+    const label = "minimax".padEnd(12);
+    if (quota.limit) {
+      lines.push(fit(`  ${label} ${bar(quota.used, quota.limit, sectionBar, quotaColor(pct))} ${fmtPct(pct)} queda (${fmtNumber(quota.remaining)}/${fmtNumber(quota.limit)})${resetInfo ? `  ${resetInfo}` : ""}`, totalWidth));
+    } else {
+      const usedVal = quota.used || (quota.usedPercent != null ? quota.usedPercent : 0);
+      lines.push(fit(`  ${label} ${bar(usedVal, 100, sectionBar, quotaColor(pct))} ${fmtPct(pct)} queda${resetInfo ? `  ${resetInfo}` : ""}`, totalWidth));
     }
     return lines;
   }
@@ -1241,6 +1795,10 @@ function drawConsumoTab(width, maxHeight, snap) {
 
   if (state.source === "antigravity") {
     lines.push(...antigravityPanel(width, snap.sources.antigravity));
+  } else if (state.source === "minimax") {
+    lines.push(...minimaxPanel(width, snap.sources.minimax, snap.quotas?.minimax));
+  } else if (state.source === "opencode") {
+    lines.push(...opencodePanel(width, snap.sources.opencode, snap.quotas?.opencode));
   } else {
     lines.push(...modelPanel(width, maxHeight - lines.length - 2));
   }
@@ -1263,16 +1821,18 @@ function summaryCards(width, total, snap) {
 }
 
 function sourceCards(width, snap) {
-  const sources = ["claude", "codex", "gemini", "antigravity"];
+  const sources = ["claude", "codex", "gemini", "antigravity", "minimax", "opencode"];
   const max = Math.max(
     1,
     ...sources.map((source) => {
       if (source === "antigravity") return snap.sources.antigravity?.modelSteps || 0;
+      if (source === "opencode") return snap.sources.opencode?.data?.totalCost || 0;
       const totals = snap.sources[source]?.totals;
       return totals?.effectiveTokens ?? totals?.totalTokens ?? 0;
     }),
   );
-  const cardWidth = Math.max(18, Math.floor((width - 6) / 4));
+  const gapWidth = (sources.length - 1) * 2;
+  const cardWidth = Math.max(18, Math.floor((width - gapWidth) / sources.length));
   const cards = sources.map((source) => {
     const meta = SOURCE_META[source];
     if (source === "antigravity") {
@@ -1281,6 +1841,50 @@ function sourceCards(width, snap) {
         `${ag.installed ? "instalado" : "no instalado"} | ${ag.sessions} sesiones`,
         bar(ag.modelSteps, max, cardWidth - 4, colors.yellow),
         `${fmtInt(ag.modelSteps)} pasos modelo`,
+      ];
+      return boxed(meta.label, body, cardWidth, meta.color);
+    }
+    if (source === "minimax") {
+      const usage = snap.sources.minimax;
+      const quota = snap.quotas?.minimax;
+      if (usage?.ok === false) {
+        return boxed(meta.label, [colorText(usage.note || "sin MINIMAX_API_KEY", colors.red), "", "configura la key"], cardWidth, meta.color);
+      }
+      if (Array.isArray(quota?.windows) && quota.windows.length) {
+        const intervalW = quota.windows.find((w) => (w.key || "").includes("interval"));
+        const weeklyW = quota.windows.find((w) => (w.key || "").includes("weekly"));
+        const intervalPct = intervalW?.remainingPercent ?? 0;
+        const weeklyPct = weeklyW?.remainingPercent ?? 0;
+        const body = [
+          `5h: ${fmtPct(intervalPct)} libre`,
+          bar(100 - intervalPct, 100, cardWidth - 4, colors.cyan),
+          `sem: ${fmtPct(weeklyPct)} libre`,
+        ];
+        return boxed(meta.label, body, cardWidth, meta.color);
+      }
+      const used = quota?.used ?? 0;
+      const limit = quota?.limit ?? null;
+      const remaining = quota?.remaining ?? null;
+      const body = [
+        limit ? `${fmtNumber(used)}/${fmtNumber(limit)} usado` : `${fmtNumber(used)} usado`,
+        bar(used, Math.max(1, limit || used || 1), cardWidth - 4, colors.cyan),
+        remaining != null ? `quedan ${fmtNumber(remaining)}` : (quota?.note || ""),
+      ];
+      return boxed(meta.label, body, cardWidth, meta.color);
+    }
+    if (source === "opencode") {
+      const usage = snap.sources.opencode;
+      const quota = snap.quotas?.opencode;
+      if (usage?.ok === false) {
+        return boxed(meta.label, [colorText(usage.note || "sin ccusage opencode", colors.red), "", "corre opencode primero"], cardWidth, meta.color);
+      }
+      const effective = usage?.totals?.effectiveTokens ?? usage?.totals?.totalTokens ?? 0;
+      const cacheRead = usage?.totals?.cacheReadTokens || 0;
+      const cacheNote = cacheRead ? ` +${fmtCompact(cacheRead)} cache` : "";
+      const body = [
+        `${fmtInt(effective)} netos${cacheNote}`,
+        bar(effective, max, cardWidth - 4, colors.green),
+        `${fmtMoney(usage?.totals.totalCost || 0)} | ${usage?.models.length || 0} modelos`,
       ];
       return boxed(meta.label, body, cardWidth, meta.color);
     }
@@ -1317,7 +1921,7 @@ function quotaBody(source, quota, width) {
     ];
   }
   if (source === "codex" && quota.kind === "detected-credits") {
-    const c = quota.credits;
+    const c = quota.creditsList?.[0] || {};
     if (c.unlimited) return ["ilimitado", bar(0, 100, width - 4, colors.green), `plan: ${quota.plan || "premium"}`];
     if (c.has_credits) return [`balance: ${c.balance}`, bar(30, 100, width - 4, colors.green), `plan: ${quota.plan || "premium"}`];
     return ["sin creditos", bar(100, 100, width - 4, colors.red), `plan: ${quota.plan || "premium"}`];
@@ -1459,6 +2063,113 @@ function antigravityPanel(width, ag) {
   return rows;
 }
 
+function minimaxPanel(width, usage, quota) {
+  const rows = [];
+  rows.push(`${colors.bold}${colors.cyan}MiniMax${RESET} ${colors.gray}(cuota de Coding Plan via API)${RESET}`);
+  rows.push(hr(width));
+
+  if (!usage || usage.ok === false) {
+    rows.push(colorText(usage?.note || "MiniMax no configurado", colors.red));
+    rows.push("");
+    rows.push(colors.gray + "Para activarlo:" + RESET);
+    rows.push("  export MINIMAX_API_KEY=sk-cp-...   # o");
+    rows.push("  ai-usage-quota edit   # y agregar minimax.apiKey");
+    return rows;
+  }
+
+  if (quota?.plan) {
+    rows.push(`Plan actual: ${colors.bold}${quota.plan}${RESET}`);
+  }
+  rows.push("");
+
+  if (Array.isArray(quota?.windows) && quota.windows.length) {
+    // Resumen rapido arriba: el modelo/window mas urgente
+    const urgent = quota.windows.reduce((min, w) => (w.remainingPercent < (min?.remainingPercent ?? 101) ? w : min), null);
+    if (urgent) {
+      const periodLabel = (urgent.key || "").includes("weekly") ? "esta semana" : "estas 5h";
+      rows.push(colorText(`Te queda ${fmtPct(urgent.remainingPercent)} ${periodLabel} en ${urgent.label || "un modelo"}`, quotaColor(urgent.remainingPercent)));
+      if (urgent.reset) {
+        rows.push(`${colors.gray}Resetea en ${fmtReset(urgent.reset)}${RESET}`);
+      }
+      rows.push("");
+    }
+
+    rows.push(`${colors.bold}Cuota por modelo${RESET}`);
+    const grouped = new Map();
+    for (const w of quota.windows) {
+      const [period, ...rest] = (w.key || "").split("_");
+      const modelName = rest.join("_") || w.label || "model";
+      if (!grouped.has(modelName)) grouped.set(modelName, {});
+      grouped.get(modelName)[period] = w;
+    }
+    for (const [modelName, periods] of grouped) {
+      rows.push(`  ${colors.bold}${modelName}${RESET}`);
+      for (const [period, w] of Object.entries(periods)) {
+        const label = period === "interval" ? "5 horas" : period === "weekly" ? "semanal" : period;
+        const reset = w.reset ? `reset ${fmtReset(w.reset)}` : "";
+        rows.push(fit(`    ${label.padEnd(10)} ${bar(w.usedPercent, 100, Math.max(10, width - 36), quotaColor(w.remainingPercent))} ${fmtPct(w.remainingPercent)} queda  ${reset}`, width));
+      }
+    }
+  } else if (quota) {
+    const pct = quota.remainingPercent ?? (quota.usedPercent != null ? Math.max(0, 100 - quota.usedPercent) : 0);
+    const usedVal = quota.used || (quota.usedPercent != null ? quota.usedPercent : 0);
+    const denom = Math.max(1, quota.limit || usedVal || 1);
+    const resetInfo = quota.resetAt
+      ? `  reset ${fmtReset(quota.resetAt)}`
+      : (quota.resetText ? `  reset ${shortText(quota.resetText, 20)}` : "");
+    rows.push(fit(`  ${bar(usedVal, denom, Math.max(10, width - 20), quotaColor(pct))} ${fmtPct(pct)} queda (${fmtNumber(quota.remaining)}/${fmtNumber(quota.limit)})${resetInfo}`, width));
+  }
+
+  rows.push("");
+  rows.push(colors.gray + "Esto NO incluye el uso de modelos via ccusage (eso va en la pestana de consumo, source=Todos)." + RESET);
+  return rows;
+}
+
+function opencodePanel(width, usage, quota) {
+  const rows = [];
+  rows.push(`${colors.bold}${colors.green}OpenCode Go${RESET} ${colors.gray}(ccusage + DB local)${RESET}`);
+  rows.push(hr(width));
+
+  if (!usage || usage.ok === false) {
+    rows.push(colorText(usage?.note || "OpenCode no detectado por ccusage", colors.red));
+    rows.push("");
+    rows.push(colors.gray + "Requisito:" + RESET);
+    rows.push("  Corre opencode al menos una vez y ten ccusage instalado (npx -y ccusage@latest)");
+    return rows;
+  }
+
+  const effective = usage.totals?.effectiveTokens ?? usage.totals?.totalTokens ?? 0;
+  const cacheRead = usage.totals?.cacheReadTokens || 0;
+  rows.push(`Coste total: ${colors.bold}${fmtMoney(usage.totals.totalCost || 0)}${RESET}`);
+  rows.push(`Tokens netos: ${fmtInt(effective)} (in: ${fmtInt(usage.totals.inputTokens || 0)} out: ${fmtInt(usage.totals.outputTokens || 0)})`);
+  rows.push(`Cache read: ${fmtInt(cacheRead)}  cache create: ${fmtInt(usage.totals.cacheCreationTokens || 0)}`);
+  rows.push(`${usage.models.length} modelos detectados`);
+  rows.push("");
+
+  rows.push(`${colors.bold}Cuota Go (limites en USD)${RESET}`);
+  if (quota?.ok && Array.isArray(quota.windows) && quota.windows.length) {
+    for (const w of quota.windows) {
+      const used = fmtMoney(w.used || 0);
+      const limit = fmtMoney(w.limit || 0);
+      const reset = w.reset ? `reset ${fmtReset(w.reset)}` : "";
+      rows.push(fit(`  ${w.label.padEnd(10)} ${bar(w.usedPercent, 100, Math.max(10, width - 36), quotaColor(w.remainingPercent))} ${fmtPct(w.remainingPercent)} queda (${used}/${limit})  ${reset}`, width));
+    }
+    rows.push("");
+    rows.push(colors.gray + "Limites Go: $12/5h, $30/sem, $60/mes." + RESET);
+  } else if (quota?.ok) {
+    const cost = quota.totalCost || 0;
+    const sessions = quota.sessionCount || 0;
+    rows.push(fit(`  coste total: ${fmtMoney(cost)}  |  ${sessions} sesiones Go`, width));
+    rows.push(colors.gray + "Configura fiveHourCost, weeklyCost, monthlyCost en quotas.json para barras de cuota." + RESET);
+  } else {
+    rows.push(colorText(quota?.note || "Sin datos de cuota Go.", colors.yellow));
+  }
+
+  rows.push("");
+  rows.push(colors.gray + "Consumo via ccusage. Cuota via DB local (cache 5 min)." + RESET);
+  return rows;
+}
+
 function visibleSources() {
   const snap = state.lastSnapshot;
   if (!snap) return [];
@@ -1492,9 +2203,11 @@ function renderPlainSummary(snap) {
     lines.push(`Codex quota ${primary.label}: used=${fmtPct(primary.usedPercent)} remaining=${fmtPct(primary.remainingPercent)} reset=${fmtReset(primary.reset)}`);
     if (secondary) lines.push(`Codex quota ${secondary.label}: used=${fmtPct(secondary.usedPercent)} remaining=${fmtPct(secondary.remainingPercent)} reset=${fmtReset(secondary.reset)}`);
   } else if (snap.quotas?.codex?.kind === "detected-credits") {
-    const c = snap.quotas.codex.credits;
-    const status = c.unlimited ? "unlimited" : c.has_credits ? `balance=${c.balance}` : "no_credits";
-    lines.push(`Codex quota credits: ${status} plan=${snap.quotas.codex.plan || "unknown"}`);
+    for (const c of snap.quotas.codex.creditsList || []) {
+      const name = c.limitId === "premium" ? "mini" : c.limitId || "codex";
+      const status = c.unlimited ? "unlimited" : c.has_credits ? `balance=${c.balance}` : "no_credits";
+      lines.push(`Codex quota credits ${name}: ${status} plan=${snap.quotas.codex.plan || "unknown"}`);
+    }
   }
   if (snap.quotas?.claude?.kind === "detected-percent") {
     for (const window of snap.quotas.claude.windows) {
@@ -1515,11 +2228,53 @@ function renderPlainSummary(snap) {
   }
   if (snap.quotas?.gemini?.kind === "detected-requests") {
     const q = snap.quotas.gemini;
+    const resetSuffix = q.resetAt
+      ? ` reset=${fmtReset(q.resetAt)}`
+      : (q.resetText ? ` reset="${q.resetText}"` : "");
     lines.push(
-      `Gemini quota: used=${fmtPct(q.usedPercent)} remaining=${fmtPct(q.remainingPercent)}${q.limitRequests ? ` requests=${fmtInt(q.remainingRequests)}/${fmtInt(q.limitRequests)}` : ""}${q.resetText ? ` reset="${q.resetText}"` : ""}${q.tier ? ` tier="${q.tier}"` : ""}`,
+      `Gemini quota: used=${fmtPct(q.usedPercent)} remaining=${fmtPct(q.remainingPercent)}${q.limitRequests ? ` requests=${fmtInt(q.remainingRequests)}/${fmtInt(q.limitRequests)}` : ""}${resetSuffix}${q.tier ? ` tier="${q.tier}"` : ""}`,
     );
     for (const item of q.modelQuotas || []) {
-      lines.push(`Gemini model quota ${item.model}: used=${fmtPct(item.usedPercent)} remaining=${fmtPct(item.remainingPercent)}${item.resetText ? ` reset="${item.resetText}"` : ""}`);
+      const mqReset = item.resetAt
+        ? ` reset=${fmtReset(item.resetAt)}`
+        : (item.resetText ? ` reset="${item.resetText}"` : "");
+      lines.push(`Gemini model quota ${item.model}: used=${fmtPct(item.usedPercent)} remaining=${fmtPct(item.remainingPercent)}${mqReset}`);
+    }
+  }
+  if (snap.quotas?.minimax) {
+    const mq = snap.quotas.minimax;
+    if (mq.ok) {
+      if (Array.isArray(mq.windows) && mq.windows.length) {
+        for (const w of mq.windows) {
+          const reset = w.reset ? ` reset=${fmtReset(w.reset)}` : "";
+          lines.push(`MiniMax quota ${w.label}: used=${fmtPct(w.usedPercent)} remaining=${fmtPct(w.remainingPercent)}${reset}`);
+        }
+      } else {
+        const pct = mq.usedPercent != null ? fmtPct(mq.usedPercent) : "--";
+        const remain = mq.remaining != null ? fmtNumber(mq.remaining) : "--";
+        const limit = mq.limit != null ? fmtNumber(mq.limit) : "--";
+        const reset = mq.resetAt ? ` reset=${fmtReset(mq.resetAt)}` : (mq.resetText ? ` reset="${mq.resetText}"` : "");
+        lines.push(`MiniMax quota: used=${pct} remaining=${remain}/${limit}${reset}`);
+      }
+    } else {
+      lines.push(`MiniMax: ${mq.note || "sin datos"}`);
+    }
+  }
+  if (snap.quotas?.opencode) {
+    const oq = snap.quotas.opencode;
+    if (oq.ok) {
+      if (Array.isArray(oq.windows) && oq.windows.length) {
+        for (const w of oq.windows) {
+          const used = fmtMoney(w.used || 0);
+          const limit = fmtMoney(w.limit || 0);
+          const reset = w.reset ? ` reset=${fmtReset(w.reset)}` : "";
+          lines.push(`OpenCode Go ${w.label}: used=${used}/${limit} (${fmtPct(w.usedPercent)}) remaining=${fmtPct(w.remainingPercent)}${reset}`);
+        }
+      } else {
+        lines.push(`OpenCode Go: cost=${fmtMoney(oq.totalCost || 0)} tokens=${fmtInt(oq.totalTokens || 0)} sessions=${oq.sessionCount || 0}`);
+      }
+    } else {
+      lines.push(`OpenCode: ${oq.note || "sin datos"}`);
     }
   }
   lines.push(`Quota config: ${snap.quotas?.configPath || QUOTA_CONFIG_PATH}`);
@@ -1569,6 +2324,8 @@ function modelColor(name) {
   if (lower.includes("claude")) return colors.magenta;
   if (lower.includes("gpt")) return colors.green;
   if (lower.includes("gemini")) return colors.blue;
+  if (lower.includes("minimax")) return colors.cyan;
+  if (lower.includes("deepseek") || lower.includes("qwen") || lower.includes("kimi") || lower.includes("glm")) return colors.green;
   return colors.cyan;
 }
 
@@ -1591,15 +2348,27 @@ function fmtNumber(value) {
 
 function fmtReset(date) {
   if (!date) return "--";
-  const target = new Date(date);
+  const target = date instanceof Date ? date : new Date(date);
   if (Number.isNaN(target.getTime())) return String(date);
   const diffMs = target.getTime() - Date.now();
   if (diffMs <= 0) return "ya";
+
   const minutes = Math.ceil(diffMs / 60000);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  const rest = minutes % 60;
-  return `${hours}h${rest ? `${rest}m` : ""}`;
+  let durationStr;
+  if (minutes < 60) durationStr = `${minutes}m`;
+  else {
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    durationStr = rest ? `${hours}h${rest}m` : `${hours}h`;
+  }
+
+  const timeStr = target.toTimeString().slice(0, 5);
+  const now = new Date();
+  if (target.toDateString() === now.toDateString()) {
+    return `${timeStr} (${durationStr})`;
+  }
+  const dayStr = target.toLocaleDateString("es", { month: "short", day: "numeric" });
+  return `${dayStr} ${timeStr} (${durationStr})`;
 }
 
 function quotaConfigHint() {

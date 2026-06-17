@@ -35,8 +35,21 @@ init_config() {
     "monthlyCredits": null,
     "usedCredits": null,
     "resetsAt": null
-  }
-}
+  },
+   "minimax": {
+     "liveCaptureCacheMinutes": 0,
+     "monthlyCredits": null,
+     "resetsAt": null,
+     "apiKey": null
+   },
+   "opencode": {
+     "liveCaptureCacheMinutes": 5,
+     "fiveHourCost": 12,
+     "weeklyCost": 30,
+     "monthlyCost": 60,
+     "apiKey": null
+   }
+ }
 JSON
   fi
   node - "$CONFIG_FILE" <<'NODE' >/dev/null 2>&1 || true
@@ -68,8 +81,21 @@ const defaults = {
     monthlyCredits: null,
     usedCredits: null,
     resetsAt: null
-  }
-};
+  },
+   minimax: {
+     liveCaptureCacheMinutes: 0,
+     monthlyCredits: null,
+     resetsAt: null,
+     apiKey: null
+   },
+   opencode: {
+     liveCaptureCacheMinutes: 5,
+     fiveHourCost: 12,
+     weeklyCost: 30,
+     monthlyCost: 60,
+     apiKey: null
+   }
+ };
 function merge(base, override) {
   const output = Array.isArray(base) ? [...base] : { ...base };
   for (const [key, value] of Object.entries(override || {})) {
@@ -103,6 +129,16 @@ case "${1:-show}" in
     ;;
   show)
     init_config
+    node - "$CONFIG_FILE" <<'NODE'
+const fs = require("fs");
+const file = process.argv[2];
+const config = JSON.parse(fs.readFileSync(file, "utf8"));
+if (config.minimax?.apiKey) config.minimax.apiKey = `${config.minimax.apiKey.slice(0, 8)}...redacted`;
+console.log(JSON.stringify(config, null, 2));
+NODE
+    ;;
+  show-raw)
+    init_config
     cat "$CONFIG_FILE"
     ;;
   edit)
@@ -117,6 +153,7 @@ case "${1:-show}" in
     cat <<EOF
 Uso:
   ai-usage-quota show
+  ai-usage-quota show-raw
   ai-usage-quota edit
   ai-usage-quota path
   ai-usage-quota init

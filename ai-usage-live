@@ -2,4 +2,8 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+  DIR="$(cd "$(dirname "$SELF")" && pwd)"
+fi
 exec node "$DIR/ai-usage-tui.mjs" "$@"

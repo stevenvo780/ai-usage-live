@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Uso:
   ./ai-usage.sh [daily|weekly|monthly|session|blocks]
-  ./ai-usage.sh [claude|codex|gemini] [daily|weekly|monthly|session|blocks]
+  ./ai-usage.sh [claude|codex|gemini|opencode] [daily|weekly|monthly|session|blocks]
 
 Ejemplos:
   ./ai-usage-live
@@ -14,6 +14,7 @@ Ejemplos:
   ./ai-usage.sh claude blocks
   ./ai-usage.sh codex session
   ./ai-usage.sh gemini daily
+  ./ai-usage.sh opencode weekly
 
 Filtros opcionales:
   SINCE=2026-06-01 ./ai-usage.sh daily
@@ -23,8 +24,8 @@ Filtros opcionales:
   ai-usage-quota edit
 
 Notas:
-  - Lee datos locales de Claude Code, Codex CLI y Gemini CLI con ccusage.
-  - ai-usage-live ademas lee cuota restante con Claude /usage y Gemini /stats model.
+  - Lee datos locales de Claude Code, Codex CLI, Gemini CLI y OpenCode con ccusage.
+  - ai-usage-live ademas lee cuota restante con Claude /usage, Gemini /stats model, MiniMax API y OpenCode Go DB.
   - Los costos son estimaciones locales, no facturacion oficial.
   - Las cuotas reales de plan/API pueden requerir mirar el panel oficial de cada proveedor.
 EOF
@@ -39,7 +40,7 @@ source_or_view="${1:-daily}"
 view="${2:-}"
 
 case "$source_or_view" in
-  claude|codex|gemini)
+  claude|codex|gemini|opencode)
     source_args=("$source_or_view")
     view="${view:-daily}"
     ;;
