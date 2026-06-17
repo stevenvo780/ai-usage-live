@@ -47,7 +47,17 @@ init_config() {
      "fiveHourCost": 12,
      "weeklyCost": 30,
      "monthlyCost": 60,
-     "apiKey": null
+     "apiKey": null,
+     "serverOverride": {
+       "enabled": false,
+       "fiveHourUsed": null,
+       "weeklyUsed": null,
+       "monthlyUsed": null,
+       "reset5h": null,
+       "resetWeek": null,
+       "resetMonth": null,
+       "note": "Pega aqui los valores reales de opencode.ai/auth (cost en USD y resets ISO). Cuando enabled=true, reemplaza el estimado local."
+     }
    }
  }
 JSON
@@ -93,7 +103,17 @@ const defaults = {
      fiveHourCost: 12,
      weeklyCost: 30,
      monthlyCost: 60,
-     apiKey: null
+     apiKey: null,
+     serverOverride: {
+       enabled: false,
+       fiveHourUsed: null,
+       weeklyUsed: null,
+       monthlyUsed: null,
+       reset5h: null,
+       resetWeek: null,
+       resetMonth: null,
+       note: "Pega aqui los valores reales de opencode.ai/auth (cost en USD y resets ISO). Cuando enabled=true, reemplaza el estimado local."
+     }
    }
  };
 function merge(base, override) {

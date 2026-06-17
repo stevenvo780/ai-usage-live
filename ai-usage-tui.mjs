@@ -547,6 +547,16 @@ function defaultQuotaConfig() {
       weeklyCost: 30,
       monthlyCost: 60,
       apiKey: null,
+      serverOverride: {
+        enabled: false,
+        fiveHourUsed: null,
+        weeklyUsed: null,
+        monthlyUsed: null,
+        reset5h: null,
+        resetWeek: null,
+        resetMonth: null,
+        note: "Pega aqui los valores reales de opencode.ai/auth (cost en USD y resets ISO). Cuando enabled=true, reemplaza el estimado local.",
+      },
     },
   };
 }
@@ -869,49 +879,116 @@ function buildOpenCodeQuota(usage, config = {}) {
   const fiveHourCost = Number(config.fiveHourCost || 0);
   const weeklyCost = Number(config.weeklyCost || 0);
   const monthlyCost = Number(config.monthlyCost || 0);
+  const override = config.serverOverride || {};
+  const useOverride = override.enabled === true;
+
+  // Default reset times (calendar week/month, rolling 5h) — used as fallback
+  // when the user enables serverOverride without providing explicit reset ISO.
+  const nowMs = Date.now();
+  const nowDate = new Date(nowMs);
+  const HOUR = 3600000;
+  const weekOffset = (nowDate.getUTCDay() + 6) % 7;
+  const weekStart = new Date(nowDate);
+  weekStart.setUTCDate(nowDate.getUTCDate() - weekOffset);
+  weekStart.setUTCHours(0, 0, 0, 0);
+  const nextWeek = new Date(weekStart.getTime());
+  nextWeek.setUTCDate(weekStart.getUTCDate() + 7);
+  const nextMonth = Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth() + 1, 1);
+  const defaultReset5h = new Date(nowMs + 5 * HOUR);
+  const defaultResetWeek = nextWeek;
+  const defaultResetMonth = new Date(nextMonth);
 
   const windows = [];
 
-  if (fiveHourCost > 0 && typeof data.cost5h === "number") {
-    const usedPct = Math.min(999, (data.cost5h / fiveHourCost) * 100);
-    windows.push({
-      key: "5h",
-      label: "5 horas",
-      usedPercent: usedPct,
-      remainingPercent: Math.max(0, 100 - usedPct),
-      reset: data.reset5h ? new Date(data.reset5h) : null,
-      used: data.cost5h,
-      limit: fiveHourCost,
-    });
-  }
+  if (useOverride) {
+    if (fiveHourCost > 0 && typeof override.fiveHourUsed === "number") {
+      const usedPct = Math.min(999, (override.fiveHourUsed / fiveHourCost) * 100);
+      windows.push({
+        key: "5h",
+        label: "5 horas",
+        usedPercent: usedPct,
+        remainingPercent: Math.max(0, 100 - usedPct),
+        reset: override.reset5h ? new Date(override.reset5h) : defaultReset5h,
+        used: override.fiveHourUsed,
+        limit: fiveHourCost,
+        source: "server",
+      });
+    }
+    if (weeklyCost > 0 && typeof override.weeklyUsed === "number") {
+      const usedPct = Math.min(999, (override.weeklyUsed / weeklyCost) * 100);
+      windows.push({
+        key: "week",
+        label: "semanal",
+        usedPercent: usedPct,
+        remainingPercent: Math.max(0, 100 - usedPct),
+        reset: override.resetWeek ? new Date(override.resetWeek) : defaultResetWeek,
+        used: override.weeklyUsed,
+        limit: weeklyCost,
+        source: "server",
+      });
+    }
+    if (monthlyCost > 0 && typeof override.monthlyUsed === "number") {
+      const usedPct = Math.min(999, (override.monthlyUsed / monthlyCost) * 100);
+      windows.push({
+        key: "month",
+        label: "mensual",
+        usedPercent: usedPct,
+        remainingPercent: Math.max(0, 100 - usedPct),
+        reset: override.resetMonth ? new Date(override.resetMonth) : defaultResetMonth,
+        used: override.monthlyUsed,
+        limit: monthlyCost,
+        source: "server",
+      });
+    }
+  } else {
+    if (fiveHourCost > 0 && typeof data.cost5h === "number") {
+      const usedPct = Math.min(999, (data.cost5h / fiveHourCost) * 100);
+      windows.push({
+        key: "5h",
+        label: "5 horas",
+        usedPercent: usedPct,
+        remainingPercent: Math.max(0, 100 - usedPct),
+        reset: data.reset5h ? new Date(data.reset5h) : null,
+        used: data.cost5h,
+        limit: fiveHourCost,
+        source: "local",
+      });
+    }
 
-  if (weeklyCost > 0 && typeof data.costWeek === "number") {
-    const usedPct = Math.min(999, (data.costWeek / weeklyCost) * 100);
-    windows.push({
-      key: "week",
-      label: "semanal",
-      usedPercent: usedPct,
-      remainingPercent: Math.max(0, 100 - usedPct),
-      reset: data.resetWeek ? new Date(data.resetWeek) : null,
-      used: data.costWeek,
-      limit: weeklyCost,
-    });
-  }
+    if (weeklyCost > 0 && typeof data.costWeek === "number") {
+      const usedPct = Math.min(999, (data.costWeek / weeklyCost) * 100);
+      windows.push({
+        key: "week",
+        label: "semanal",
+        usedPercent: usedPct,
+        remainingPercent: Math.max(0, 100 - usedPct),
+        reset: data.resetWeek ? new Date(data.resetWeek) : null,
+        used: data.costWeek,
+        limit: weeklyCost,
+        source: "local",
+      });
+    }
 
-  if (monthlyCost > 0 && typeof data.costMonth === "number") {
-    const usedPct = Math.min(999, (data.costMonth / monthlyCost) * 100);
-    windows.push({
-      key: "month",
-      label: "mensual",
-      usedPercent: usedPct,
-      remainingPercent: Math.max(0, 100 - usedPct),
-      reset: data.resetMonth ? new Date(data.resetMonth) : null,
-      used: data.costMonth,
-      limit: monthlyCost,
-    });
+    if (monthlyCost > 0 && typeof data.costMonth === "number") {
+      const usedPct = Math.min(999, (data.costMonth / monthlyCost) * 100);
+      windows.push({
+        key: "month",
+        label: "mensual",
+        usedPercent: usedPct,
+        remainingPercent: Math.max(0, 100 - usedPct),
+        reset: data.resetMonth ? new Date(data.resetMonth) : null,
+        used: data.costMonth,
+        limit: monthlyCost,
+        source: "local",
+      });
+    }
   }
 
   if (windows.length) {
+    const allServer = windows.every((w) => w.source === "server");
+    const noteText = useOverride
+      ? (override.note ? `Override manual: ${override.note}` : "Override manual desde opencode.ai/auth.")
+      : (usage.note || (usage.cacheHit ? "OpenCode Go desde cache local." : "OpenCode Go DB local."));
     return {
       source: "opencode",
       kind: "detected-percent",
@@ -920,7 +997,8 @@ function buildOpenCodeQuota(usage, config = {}) {
       totalCost: data.totalCost || 0,
       totalTokens: data.totalTokens || 0,
       sessionCount: data.sessionCount || 0,
-      note: usage.note || (usage.cacheHit ? "OpenCode Go desde cache local." : "OpenCode Go DB local."),
+      serverOverride: allServer,
+      note: noteText,
     };
   }
 
@@ -931,7 +1009,10 @@ function buildOpenCodeQuota(usage, config = {}) {
     totalCost: data.totalCost || 0,
     totalTokens: data.totalTokens || 0,
     sessionCount: data.sessionCount || 0,
-    note: "Configura fiveHourCost, weeklyCost o monthlyCost en quotas.json para ver barras de cuota Go.",
+    serverOverride: false,
+    note: useOverride
+      ? "serverOverride.enabled=true pero falta fiveHourUsed/weeklyUsed/monthlyUsed o los limites fiveHourCost/weeklyCost/monthlyCost."
+      : "Configura fiveHourCost, weeklyCost o monthlyCost en quotas.json para ver barras de cuota Go.",
   };
 }
 
@@ -1696,6 +1777,9 @@ function quotaSection(label, color, quota, barWidth, totalWidth) {
   }
 
   if (quota.kind === "detected-percent" && quota.windows?.length) {
+    if (quota.serverOverride && quota.note) {
+      lines.push(fit(`  ${colors.gray}${quota.note}${RESET}`, totalWidth));
+    }
     for (const w of quota.windows) {
       const pct = w.remainingPercent;
       const label2 = (w.label || w.key || "").padEnd(12);
@@ -2150,7 +2234,8 @@ function minimaxPanel(width, usage, quota) {
 
 function opencodePanel(width, usage, quota) {
   const rows = [];
-  rows.push(`${colors.bold}${colors.green}OpenCode Go${RESET} ${colors.gray}(ccusage + DB local)${RESET}`);
+  const headerTag = quota?.serverOverride ? "ccusage + serverOverride" : "ccusage + DB local";
+  rows.push(`${colors.bold}${colors.green}OpenCode Go${RESET} ${colors.gray}(${headerTag})${RESET}`);
   rows.push(hr(width));
 
   if (!usage || usage.ok === false) {
@@ -2171,11 +2256,15 @@ function opencodePanel(width, usage, quota) {
 
   rows.push(`${colors.bold}Cuota Go (limites en USD)${RESET}`);
   if (quota?.ok && Array.isArray(quota.windows) && quota.windows.length) {
+    if (quota.serverOverride && quota.note) {
+      rows.push(colors.gray + quota.note + RESET);
+    }
     for (const w of quota.windows) {
       const used = fmtMoney(w.used || 0);
       const limit = fmtMoney(w.limit || 0);
       const reset = w.reset ? `reset ${fmtReset(w.reset)}` : "";
-      rows.push(fit(`  ${w.label.padEnd(10)} ${bar(w.usedPercent, 100, Math.max(10, width - 36), quotaColor(w.remainingPercent))} ${fmtPct(w.remainingPercent)} queda (${used}/${limit})  ${reset}`, width));
+      const tag = w.source === "server" ? " (server)" : " (local)";
+      rows.push(fit(`  ${w.label.padEnd(10)} ${bar(w.usedPercent, 100, Math.max(10, width - 36), quotaColor(w.remainingPercent))} ${fmtPct(w.remainingPercent)} queda (${used}/${limit})  ${reset}${tag}`, width));
     }
     rows.push("");
     rows.push(colors.gray + "Limites Go: $12/5h, $30/sem, $60/mes." + RESET);
@@ -2189,7 +2278,7 @@ function opencodePanel(width, usage, quota) {
   }
 
   rows.push("");
-  rows.push(colors.gray + "Consumo via ccusage. Cuota via DB local (cache 5 min)." + RESET);
+  rows.push(colors.gray + (quota?.serverOverride ? "Consumo via ccusage. Cuota via serverOverride (manual)." : "Consumo via ccusage. Cuota via DB local (cache 5 min).") + RESET);
   return rows;
 }
 
@@ -2286,12 +2375,16 @@ function renderPlainSummary(snap) {
   if (snap.quotas?.opencode) {
     const oq = snap.quotas.opencode;
     if (oq.ok) {
+      if (oq.serverOverride && oq.note) {
+        lines.push(`OpenCode Go [serverOverride]: ${oq.note}`);
+      }
       if (Array.isArray(oq.windows) && oq.windows.length) {
         for (const w of oq.windows) {
           const used = fmtMoney(w.used || 0);
           const limit = fmtMoney(w.limit || 0);
           const reset = w.reset ? ` reset=${fmtReset(w.reset)}` : "";
-          lines.push(`OpenCode Go ${w.label}: used=${used}/${limit} (${fmtPct(w.usedPercent)}) remaining=${fmtPct(w.remainingPercent)}${reset}`);
+          const tag = w.source === "server" ? " [server]" : " [local]";
+          lines.push(`OpenCode Go ${w.label}: used=${used}/${limit} (${fmtPct(w.usedPercent)}) remaining=${fmtPct(w.remainingPercent)}${reset}${tag}`);
         }
       } else {
         lines.push(`OpenCode Go: cost=${fmtMoney(oq.totalCost || 0)} tokens=${fmtInt(oq.totalTokens || 0)} sessions=${oq.sessionCount || 0}`);

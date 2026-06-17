@@ -62,7 +62,7 @@ up/down select model
 | Gemini CLI | `ccusage` + `/stats model` capture | Cached 15min to avoid burning requests |
 | Antigravity | Local transcript analysis | Sessions, model steps, activity timestamps |
 | MiniMax | Coding Plan API + local cache | Requires `MINIMAX_API_KEY` or `minimax.apiKey` in quota config |
-| OpenCode Go | Local opencode.db SQLite + configured limits | Requires `opencode` installed with `opencode-go` provider via `/connect`. Default limits $12/5h, $30/wk, $60/mo |
+| OpenCode Go | Local opencode.db SQLite + configured limits (+ optional `serverOverride` from dashboard) | Requires `opencode` installed with `opencode-go` provider via `/connect`. Default limits $12/5h, $30/wk, $60/mo. Set `opencode.serverOverride.enabled=true` to use values pasted from `opencode.ai/auth` |
 
 ## Why "effective tokens"?
 
@@ -84,11 +84,47 @@ Useful fields:
   "gemini": { "liveCapture": true, "liveCaptureCacheMinutes": 15 },
   "antigravity": { "monthlyCredits": 1000, "usedCredits": 250, "resetsAt": "2026-07-01" },
   "minimax": { "liveCaptureCacheMinutes": 0, "monthlyCredits": null, "resetsAt": null, "apiKey": null },
-  "opencode": { "liveCaptureCacheMinutes": 5, "fiveHourCost": 12, "weeklyCost": 30, "monthlyCost": 60, "apiKey": null }
+  "opencode": {
+    "liveCaptureCacheMinutes": 5,
+    "fiveHourCost": 12,
+    "weeklyCost": 30,
+    "monthlyCost": 60,
+    "apiKey": null,
+    "serverOverride": {
+      "enabled": false,
+      "fiveHourUsed": null,
+      "weeklyUsed": null,
+      "monthlyUsed": null,
+      "reset5h": null,
+      "resetWeek": null,
+      "resetMonth": null,
+      "note": "Pega aqui los valores reales de opencode.ai/auth (cost en USD y resets ISO). Cuando enabled=true, reemplaza el estimado local."
+    }
+  }
 }
 ```
 
 Set `AI_USAGE_GEMINI_LIVE=0` or `"liveCapture": false` to disable Gemini CLI capture.
+
+### OpenCode Go — server-override
+
+OpenCode Go no expone una API publica para leer la cuota real del servidor. El TUI calcula un estimado desde `~/.local/share/opencode/opencode.db` que suele diferir del dashboard (los costes locales usan tarifas publicas, no las del plan Go).
+
+Si querés ver los valores exactos que muestra `opencode.ai/auth`, pegalos manualmente en `quotas.json` bajo `opencode.serverOverride`:
+
+```json
+"serverOverride": {
+  "enabled": true,
+  "fiveHourUsed": 1.32,
+  "weeklyUsed": 1.20,
+  "monthlyUsed": 1.20,
+  "reset5h": "2026-06-17T22:00:00Z",
+  "resetWeek": "2026-06-22T00:00:00Z",
+  "resetMonth": "2026-07-01T00:00:00Z"
+}
+```
+
+Con `enabled=true` las barras de cuota se calculan desde `fiveHourUsed/weeklyUsed/monthlyUsed` en lugar del DB local. Los campos `reset*` son opcionales (ISO 8601); si no los pasas, se usan los limites por defecto del plan. Ponelo en `enabled=false` para volver al estimado local.
 
 ## Environment variables
 
