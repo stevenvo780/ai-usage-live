@@ -1327,11 +1327,12 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
 
     const rows = stdout.trim() ? JSON.parse(stdout) : [];
     const now = Date.now();
-    const nowDate = new Date();
-    const dayStart = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate()).getTime();
-    const weekStart = dayStart - (nowDate.getDay() || 7) * 86400000 + 86400000;
-    const monthStart = new Date(nowDate.getFullYear(), nowDate.getMonth(), 1).getTime();
-    const fiveHoursAgo = now - 5 * 3600000;
+    const HOUR = 3600000;
+    const DAY = 86400000;
+    // Rolling windows (Go plan tracks last 5h / 7d / 30d, not calendar boundaries)
+    const fiveHoursAgo = now - 5 * HOUR;
+    const sevenDaysAgo = now - 7 * DAY;
+    const thirtyDaysAgo = now - 30 * DAY;
 
     let cost5h = 0, costWeek = 0, costMonth = 0, totalCost = 0;
     let totalTokens = 0, totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0;
@@ -1347,8 +1348,8 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
       totalCacheWrite += Number(row.tokens_cache_write || 0);
 
       if (ts >= fiveHoursAgo) cost5h += cost;
-      if (ts >= weekStart) costWeek += cost;
-      if (ts >= monthStart) costMonth += cost;
+      if (ts >= sevenDaysAgo) costWeek += cost;
+      if (ts >= thirtyDaysAgo) costMonth += cost;
     }
 
     const fiveHourCost = Number(configEntry.fiveHourCost || 12);
@@ -1369,9 +1370,9 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
         totalCacheRead: totalCacheRead,
         totalCacheWrite: totalCacheWrite,
         sessionCount: rows.length,
-        reset5h: new Date(now + 5 * 3600000).toISOString(),
-        resetWeek: new Date(weekStart + 7 * 86400000).toISOString(),
-        resetMonth: new Date(nowDate.getFullYear(), nowDate.getMonth() + 1, 1).toISOString(),
+        reset5h: new Date(now + 5 * HOUR).toISOString(),
+        resetWeek: new Date(now + 7 * DAY).toISOString(),
+        resetMonth: new Date(now + 30 * DAY).toISOString(),
       },
       limits: {
         fiveHourCost: fiveHourCost || null,
