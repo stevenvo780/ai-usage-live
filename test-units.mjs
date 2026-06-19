@@ -1,0 +1,417 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  normalizeTotals,
+  sumRows,
+  extractModels,
+  mergeModels,
+  buildCodexQuota,
+  buildClaudeQuota,
+  buildGeminiQuota,
+  buildMiniMaxQuota,
+  buildOpenCodeQuota,
+  buildAntigravityQuota,
+  buildTokenQuota,
+  parseClaudeUsageOutput,
+  claudeWindowKey,
+  claudeWindowLabel,
+  numberFromAny,
+  bar,
+  truncateAnsi,
+  stripAnsi,
+  visibleLength,
+  fit,
+} from "./ai-usage-tui.mjs";
+
+const HOUR_MS = 3600000;
+
+test("normalizeTotals: basic inputs with cache tokens", () => {
+  const result = normalizeTotals({
+    inputTokens: 100,
+    outputTokens: 50,
+    cacheCreationTokens: 10,
+    cacheReadTokens: 5,
+  });
+
+  assert.strictEqual(result.inputTokens, 100);
+  assert.strictEqual(result.outputTokens, 50);
+  assert.strictEqual(result.cacheCreationTokens, 10);
+  assert.strictEqual(result.cacheReadTokens, 5);
+  assert.strictEqual(result.totalTokens, 165); // input + output + cache creation + cache read
+  assert.strictEqual(result.effectiveTokens, 160); // input + output + cacheCreation
+});
+
+test("normalizeTotals: empty object defaults to zero", () => {
+  const result = normalizeTotals({});
+
+  assert.strictEqual(result.inputTokens, 0);
+  assert.strictEqual(result.outputTokens, 0);
+  assert.strictEqual(result.cacheCreationTokens, 0);
+  assert.strictEqual(result.cacheReadTokens, 0);
+  assert.strictEqual(result.totalTokens, 0);
+  assert.strictEqual(result.effectiveTokens, 0);
+  assert.strictEqual(result.totalCost, 0);
+});
+
+test("normalizeTotals: totalCost with fallback keys", () => {
+  const result = normalizeTotals({
+    inputTokens: 100,
+    outputTokens: 50,
+    cost: 0.5,
+  });
+
+  assert(result.totalCost >= 0.4); // cost fallback key
+});
+
+test("sumRows: aggregates numeric fields across rows", () => {
+  const rows = [
+    {
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+      totalCost: 0.01,
+    },
+    {
+      inputTokens: 20,
+      outputTokens: 15,
+      totalTokens: 35,
+      totalCost: 0.02,
+    },
+  ];
+  const result = sumRows(rows);
+
+  assert.strictEqual(result.inputTokens, 30);
+  assert.strictEqual(result.outputTokens, 20);
+  assert.strictEqual(result.totalTokens, 50);
+  assert.strictEqual(result.totalCost, 0.03);
+});
+
+test("sumRows: empty array returns empty object", () => {
+  const result = sumRows([]);
+  assert.deepEqual(result, {});
+});
+
+test("extractModels: from row.models object", () => {
+  const row = {
+    models: {
+      "claude-3-5": {
+        inputTokens: 50,
+        outputTokens: 25,
+        totalTokens: 75,
+      },
+      "gpt-4": { inputTokens: 30, outputTokens: 20, totalTokens: 50 },
+    },
+    totalTokens: 125,
+    totalCost: 0.1,
+  };
+  const result = extractModels(row);
+
+  assert(Array.isArray(result));
+  assert.strictEqual(result.length, 2);
+  assert(result.some((m) => m.modelName === "claude-3-5"));
+  assert(result.some((m) => m.modelName === "gpt-4"));
+});
+
+test("extractModels: from row.modelsUsed single entry", () => {
+  const row = {
+    modelsUsed: ["claude-3-5"],
+    inputTokens: 100,
+    outputTokens: 50,
+    totalTokens: 150,
+    totalCost: 0.15,
+  };
+  const result = extractModels(row);
+
+  assert(Array.isArray(result));
+  assert.strictEqual(result.length, 1);
+  assert.strictEqual(result[0].modelName, "claude-3-5");
+});
+
+test("extractModels: returns empty array when no models", () => {
+  const row = { name: "test", totalCost: 0.05 };
+  const result = extractModels(row);
+
+  assert(Array.isArray(result));
+  assert.strictEqual(result.length, 0);
+});
+
+test("mergeModels: aggregates models by name", () => {
+  const modelList = [
+    {
+      modelName: "claude-3-5",
+      inputTokens: 50,
+      outputTokens: 25,
+      totalTokens: 75,
+      cost: 0.05,
+    },
+    {
+      modelName: "claude-3-5",
+      inputTokens: 30,
+      outputTokens: 20,
+      totalTokens: 50,
+      cost: 0.03,
+    },
+    {
+      modelName: "gpt-4",
+      inputTokens: 20,
+      outputTokens: 15,
+      totalTokens: 35,
+      cost: 0.04,
+    },
+  ];
+  const result = mergeModels(modelList);
+
+  assert(Array.isArray(result));
+  const claude = result.find((m) => m.modelName === "claude-3-5");
+  assert(claude);
+  assert.strictEqual(claude.inputTokens, 80);
+  assert.strictEqual(claude.totalTokens, 125);
+});
+
+test("buildTokenQuota: creates quota with configured-tokens kind", () => {
+  const result = buildTokenQuota(
+    "test-source",
+    { totals: { totalTokens: 500 } },
+    1000,
+    "5h window"
+  );
+
+  assert.strictEqual(result.source, "test-source");
+  assert.strictEqual(result.kind, "configured-tokens");
+  assert.strictEqual(result.used, 500);
+  assert.strictEqual(result.limit, 1000);
+  assert.strictEqual(result.remaining, 500);
+  assert.strictEqual(result.usedPercent, 50);
+});
+
+test("buildTokenQuota: returns unknown kind with zero limit", () => {
+  const result = buildTokenQuota("test", { totals: { totalTokens: 0 } }, 0, "label");
+  assert.strictEqual(result.source, "test");
+  assert.strictEqual(result.kind, "unknown");
+  assert.strictEqual(result.ok, false);
+});
+
+test("parseClaudeUsageOutput: parses percentage from text", () => {
+  const text = "Claude usage\nCurrent 5h: 45% used";
+  const result = parseClaudeUsageOutput(text);
+
+  assert(result.windows);
+  assert(Array.isArray(result.windows));
+  assert(result.windows.length > 0);
+});
+
+test("parseClaudeUsageOutput: empty text returns no windows", () => {
+  const result = parseClaudeUsageOutput("");
+
+  assert(Array.isArray(result.windows));
+  assert.strictEqual(result.windows.length, 0);
+});
+
+test("claudeWindowKey: returns string key from label", () => {
+  const key = claudeWindowKey("5h");
+  assert(typeof key === "string");
+  assert(key.length > 0);
+});
+
+test("claudeWindowLabel: returns human label from key", () => {
+  const label = claudeWindowLabel("5h");
+  assert(typeof label === "string");
+  assert(label.length > 0);
+});
+
+test("numberFromAny: returns first finite number from keys", () => {
+  const obj = { a: 0, b: 5, c: 10 };
+  const result = numberFromAny(obj, ["a", "b", "c"]);
+
+  assert.strictEqual(result, 0); // 0 is finite
+});
+
+test("numberFromAny: returns null when no finite number found", () => {
+  const obj = { x: "text", y: undefined, z: null };
+  const result = numberFromAny(obj, ["x", "y", "z", "missing"]);
+
+  assert.strictEqual(result, null);
+});
+
+test("bar: generates bar string without crashing", () => {
+  const result = bar(50, 100, 10, "");
+
+  assert(typeof result === "string");
+});
+
+test("bar: handles NaN gracefully", () => {
+  const result = bar(NaN, 100, 10, "");
+
+  assert(typeof result === "string");
+  // Should not throw, result may be empty or placeholder
+});
+
+test("stripAnsi: removes ANSI escape codes", () => {
+  const text = "\x1b[31mhello\x1b[0m world";
+  const result = stripAnsi(text);
+
+  assert.strictEqual(result, "hello world");
+});
+
+test("visibleLength: counts characters without ANSI codes", () => {
+  const text = "\x1b[31mhello\x1b[0m";
+  const result = visibleLength(text);
+
+  assert.strictEqual(result, 5);
+});
+
+test("fit: respects width constraint", () => {
+  const result = fit("hello world extra text", 5);
+
+  assert(typeof result === "string");
+  assert(visibleLength(result) <= 5);
+});
+
+test("truncateAnsi: truncates colored text preserving ANSI", () => {
+  const text = "\x1b[31mhello world\x1b[0m";
+  const result = truncateAnsi(text, 6);
+
+  assert(typeof result === "string");
+  assert(visibleLength(result) <= 6);
+});
+
+test("buildMiniMaxQuota: creates quota from usage", () => {
+  const usage = { cost5h: 100, costWeek: 250, costMonth: 800 };
+  const config = { limits: { minimax: 1000 } };
+  const result = buildMiniMaxQuota(usage, config);
+
+  assert(result.source);
+  assert(result.kind);
+  assert.strictEqual(typeof result.ok, "boolean");
+});
+
+test("buildOpenCodeQuota: creates quota with windows when override enabled", () => {
+  const usage = { cost5h: 50, costWeek: 150, costMonth: 500 };
+  const config = {
+    fiveHourCost: 1000,
+    weeklyCost: 1000,
+    monthlyCost: 1000,
+    serverOverride: {
+      enabled: true,
+      fiveHourUsed: 200,
+      weeklyUsed: 400,
+      monthlyUsed: 600,
+    },
+  };
+  const result = buildOpenCodeQuota(usage, config);
+
+  assert(result.source);
+  assert(result.windows);
+  assert(Array.isArray(result.windows));
+  assert(result.windows.length > 0);
+  assert.strictEqual(typeof result.ok, "boolean");
+});
+
+// --- Refuerzos Opus: valores concretos, no solo tipos ---
+
+test("buildAntigravityQuota: configured credits -> 25% used, 750 left", () => {
+  const q = buildAntigravityQuota(
+    { installed: true, sessions: 3, modelSteps: 9 },
+    { monthlyCredits: 1000, usedCredits: 250 },
+  );
+  assert.strictEqual(q.kind, "configured-credits");
+  assert.strictEqual(q.ok, true);
+  assert.strictEqual(q.used, 250);
+  assert.strictEqual(q.limit, 1000);
+  assert.strictEqual(q.remaining, 750);
+  assert.strictEqual(q.usedPercent, 25);
+  assert.strictEqual(q.remainingPercent, 75);
+});
+
+test("buildAntigravityQuota: installed but unconfigured -> unknown, ok true, points to Gemini", () => {
+  const q = buildAntigravityQuota({ installed: true, sessions: 1, modelSteps: 2 }, {});
+  assert.strictEqual(q.kind, "unknown");
+  assert.strictEqual(q.ok, true);
+  assert.match(q.note, /Gemini/);
+});
+
+test("buildAntigravityQuota: not installed -> ok false", () => {
+  const q = buildAntigravityQuota({ installed: false }, { monthlyCredits: 1000 });
+  assert.strictEqual(q.ok, false);
+});
+
+test("buildMiniMaxQuota: model_remains -> per-model 5h/sem windows with used = 100 - remaining", () => {
+  const now = Date.now();
+  const q = buildMiniMaxQuota(
+    {
+      ok: true,
+      model_remains: [
+        {
+          model_name: "general",
+          current_interval_remaining_percent: 50,
+          current_weekly_remaining_percent: 30,
+          end_time: now + 4 * HOUR_MS,
+          weekly_end_time: now + 5 * 24 * HOUR_MS,
+        },
+      ],
+    },
+    {},
+  );
+  assert.strictEqual(q.kind, "detected-percent");
+  const fiveH = q.windows.find((w) => w.label === "general 5h");
+  const week = q.windows.find((w) => w.label === "general sem");
+  assert(fiveH && week);
+  assert.strictEqual(fiveH.usedPercent, 50);
+  assert.strictEqual(fiveH.remainingPercent, 50);
+  assert.strictEqual(week.usedPercent, 70);
+});
+
+test("buildOpenCodeQuota: serverOverride uses override values (source=server), not local data", () => {
+  const q = buildOpenCodeQuota(
+    { ok: true, data: { cost5h: 99, costWeek: 99, costMonth: 99 } },
+    {
+      fiveHourCost: 12,
+      weeklyCost: 30,
+      monthlyCost: 60,
+      serverOverride: { enabled: true, fiveHourUsed: 6, weeklyUsed: 3, monthlyUsed: 6 },
+    },
+  );
+  assert.strictEqual(q.kind, "detected-percent");
+  const w5 = q.windows.find((w) => w.key === "5h");
+  assert(w5);
+  assert.strictEqual(w5.source, "server");
+  assert.strictEqual(w5.used, 6); // override, not local 99
+  assert.strictEqual(w5.usedPercent, 50); // 6/12
+});
+
+test("buildOpenCodeQuota: local path computes windows from db costs (source=local)", () => {
+  const q = buildOpenCodeQuota(
+    { ok: true, data: { cost5h: 6, costWeek: 15, costMonth: 30 } },
+    { fiveHourCost: 12, weeklyCost: 30, monthlyCost: 60, serverOverride: { enabled: false } },
+  );
+  const w5 = q.windows.find((w) => w.key === "5h");
+  assert(w5);
+  assert.strictEqual(w5.source, "local");
+  assert.strictEqual(w5.usedPercent, 50);
+});
+
+test("buildCodexQuota: configured-tokens path when rate limits disabled", () => {
+  const q = buildCodexQuota(
+    { totals: { totalTokens: 250000 } },
+    { useDetectedRateLimits: false, dailyTokens: 1000000 },
+  );
+  assert.strictEqual(q.kind, "configured-tokens");
+  assert.strictEqual(q.usedPercent, 25);
+});
+
+test("bar: NaN produces no filled cells", () => {
+  const out = stripAnsi(bar(NaN, 100, 10, ""));
+  assert(!out.includes("#"));
+});
+
+test("bar: 50% fills exactly half", () => {
+  const out = stripAnsi(bar(50, 100, 10, ""));
+  assert.strictEqual((out.match(/#/g) || []).length, 5);
+});
+
+test("truncateAnsi: preserves the color code seen before the cut", () => {
+  const out = truncateAnsi("\x1b[31mhello world\x1b[0m", 6);
+  assert(out.includes("\x1b[31m")); // color preserved
+  assert(out.endsWith("\x1b[0m")); // RESET appended
+  assert(visibleLength(out) <= 6);
+});
