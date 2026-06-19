@@ -20,7 +20,7 @@ Terminal dashboard for local AI CLI usage — monitors Claude Code, Codex CLI, A
 
 ```bash
 bash package-ai-usage-live.sh
-sudo dpkg -i dist/ai-usage-live_0.8.0_all.deb
+sudo dpkg -i dist/ai-usage-live_0.9.0_all.deb
 ```
 
 ### Manual
@@ -36,6 +36,7 @@ chmod +x ai-usage-live ai-usage.sh ai-usage-quota
 ```bash
 ai-usage-live                          # Interactive TUI
 ai-usage-live --once                   # One-shot plain text summary
+ai-usage-live --json                   # JSON output for scripts/agents
 ai-usage-live daily all --refresh 5    # Auto-refresh every 5s
 ai-usage-live daily antigravity        # Focus on Antigravity
 ai-usage daily                         # ccusage daily summary
@@ -55,6 +56,138 @@ up/down/left/right navigate cards in the grid
 enter open detailed view of selected provider
 esc return to grid
 c Claude, x Codex, v Antigravity, m MiniMax, o OpenCode (directly select provider card)
+```
+
+## MCP server
+
+El proyecto incluye un servidor Model Context Protocol (MCP) llamado `ai-usage-mcp` (implementado en `ai-usage-mcp.mjs`). Es un servidor zero-dependency que funciona mediante stdio con JSON-RPC 2.0. Permite a agentes y modelos de IA consultar dinámicamente el estado y uso de las cuotas locales para decidir qué proveedor o modelo utilizar.
+
+### Registro en el cliente
+
+Para registrar el servidor MCP en clientes compatibles (como Claude Desktop o Claude Code), añade la configuración a tu archivo de settings correspondiente:
+
+```json
+{
+  "mcpServers": {
+    "ai-usage": {
+      "command": "ai-usage-mcp"
+    }
+  }
+}
+```
+
+O bien, usando la ruta absoluta al script en sistemas donde no esté el binario en el PATH global:
+
+```json
+{
+  "mcpServers": {
+    "ai-usage": {
+      "command": "node",
+      "args": ["/absolute/path/to/ai-usage-mcp.mjs"]
+    }
+  }
+}
+```
+
+### Herramientas expuestas (Tools)
+
+* **`get_ai_quotas`**: Retorna el uso y cuotas estructuradas de todos los proveedores configurados.
+  - **Argumentos**: Sin argumentos (`{}`).
+  - **Nota**: La primera llamada puede tardar unos segundos ya que realiza consultas en vivo a los CLIs/APIs de los proveedores (Claude, Codex, Antigravity, MiniMax, OpenCode Go). Las llamadas subsecuentes utilizan la caché local rápida.
+
+### Ejemplo de respuesta JSON
+
+```json
+{
+  "capturedAt": "2026-06-19T18:16:36.527Z",
+  "since": "2026-06-19",
+  "providers": {
+    "claude": {
+      "ok": true,
+      "kind": "detected-percent",
+      "windows": [
+        {
+          "label": "sesion",
+          "usedPercent": 72,
+          "remainingPercent": 28,
+          "resetInSeconds": 3143,
+          "resetAt": "2026-06-19T19:09:00.000Z",
+          "resetText": "Jun 19, 7:09pm (UTC)"
+        }
+      ],
+      "note": "Claude /usage desde cache local."
+    },
+    "codex": {
+      "ok": true,
+      "kind": "detected-percent",
+      "windows": [
+        {
+          "label": "5h",
+          "usedPercent": 100,
+          "remainingPercent": 0,
+          "resetInSeconds": 2820,
+          "resetAt": "2026-06-19T19:03:37.000Z"
+        }
+      ],
+      "note": "Rate limit detectado desde sesiones Codex."
+    },
+    "antigravity": {
+      "ok": true,
+      "kind": "detected-percent",
+      "windows": [
+        {
+          "label": "5 horas",
+          "usedPercent": 41,
+          "remainingPercent": 59,
+          "resetInSeconds": 3120,
+          "resetAt": "2026-06-19T19:08:36.527Z",
+          "family": "Gemini",
+          "resetText": "52m"
+        },
+        {
+          "label": "semanal",
+          "usedPercent": 35,
+          "remainingPercent": 65,
+          "resetInSeconds": 299700,
+          "resetAt": "2026-06-23T05:31:36.527Z",
+          "family": "Claude/GPT",
+          "resetText": "83h 15m"
+        }
+      ],
+      "note": "Antigravity /usage (CLI, 2 grupos: Gemini + Claude/GPT)."
+    },
+    "minimax": {
+      "ok": true,
+      "kind": "detected-percent",
+      "windows": [
+        {
+          "label": "general 5h",
+          "usedPercent": 13,
+          "remainingPercent": 87,
+          "resetInSeconds": 6203,
+          "resetAt": "2026-06-19T20:00:00.000Z"
+        }
+      ],
+      "note": "MiniMax Coding Plan."
+    },
+    "opencode": {
+      "ok": true,
+      "kind": "detected-percent",
+      "windows": [
+        {
+          "label": "5 horas",
+          "usedPercent": 0,
+          "remainingPercent": 100,
+          "resetInSeconds": 18000,
+          "resetAt": "2026-06-19T23:16:36.238Z",
+          "source": "web",
+          "resetText": "5 hours"
+        }
+      ],
+      "note": "Cuota real (opencode.ai/auth)."
+    }
+  }
+}
 ```
 
 ## Data sources
