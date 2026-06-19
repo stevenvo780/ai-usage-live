@@ -62,7 +62,7 @@ up/down select model
 | Gemini CLI | (Removido) | Proveedor removido. Google revocó el OAuth de gemini-cli (`invalid_grant`). Antigravity es ahora la vía de acceso a los modelos Gemini. |
 | Antigravity | Local transcript analysis + Cuota real automática | Es la vía de acceso a los modelos Gemini. Cuota real detectada automáticamente vía API `cloudcode-pa` (URL: `POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`) + consumo local (sesiones, pasos, actividad) derivado de transcripts locales. |
 | MiniMax | Coding Plan API + local cache | Requires `MINIMAX_API_KEY` or `minimax.apiKey` in quota config |
-| OpenCode Go | Local opencode.db SQLite + configured limits | Requires `opencode` installed with `opencode-go` provider (or variants `opencode-go:*`). Set `opencode.serverOverride.enabled=true` to use exact web values |
+| OpenCode Go | Cuota real vía scrape web autenticado + fallback override/local | Requires `opencode` installed with `opencode-go` provider. Soporta scrape web (cookie + workspaceId), override manual o estimado local. |
 
 ## Why "effective tokens"?
 
@@ -146,26 +146,46 @@ El soporte para Gemini CLI ha sido removido debido a que Google revocó el OAuth
 
 ### OpenCode Go — server-override
 
-OpenCode Go no expone una API publica para leer la cuota real del servidor. El TUI calcula un estimado desde `~/.local/share/opencode/opencode.db` que suele diferir del dashboard (los costes locales usan tarifas publicas, no las del plan Go).
+OpenCode Go no expone una API pública para leer la cuota real del servidor. Sin embargo, ahora es posible consultar la cuota real automáticamente mediante un scrape web autenticado del dashboard.
 
-Si querés ver los valores exactos que muestra `opencode.ai/auth`, pegalos manualmente en `quotas.json` bajo `opencode.serverOverride`:
+#### Cómo funciona el scrape web
+- **Fetch**: Realiza peticiones HTTP GET a `https://opencode.ai/workspace/<workspaceId>/go` enviando la cookie de sesión `auth`.
+- **User-Agent**: Se utiliza un User-Agent de navegador Chrome para evitar que Cloudflare bloquee la petición al detectarla como bot.
+- **Parsing**: Parsea el HTML SSR del dashboard buscando los bloques de consumo (*Rolling/Weekly/Monthly Usage*) para extraer el porcentaje usado real y los tiempos de reset de cada período.
+- **Caché**: Los datos obtenidos se almacenan en caché por 5 minutos.
+
+#### Configuración en `quotas.json`
+Edita la sección `opencode` en tu archivo `quotas.json` y agrega las siguientes claves:
 
 ```json
-"serverOverride": {
-  "enabled": true,
-  "fiveHourUsed": 1.32,
-  "weeklyUsed": 1.20,
-  "monthlyUsed": 1.20,
-  "reset5h": "2026-06-17T22:00:00Z",
-  "resetWeek": "2026-06-22T00:00:00Z",
-  "resetMonth": "2026-07-01T00:00:00Z"
+"opencode": {
+  "cookie": "tu_valor_de_cookie_auth",
+  "workspaceId": "wrk_xxx"
 }
 ```
 
-Con `enabled=true` las barras de cuota se calculan desde `fiveHourUsed/weeklyUsed/monthlyUsed` en lugar del DB local. Cuando habilitás esta opción, el dashboard ahora muestra **TAMBIÉN el estimado local (tarifas públicas)** al lado de la cuota del servidor para que puedas comparar fácilmente.
-Ejemplo: `estimado local (tarifa publica): 5h $1.58 sem $30.52 mes $30.52`.
+- **`cookie`**: El valor de la cookie `auth` de sesión de `opencode.ai`.
+- **`workspaceId`**: El identificador de tu workspace (por ejemplo, `wrk_xxx`).
 
-Los campos `reset*` son opcionales (ISO 8601); si no los pasas, se usan los limites por defecto del plan. Ponelo en `enabled=false` para volver únicamente al estimado local.
+#### Cómo obtener la cookie
+1. Inicia sesión en tu cuenta en [opencode.ai](https://opencode.ai) en el navegador.
+2. Abre las herramientas de desarrollo (**F12** o clic derecho -> Inspeccionar).
+3. Dirígete a la pestaña **Application** (Chrome/Edge) o **Almacenamiento** (Firefox) y expande la sección **Cookies** seleccionando `https://opencode.ai`.
+4. Copia el valor del campo `auth`.
+
+#### Precedencia de datos
+El dashboard procesará las fuentes de datos según la siguiente prioridad:
+1. **Scrape Web (`[web]`)**: Si se configuran `cookie` y `workspaceId` en `quotas.json` (y `AI_USAGE_OPENCODE_WEB` no está establecido en `0`), se mostrará la cuota real obtenida de la web.
+2. **Server Override Manual**: Si el scrape no está disponible o falla, pero `serverOverride.enabled` está en `true`, se usarán los valores manuales de `quotas.json`.
+3. **Estimado Local**: Si no hay datos web ni manuales, se utilizará la estimación local de consumo a partir del archivo de base de datos `opencode.db`.
+
+#### Desactivación del Scrape Web
+Puedes desactivar temporal o permanentemente el scrape web estableciendo la variable de entorno `AI_USAGE_OPENCODE_WEB=0`. Por defecto, su valor es `1`.
+
+#### Nota de seguridad
+La cookie es un secreto de sesión sensible:
+- El comando `ai-usage-quota show` oculta/redacta el valor de la cookie automáticamente en pantalla.
+- El archivo `quotas.json` se ubica fuera del repositorio (en `~/.config/ai-usage-live/`) y nunca debe ser añadido al control de versiones.
 
 ## Environment variables
 
@@ -182,6 +202,7 @@ Los campos `reset*` son opcionales (ISO 8601); si no los pasas, se usan los limi
 | `MINIMAX_USAGE_URL` | `https://api.minimax.io/v1/api/openplatform/coding_plan/remains` | Override endpoint API de MiniMax |
 | `AI_USAGE_OPENCODE_LIVE` | `1` | Set to `0` to disable OpenCode Go DB capture |
 | `OPENCODE_USAGE_CACHE_MINUTES` | `5` | OpenCode Go DB cache duration |
+| `AI_USAGE_OPENCODE_WEB` | `1` | Set to `0` to disable OpenCode Go web scraping / Establece en `0` para desactivar el scrape web de cuota de OpenCode Go |
 | `XDG_CONFIG_HOME` | `~/.config` | Base directory for `ai-usage-live/quotas.json` and local caches |
 | `AI_USAGE_GEMINI_LIVE` | `1` | *(Obsoleta/Removida)* Set to `0` to disable Gemini capture |
 | `AI_USAGE_GEMINI_TIMEOUT` | `45` | *(Obsoleta/Removida)* Gemini capture timeout in seconds |
