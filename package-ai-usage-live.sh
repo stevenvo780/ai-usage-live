@@ -2,11 +2,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="${VERSION:-0.5.3}"
+VERSION="${VERSION:-$(node -p "require('./package.json').version" 2>/dev/null || echo 0.5.5)}"
 PKG_NAME="ai-usage-live"
 BUILD_DIR="$ROOT/build/${PKG_NAME}_${VERSION}_all"
 DIST_DIR="$ROOT/dist"
 
+rm -rf "$ROOT/build" "$ROOT/dist"/*.deb 2>/dev/null || true
 rm -rf "$BUILD_DIR"
 mkdir -p \
   "$BUILD_DIR/DEBIAN" \
@@ -18,6 +19,7 @@ install -m 0755 "$ROOT/ai-usage-tui.mjs" "$BUILD_DIR/opt/ai-usage-live/ai-usage-
 install -m 0755 "$ROOT/gemini-quota-capture.py" "$BUILD_DIR/opt/ai-usage-live/gemini-quota-capture.py"
 install -m 0755 "$ROOT/ai-usage.sh" "$BUILD_DIR/opt/ai-usage-live/ai-usage.sh"
 install -m 0755 "$ROOT/ai-usage-quota" "$BUILD_DIR/opt/ai-usage-live/ai-usage-quota"
+install -m 0644 "$ROOT/LICENSE" "$BUILD_DIR/usr/share/doc/ai-usage-live/LICENSE"
 install -m 0644 "$ROOT/README.md" "$BUILD_DIR/usr/share/doc/ai-usage-live/README.md"
 
 cat > "$BUILD_DIR/usr/bin/ai-usage-live" <<'WRAPPER'
@@ -46,7 +48,7 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: all
-Depends: nodejs, npm
+Depends: nodejs, npm, python3
 Maintainer: Local Codex <local@example.invalid>
 Description: Terminal dashboard for local AI CLI usage
  Provides a btop-style terminal dashboard for Claude Code, Codex CLI,
