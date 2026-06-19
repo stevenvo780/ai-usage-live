@@ -1,12 +1,12 @@
 # ai-usage-live
 
-Terminal dashboard for local AI CLI usage — monitors Claude Code, Codex CLI, Gemini CLI, Antigravity, MiniMax, and OpenCode Go in a single btop-style TUI.
+Terminal dashboard for local AI CLI usage — monitors Claude Code, Codex CLI, Antigravity, MiniMax, and OpenCode Go in a single btop-style TUI. (Note: Gemini CLI has been removed as Google revoked its OAuth).
 
 ## Features
 
-- **Real-time quota monitoring** for Claude, Codex, Gemini, Antigravity, and MiniMax
+- **Real-time quota monitoring** for Claude, Codex, Antigravity, and MiniMax
 - **Effective token counting** — separates cache-read tokens from real consumption so Claude usage isn't inflated by prompt caching (cache reads can be 97%+ of reported totalTokens)
-- **Live quota detection** from `claude /usage` and `gemini /stats model`
+- **Live quota detection** from `claude /usage` and real quota for Antigravity via Google's consumer API
 - **Codex rate-limit detection** from local session events
 - **Model-by-model breakdown** with sorting by effective tokens
 - **Auto-refresh** with configurable interval
@@ -17,13 +17,13 @@ Terminal dashboard for local AI CLI usage — monitors Claude Code, Codex CLI, G
 
 ```bash
 bash package-ai-usage-live.sh
-sudo dpkg -i dist/ai-usage-live_0.5.5_all.deb
+sudo dpkg -i dist/ai-usage-live_0.6.0_all.deb
 ```
 
 ### Manual
 
 ```bash
-# Requires Node.js 18+ and optionally Python 3 for Gemini quota capture
+# Requires Node.js 18+
 chmod +x ai-usage-live ai-usage.sh ai-usage-quota
 ./ai-usage-live
 ```
@@ -48,7 +48,7 @@ ai-usage-quota edit                    # Edit quota limits
 q exit
 r refresh (forces live provider refresh)
 1 daily, 2 weekly, 3 monthly, 4 session, 5 blocks
-a all, c Claude, x Codex, g Gemini, v Antigravity, m MiniMax, o OpenCode
+a all, c Claude, x Codex, v Antigravity, m MiniMax, o OpenCode
 up/down select model
 ```
 
@@ -59,8 +59,8 @@ up/down select model
 | Claude Code | `ccusage` local logs | Effective tokens = input + cacheCreate + output (excludes cache reads) |
 | Claude quota | `claude -p /usage` | Reports session, weekly (all), weekly (Sonnet) percentages |
 | Codex CLI | `ccusage` local logs + rate_limits from sessions | Auto-detects 5h and weekly windows |
-| Gemini CLI | `ccusage` local logs | Cuota `/stats model` muerta por revocación OAuth (devuelve `authDead`). CLI sigue funcional para `ccusage` de consumo local. |
-| Antigravity | Local transcript analysis + Cuota manual | Es la ruta a modelos Gemini. Cuota manual se define en `quotas.json`. Consumo (sesiones, pasos, actividad) se deriva de transcripts locales. |
+| Gemini CLI | (Removido) | Proveedor removido. Google revocó el OAuth de gemini-cli (`invalid_grant`). Antigravity es ahora la vía de acceso a los modelos Gemini. |
+| Antigravity | Local transcript analysis + Cuota real automática | Es la vía de acceso a los modelos Gemini. Cuota real detectada automáticamente vía API `cloudcode-pa` (URL: `POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`) + consumo local (sesiones, pasos, actividad) derivado de transcripts locales. |
 | MiniMax | Coding Plan API + local cache | Requires `MINIMAX_API_KEY` or `minimax.apiKey` in quota config |
 | OpenCode Go | Local opencode.db SQLite + configured limits | Requires `opencode` installed with `opencode-go` provider (or variants `opencode-go:*`). Set `opencode.serverOverride.enabled=true` to use exact web values |
 
@@ -91,12 +91,6 @@ Useful fields:
   "codex": {
     "useDetectedRateLimits": true,
     "dailyTokens": null
-  },
-  "gemini": {
-    "liveCapture": true,
-    "liveCaptureCacheMinutes": 15,
-    "dailyTokens": null,
-    "dailyRequests": null
   },
   "antigravity": {
     "monthlyCredits": null,
@@ -129,16 +123,26 @@ Useful fields:
 }
 ```
 
-Para **Antigravity**, es necesario configurar manualmente los campos `monthlyCredits`, `usedCredits` y `resetsAt` (con valores numéricos y formato ISO respectivamente) para que el dashboard muestre la barra de cuota.
+Para **Antigravity**, la cuota real se obtiene automáticamente y no requiere configuración manual. Sin embargo, los campos `monthlyCredits`, `usedCredits` y `resetsAt` (con valores numéricos y formato ISO respectivamente) se pueden configurar opcionalmente en `quotas.json` como fallback si la API de cuota real falla.
 
-Set `AI_USAGE_GEMINI_LIVE=0` or `"liveCapture": false` to disable Gemini CLI capture.
+Set `AI_USAGE_ANTIGRAVITY_LIVE=0` to disable Antigravity live quota capture.
 
 ### Antigravity (Gemini)
 
-Antigravity es ahora la ruta principal a los modelos Gemini, ya que Google lo expone vía Antigravity (y no vía CLI directo de manera estable). Se renderiza como "Antigravity (Gemini)" en los tabs de Cuotas y en la vista `--once`.
+Antigravity es ahora la vía de acceso principal a los modelos Gemini, ya que Google lo expone a través de esta herramienta. Se renderiza como "Antigravity (Gemini)" en los tabs de Cuotas y en la vista `--once`.
 
-- **Cuota manual**: Al no haber una API de cuota estable expuesta localmente, la cuota es 100% manual. Se debe definir a través de los valores `antigravity.monthlyCredits`, `usedCredits` y `resetsAt` en `quotas.json`.
+- **Cuota real automática**: Muestra la cuota real automáticamente consumiendo la API de Google Cloud Code:
+  - **URL**: `POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`
+  - **Auth**: Token de tipo Bearer obtenido desde `~/.gemini/antigravity-cli/antigravity-oauth-token`
+  - **Project**: Proyecto ID leído desde `~/.gemini/antigravity-cli/cache/projects.json`
+  - **Respuesta**: Procesa el arreglo de `buckets[]` por modelo Gemini con `remainingFraction` y `resetTime` (para el tokenType `REQUESTS`).
+  - **Sin configuración manual**: No requiere credenciales nuevas ni configuración adicional de claves de API.
+- **Cuota manual (Fallback)**: Si la API de cuota falla o no se detecta la sesión activa, el dashboard utilizará como fallback los valores manuales configurados en `antigravity.monthlyCredits`, `usedCredits` y `resetsAt` de `quotas.json`.
 - **Consumo**: El consumo interno (sesiones, pasos del modelo y timestamps de actividad) se deriva analizando directamente los transcripts locales generados por Antigravity.
+
+### Gemini CLI (Removido)
+
+El soporte para Gemini CLI ha sido removido debido a que Google revocó el OAuth de gemini-cli (`invalid_grant`), inhabilitando la consulta directa de cuota. Antigravity es ahora la vía exclusiva para acceder y monitorear el consumo de los modelos Gemini.
 
 ### OpenCode Go — server-override
 
@@ -169,9 +173,8 @@ Los campos `reset*` son opcionales (ISO 8601); si no los pasas, se usan los limi
 |---|---|---|
 | `REFRESH_SEC` | `10` | Auto-refresh interval in seconds |
 | `AI_USAGE_CLAUDE_LIVE` | `1` | Set to `0` to disable Claude /usage |
-| `AI_USAGE_GEMINI_LIVE` | `1` | Set to `0` to disable Gemini capture |
-| `AI_USAGE_GEMINI_TIMEOUT` | `45` | Gemini capture timeout in seconds |
-| `AI_USAGE_GEMINI_DEBUG_FILE` | — | Write raw Gemini capture output to file |
+| `AI_USAGE_ANTIGRAVITY_LIVE` | `1` | Set to `0` to disable Antigravity live quota API capture / Establece en `0` para desactivar la API de cuota de Antigravity |
+| `ANTIGRAVITY_USAGE_CACHE_MINUTES` | `15` | Antigravity quota API cache duration / Minutos de caché para la API de cuota de Antigravity |
 | `MINIMAX_API_KEY` | — | MiniMax Coding Plan API key |
 | `AI_USAGE_MINIMAX_LIVE` | `1` | Set to `0` to disable MiniMax API capture |
 | `MINIMAX_USAGE_CACHE_MINUTES` | `0` | MiniMax API cache duration |
@@ -180,6 +183,9 @@ Los campos `reset*` son opcionales (ISO 8601); si no los pasas, se usan los limi
 | `AI_USAGE_OPENCODE_LIVE` | `1` | Set to `0` to disable OpenCode Go DB capture |
 | `OPENCODE_USAGE_CACHE_MINUTES` | `5` | OpenCode Go DB cache duration |
 | `XDG_CONFIG_HOME` | `~/.config` | Base directory for `ai-usage-live/quotas.json` and local caches |
+| `AI_USAGE_GEMINI_LIVE` | `1` | *(Obsoleta/Removida)* Set to `0` to disable Gemini capture |
+| `AI_USAGE_GEMINI_TIMEOUT` | `45` | *(Obsoleta/Removida)* Gemini capture timeout in seconds |
+| `AI_USAGE_GEMINI_DEBUG_FILE` | — | *(Obsoleta/Removida)* Write raw Gemini capture output to file |
 
 ## License
 
