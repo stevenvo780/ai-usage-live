@@ -16,6 +16,7 @@ mkdir -p \
   "$BUILD_DIR/usr/share/doc/ai-usage-live"
 
 install -m 0755 "$ROOT/ai-usage-tui.mjs" "$BUILD_DIR/opt/ai-usage-live/ai-usage-tui.mjs"
+install -m 0755 "$ROOT/ai-usage-mcp.mjs" "$BUILD_DIR/opt/ai-usage-live/ai-usage-mcp.mjs"
 install -m 0755 "$ROOT/gemini-quota-capture.py" "$BUILD_DIR/opt/ai-usage-live/gemini-quota-capture.py"
 install -m 0755 "$ROOT/antigravity-usage-capture.py" "$BUILD_DIR/opt/ai-usage-live/antigravity-usage-capture.py"
 install -m 0755 "$ROOT/ai-usage.sh" "$BUILD_DIR/opt/ai-usage-live/ai-usage.sh"
@@ -41,7 +42,13 @@ set -euo pipefail
 exec /opt/ai-usage-live/ai-usage-quota "$@"
 WRAPPER
 
-chmod 0755 "$BUILD_DIR/usr/bin/ai-usage-live" "$BUILD_DIR/usr/bin/ai-usage" "$BUILD_DIR/usr/bin/ai-usage-quota"
+cat > "$BUILD_DIR/usr/bin/ai-usage-mcp" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+exec node /opt/ai-usage-live/ai-usage-mcp.mjs "$@"
+WRAPPER
+
+chmod 0755 "$BUILD_DIR/usr/bin/ai-usage-live" "$BUILD_DIR/usr/bin/ai-usage" "$BUILD_DIR/usr/bin/ai-usage-quota" "$BUILD_DIR/usr/bin/ai-usage-mcp"
 
 cat > "$BUILD_DIR/DEBIAN/control" <<CONTROL
 Package: ai-usage-live

@@ -86,6 +86,7 @@ const state = {
   cardIndex: 0,
   detail: false,
   once: args.once,
+  json: args.json,
 };
 
 let ccusageCommand = null;
@@ -105,13 +106,14 @@ if (INVOKED_DIRECTLY) {
 
 async function main() {
   ccusageCommand = detectCcusage();
-  const interactive = !state.once && process.stdin.isTTY && process.stdout.isTTY;
+  const interactive = !state.once && !state.json && process.stdin.isTTY && process.stdout.isTTY;
   state.lastSnapshot = interactive
     ? await collectSnapshot({ includeLive: false })
     : await collectSnapshot({ includeLive: true, ignoreMiniMaxCache: true });
 
   if (!interactive) {
-    console.log(renderPlainSummary(state.lastSnapshot));
+    if (state.json) console.log(JSON.stringify(buildAgentQuotaSummary(state.lastSnapshot), null, 2));
+    else console.log(renderPlainSummary(state.lastSnapshot));
     return;
   }
 
@@ -133,6 +135,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--once") parsed.once = true;
+    else if (arg === "--json") parsed.json = true;
     else if (arg === "--since") parsed.since = argv[++i];
     else if (arg === "--until") parsed.until = argv[++i];
     else if (arg === "--refresh") parsed.refreshSec = Number(argv[++i]);
@@ -3256,8 +3259,58 @@ function exit(code) {
   process.exit(code);
 }
 
-// Exports para pruebas unitarias (no se ejecuta main() al importar; ver INVOKED_DIRECTLY).
+function agentRound(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.round(n * 10) / 10 : null;
+}
+
+// Resumen estructurado de cuotas para consumo por agentes (MCP / --json).
+// Aplana cada proveedor en {windows:[{usedPercent, remainingPercent, resetInSeconds, ...}]}
+// para que un agente decida que proveedor/modelo usar segun disponibilidad.
+function buildAgentQuotaSummary(snap) {
+  const nowMs = Date.now();
+  const out = { capturedAt: new Date().toISOString(), since: snap?.since || null, providers: {} };
+  const quotas = snap?.quotas || {};
+  for (const provider of ["claude", "codex", "antigravity", "minimax", "opencode"]) {
+    const quota = quotas[provider];
+    if (!quota) continue;
+    const windows = (Array.isArray(quota.windows) ? quota.windows : []).map((w) => {
+      const resetMs = w.reset instanceof Date ? w.reset.getTime() : (w.reset ? Date.parse(w.reset) : NaN);
+      const entry = {
+        label: String(w.label || w.key || ""),
+        usedPercent: agentRound(w.usedPercent),
+        remainingPercent: agentRound(w.remainingPercent),
+        resetInSeconds: Number.isFinite(resetMs) ? Math.max(0, Math.round((resetMs - nowMs) / 1000)) : null,
+        resetAt: Number.isFinite(resetMs) ? new Date(resetMs).toISOString() : null,
+      };
+      if (w.family) entry.family = w.family;
+      if (w.source) entry.source = w.source;
+      if (w.resetText) entry.resetText = w.resetText;
+      if (w.available) entry.available = true;
+      return entry;
+    });
+    out.providers[provider] = {
+      ok: quota.ok !== false,
+      kind: quota.kind || "unknown",
+      windows,
+      note: quota.note || "",
+    };
+  }
+  return out;
+}
+
+// Punto de entrada para el servidor MCP: colecta un snapshot fresco (con live) y
+// devuelve el resumen para agentes. Importable sin ejecutar el TUI (INVOKED_DIRECTLY).
+async function runQuotaSnapshot() {
+  if (!ccusageCommand) ccusageCommand = detectCcusage();
+  const snap = await collectSnapshot({ includeLive: true });
+  return buildAgentQuotaSummary(snap);
+}
+
+// Exports para pruebas unitarias y el servidor MCP (no se ejecuta main() al importar).
 export {
+  buildAgentQuotaSummary,
+  runQuotaSnapshot,
   normalizeTotals,
   sumRows,
   extractModels,
