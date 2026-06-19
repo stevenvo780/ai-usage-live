@@ -943,6 +943,38 @@ function staleAntigravityQuota(note) {
   return { source: "antigravity", ok: false, note };
 }
 
+function parseRefreshShort(text) {
+  // "93h 46m" / "55m" / "2d 3h" -> Date futura.
+  let ms = 0;
+  let found = false;
+  for (const m of String(text || "").matchAll(/(\d+)\s*([dhms])/gi)) {
+    found = true;
+    const n = Number(m[1]);
+    const u = m[2].toLowerCase();
+    ms += n * (u === "d" ? 86400000 : u === "h" ? 3600000 : u === "m" ? 60000 : 1000);
+  }
+  return found ? new Date(Date.now() + ms) : null;
+}
+
+async function captureAntigravityUsage(config = {}) {
+  // Captura el comando interactivo `/usage` del CLI agy, que muestra la cuota por
+  // GRUPO (Gemini y Claude/GPT) — la API SDK solo expone Gemini.
+  const helper = path.join(SCRIPT_DIR, "antigravity-usage-capture.py");
+  if (!existsSync(helper)) return { ok: false };
+  const timeoutSeconds = Math.max(15, Number(config.usageTimeoutSeconds || 40));
+  try {
+    const { stdout } = await execFileAsync("python3", [helper], {
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: (timeoutSeconds + 5) * 1000,
+      env: { ...process.env, AI_USAGE_ANTIGRAVITY_TIMEOUT: String(timeoutSeconds) },
+    });
+    return JSON.parse(stdout);
+  } catch {
+    return { ok: false };
+  }
+}
+
 async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false } = {}) {
   // Cuota REAL del plan consumer de Antigravity (Gemini) via el backend
   // cloudcode-pa.googleapis.com:retrieveUserQuota, usando el oauth-token local.
@@ -956,6 +988,24 @@ async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false } 
     if (cached) return { ...cached, cacheHit: true };
   }
 
+  // 1) Fuente PRIMARIA: el comando /usage del CLI agy (cuota por grupo Gemini + Claude/GPT).
+  if (process.env.AI_USAGE_ANTIGRAVITY_USAGE !== "0") {
+    const viaUsage = await captureAntigravityUsage(config);
+    if (viaUsage?.ok && Array.isArray(viaUsage.groups) && viaUsage.groups.length) {
+      const output = {
+        source: "antigravity",
+        ok: true,
+        groups: viaUsage.groups,
+        capturedAt: viaUsage.capturedAt || new Date().toISOString(),
+        cacheHit: false,
+        note: "Antigravity /usage (CLI).",
+      };
+      writeJsonCache(ANTIGRAVITY_QUOTA_CACHE_PATH, output);
+      return output;
+    }
+  }
+
+  // 2) Fallback: API SDK retrieveUserQuota (solo Gemini por-modelo).
   const tokenRaw = readJsonSafe(ANTIGRAVITY_TOKEN_PATH);
   const accessToken = tokenRaw?.token?.access_token || tokenRaw?.access_token;
   if (!accessToken) {
@@ -1018,8 +1068,38 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
   if (lastActivity) statBits.push(`ult ${timeOnly(lastActivity)}`);
   const statsNote = statBits.join("  ");
 
-  // 1) Cuota REAL desde la API (retrieveUserQuota). Listamos TODOS los modelos con
-  //    cuota: Gemini primero, luego el resto (claude, gpt, etc.) que el plan tambien ofrece.
+  // 1) Fuente CLI /usage: grupos Gemini y Claude/GPT, cada uno con limite 5h y semanal.
+  if (live?.ok && Array.isArray(live.groups) && live.groups.length) {
+    const windows = [];
+    for (const g of live.groups) {
+      const fam = g.name || "grupo";
+      for (const [key, label, w] of [["5h", "5 horas", g.fiveHour], ["sem", "semanal", g.weekly]]) {
+        const rem = w ? Number(w.remainingPercent) : NaN;
+        if (!Number.isFinite(rem)) continue;
+        const remPct = Math.max(0, Math.min(100, rem));
+        windows.push({
+          key: `${fam}-${key}`,
+          label,
+          family: fam,
+          usedPercent: Math.max(0, Math.min(100, 100 - remPct)),
+          remainingPercent: remPct,
+          reset: parseRefreshShort(w.refreshText),
+          resetText: w.refreshText || "",
+        });
+      }
+    }
+    if (windows.length) {
+      return {
+        source: "antigravity",
+        kind: "detected-percent",
+        ok: true,
+        windows,
+        note: `Antigravity /usage (CLI, ${live.groups.length} grupos: Gemini + Claude/GPT).  ${statsNote}${live.cacheStale ? "  [cache]" : ""}`,
+      };
+    }
+  }
+
+  // 2) Fallback API: retrieveUserQuota (Gemini por-modelo) + modelos ofrecidos como "disponibles".
   if (live?.ok && Array.isArray(live.buckets) && live.buckets.length) {
     const isGemini = (b) => /gemini/i.test(b.modelId);
     const sorted = [...live.buckets].sort((a, b) => {
@@ -2282,8 +2362,7 @@ function drawQuotaDetail(width, provider, quota) {
       if (!groups.has(fam)) groups.set(fam, []);
       groups.get(fam).push(w);
     }
-    const order = ["gemini", "otros"].filter((k) => groups.has(k));
-    for (const k of Object.keys(groups)) if (!order.includes(k)) order.push(k);
+    const order = [...groups.keys()]; // Map: preserva orden de insercion (Gemini primero)
     for (const fam of order) {
       const ws = groups.get(fam);
       const famLabel = fam === "gemini" ? "Gemini" : fam === "otros" ? "Otros" : fam;

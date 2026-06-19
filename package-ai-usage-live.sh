@@ -17,6 +17,7 @@ mkdir -p \
 
 install -m 0755 "$ROOT/ai-usage-tui.mjs" "$BUILD_DIR/opt/ai-usage-live/ai-usage-tui.mjs"
 install -m 0755 "$ROOT/gemini-quota-capture.py" "$BUILD_DIR/opt/ai-usage-live/gemini-quota-capture.py"
+install -m 0755 "$ROOT/antigravity-usage-capture.py" "$BUILD_DIR/opt/ai-usage-live/antigravity-usage-capture.py"
 install -m 0755 "$ROOT/ai-usage.sh" "$BUILD_DIR/opt/ai-usage-live/ai-usage.sh"
 install -m 0755 "$ROOT/ai-usage-quota" "$BUILD_DIR/opt/ai-usage-live/ai-usage-quota"
 install -m 0644 "$ROOT/LICENSE" "$BUILD_DIR/usr/share/doc/ai-usage-live/LICENSE"
