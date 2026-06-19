@@ -26,6 +26,7 @@ import {
   fit,
   fmtCountdown,
   blockBar,
+  buildAgentQuotaSummary,
 } from "./ai-usage-tui.mjs";
 
 const HOUR_MS = 3600000;
@@ -561,4 +562,29 @@ test("parseClaudeResetText: '7:10pm' -> 19:10 UTC", () => {
 test("parseClaudeResetText: garbage/empty -> null", () => {
   assert.strictEqual(parseClaudeResetText("nonsense xyz"), null);
   assert.strictEqual(parseClaudeResetText(""), null);
+});
+
+test("buildAgentQuotaSummary: aplana windows con resetInSeconds", () => {
+  const future = new Date(Date.now() + 3600*1000);
+  const snap = { since:"2026-06-19", quotas: { codex: { ok:true, kind:"detected-percent", windows:[{ label:"5h", usedPercent:80, remainingPercent:20, reset: future }], note:"n" } } };
+  const out = buildAgentQuotaSummary(snap);
+  assert(typeof out.capturedAt === "string");
+  assert.strictEqual(out.providers.codex.ok, true);
+  assert.strictEqual(out.providers.codex.windows[0].usedPercent, 80);
+  assert.strictEqual(out.providers.codex.windows[0].remainingPercent, 20);
+  const ri = out.providers.codex.windows[0].resetInSeconds;
+  assert(ri >= 3500 && ri <= 3600);
+  assert(typeof out.providers.codex.windows[0].resetAt === "string");
+});
+
+test("buildAgentQuotaSummary: window sin reset -> resetInSeconds null", () => {
+  const snap = { quotas: { minimax: { ok:true, kind:"detected-percent", windows:[{ label:"5h", usedPercent:0, remainingPercent:100 }], note:"" } } };
+  const out = buildAgentQuotaSummary(snap);
+  assert.strictEqual(out.providers.minimax.windows[0].resetInSeconds, null);
+  assert.strictEqual(out.providers.minimax.windows[0].resetAt, null);
+});
+
+test("buildAgentQuotaSummary: snapshot vacío -> providers {}", () => {
+  const out = buildAgentQuotaSummary({});
+  assert.deepEqual(out.providers, {});
 });
