@@ -42,6 +42,17 @@ const SOURCE_META = {
 
 const ALL_SOURCES = ["claude", "codex", "opencode"];
 const SOURCE_KEYS = ["all", "claude", "codex", "antigravity", "minimax", "opencode"];
+// Orden de las tarjetas del grid de cuotas (drill-down con flechas + enter).
+const PROVIDER_ORDER = ["claude", "codex", "antigravity", "minimax", "opencode"];
+// Metadata visual de cada proveedor para el grid/detalle de cuotas.
+// Iconos single-width (NO emojis doble-ancho) para que no descuadren el TUI.
+const PROVIDER_META = {
+  claude: { label: "Claude", color: colors.magenta, icon: "\u2726" },
+  codex: { label: "Codex", color: colors.green, icon: "\u2B21" },
+  antigravity: { label: "Antigravity", color: colors.yellow, icon: "\u25C6" },
+  minimax: { label: "MiniMax", color: colors.cyan, icon: "\u25B0" },
+  opencode: { label: "OpenCode", color: colors.blue, icon: "\u26C1" },
+};
 const VIEW_KEYS = ["daily", "weekly", "monthly", "session", "blocks"];
 const TAB_KEYS = ["cuotas", "consumo"];
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -72,6 +83,8 @@ const state = {
   loading: false,
   error: "",
   selectedModel: 0,
+  cardIndex: 0,
+  detail: false,
   once: args.once,
 };
 
@@ -976,30 +989,34 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
   if (lastActivity) statBits.push(`ult ${timeOnly(lastActivity)}`);
   const statsNote = statBits.join("  ");
 
-  // 1) Cuota REAL desde la API (retrieveUserQuota). Mostramos los buckets Gemini.
+  // 1) Cuota REAL desde la API (retrieveUserQuota). Listamos TODOS los modelos con
+  //    cuota: Gemini primero, luego el resto (claude, gpt, etc.) que el plan tambien ofrece.
   if (live?.ok && Array.isArray(live.buckets) && live.buckets.length) {
-    const gemini = live.buckets.filter((b) => /gemini/i.test(b.modelId));
-    const pool = gemini.length ? gemini : live.buckets;
-    const sorted = [...pool].sort((a, b) => a.remainingFraction - b.remainingFraction);
-    const shown = sorted.slice(0, 6);
-    const windows = shown.map((b) => {
+    const isGemini = (b) => /gemini/i.test(b.modelId);
+    const sorted = [...live.buckets].sort((a, b) => {
+      const ga = isGemini(a) ? 0 : 1;
+      const gb = isGemini(b) ? 0 : 1;
+      if (ga !== gb) return ga - gb; // gemini primero
+      return a.remainingFraction - b.remainingFraction; // dentro del grupo, mas usado primero
+    });
+    const windows = sorted.map((b) => {
       const remPct = Math.max(0, Math.min(100, b.remainingFraction * 100));
       return {
         key: b.modelId,
-        label: shortText(b.modelId.replace(/-preview$/, ""), 16),
+        label: shortText(b.modelId.replace(/-preview$/, ""), 18),
+        family: isGemini(b) ? "gemini" : "otros",
         usedPercent: Math.max(0, Math.min(100, 100 - remPct)),
         remainingPercent: remPct,
         reset: b.resetTime ? new Date(b.resetTime) : null,
       };
     });
-    const extra = sorted.length - shown.length;
     const unit = live.buckets[0]?.tokenType || "req";
     return {
       source: "antigravity",
       kind: "detected-percent",
       ok: true,
       windows,
-      note: `Gemini via Antigravity (API real, ${unit}${extra > 0 ? `, +${extra} modelos` : ""}).  ${statsNote}${live.cacheStale ? "  [cache]" : ""}`,
+      note: `Antigravity (API real, ${unit}, ${windows.length} modelos).  ${statsNote}${live.cacheStale ? "  [cache]" : ""}`,
     };
   }
 
@@ -1941,6 +1958,16 @@ function onKey(buffer) {
       i += 2;
       continue;
     }
+    if (input.startsWith("\x1b[C", i)) {
+      handleKey("\x1b[C");
+      i += 2;
+      continue;
+    }
+    if (input.startsWith("\x1b[D", i)) {
+      handleKey("\x1b[D");
+      i += 2;
+      continue;
+    }
     handleKey(input[i]);
   }
 }
@@ -1960,13 +1987,49 @@ function handleKey(key) {
   else if (key === "v") setSource("antigravity");
   else if (key === "m") setSource("minimax");
   else if (key === "o") setSource("opencode");
-  else if (key === "\x1b[A") moveModel(-1);
-  else if (key === "\x1b[B") moveModel(1);
+  else if (key === "\x1b[A") onArrow("up");
+  else if (key === "\x1b[B") onArrow("down");
+  else if (key === "\x1b[C") onArrow("right");
+  else if (key === "\x1b[D") onArrow("left");
+  else if (key === "\r" || key === "\n") onEnter();
+  else if (key === "\x1b") onBack();
+}
+
+function onArrow(dir) {
+  if (state.tab === "consumo") {
+    if (dir === "up") moveModel(-1);
+    else if (dir === "down") moveModel(1);
+    return;
+  }
+  // Cuotas: grid o detalle — flechas mueven la tarjeta seleccionada.
+  if (dir === "up" || dir === "left") moveCard(-1);
+  else moveCard(1);
+}
+
+function moveCard(delta) {
+  const n = PROVIDER_ORDER.length;
+  if (!n) return;
+  state.cardIndex = (((state.cardIndex + delta) % n) + n) % n;
+  render();
+}
+
+function onEnter() {
+  if (state.tab !== "cuotas") return;
+  state.detail = !state.detail;
+  render();
+}
+
+function onBack() {
+  if (state.tab === "cuotas" && state.detail) {
+    state.detail = false;
+    render();
+  }
 }
 
 function toggleTab() {
   const idx = TAB_KEYS.indexOf(state.tab);
   state.tab = TAB_KEYS[(idx + 1) % TAB_KEYS.length];
+  state.detail = false;
   render();
 }
 
@@ -1979,6 +2042,8 @@ function setView(view) {
 function setSource(source) {
   state.source = source;
   state.selectedModel = 0;
+  const idx = PROVIDER_ORDER.indexOf(source);
+  if (idx >= 0) state.cardIndex = idx;
   render();
 }
 
@@ -2028,37 +2093,176 @@ function draw(width, height) {
   while (lines.length < height - 2) lines.push("");
   lines.push(hr(width));
   const helpText = state.tab === "cuotas"
-    ? `${colors.gray}q salir | r refrescar | Tab cambiar pestaña${RESET}`
-    : `${colors.gray}q salir | r refrescar | Tab pestaña | 1-5 vista | a/c/x/g/v/m fuente | flechas modelos${RESET}`;
+    ? (state.detail
+        ? `${colors.gray}\u2191\u2193\u2190\u2192 navegar \u00B7 esc volver \u00B7 tab consumo \u00B7 r refrescar \u00B7 q salir${RESET}`
+        : `${colors.gray}\u2191\u2193\u2190\u2192 navegar \u00B7 enter detalle \u00B7 tab consumo \u00B7 r refrescar \u00B7 q salir${RESET}`)
+    : `${colors.gray}\u2191\u2193\u2190\u2192 modelos \u00B7 1-5 vista \u00B7 a/c/x/v/m/o fuente \u00B7 tab cuotas \u00B7 r refrescar \u00B7 q salir${RESET}`;
   lines.push(fit(helpText, width));
   return lines.slice(0, height);
 }
 
 function drawQuotaTab(width, maxHeight, snap) {
+  const quotas = (snap && snap.quotas) || {};
+  const selected = PROVIDER_ORDER[state.cardIndex] || PROVIDER_ORDER[0];
+
+  let lines;
+  if (state.detail) {
+    lines = drawQuotaDetail(width, selected, quotas[selected]);
+  } else {
+    lines = drawQuotaGrid(width, maxHeight, quotas, selected);
+  }
+  const cap = Math.max(1, Number(maxHeight) || 1);
+  return lines.slice(0, cap);
+}
+
+function drawQuotaGrid(width, maxHeight, quotas, selected) {
+  const gap = 2;
+  const cols = width >= 110 ? 4 : width >= 75 ? 3 : width >= 50 ? 2 : 1;
+  const cardW = Math.max(22, Math.min(30, Math.floor((width - (cols - 1) * gap) / cols)));
+
+  const cardList = PROVIDER_ORDER.map((provider) =>
+    renderQuotaCard(cardW, provider, quotas[provider], provider === selected),
+  );
+
+  const rowCap = Math.max(1, Number(maxHeight) || cardList.length * 6);
+  const out = [];
+  for (let i = 0; i < cardList.length; i += cols) {
+    if (out.length >= rowCap) break;
+    const rowCards = cardList.slice(i, i + cols);
+    const maxH = Math.max(...rowCards.map((c) => c.length));
+    for (let y = 0; y < maxH; y += 1) {
+      if (out.length >= rowCap) break;
+      const parts = rowCards.map((card) => {
+        const line = card[y];
+        if (line === undefined) return " ".repeat(cardW);
+        const vl = visibleLength(line);
+        if (vl < cardW) return line + " ".repeat(cardW - vl);
+        if (vl > cardW) return truncateAnsi(line, cardW);
+        return line;
+      });
+      out.push(fit(parts.join(" ".repeat(gap)), width));
+    }
+  }
+  return out;
+}
+
+function renderQuotaCard(cardW, provider, quota, selected) {
+  const meta = PROVIDER_META[provider] || { label: provider, color: colors.gray, icon: "?" };
+  const inner = Math.max(4, cardW - 2);
   const lines = [];
-  const quotas = snap.quotas || {};
-  const halfWidth = Math.max(30, Math.floor((width - 4) / 2));
+  const borderColor = selected ? `${colors.bold}${meta.color}` : colors.gray;
+  const inv = selected ? colors.inverse : "";
 
-  // Claude quota
-  lines.push(...quotaSection("Claude", colors.magenta, quotas.claude, halfWidth, width));
-  lines.push("");
+  const headPrefix = ` ${meta.icon} ${meta.label} `;
+  const headFill = Math.max(1, inner - visibleLength(headPrefix));
+  lines.push(`${borderColor}${inv}\u250C${headPrefix}${"\u2500".repeat(headFill)}\u2510${RESET}`);
 
-  // Codex quota
-  lines.push(...quotaSection("Codex", colors.green, quotas.codex, halfWidth, width));
-  lines.push("");
+  const windows = quota && quota.ok !== false && Array.isArray(quota.windows) ? quota.windows : [];
+  const bodyBorder = `${meta.color}${inv}`;
+  const bodyLine = (content) =>
+    `${bodyBorder}\u2502${fit(content, inner)}\u2502${RESET}`;
 
-  // Antigravity quota (Gemini via API real; reemplaza al gemini-cli que Google deautenticó)
-  lines.push(...quotaSection("Antigravity (Gemini)", colors.yellow, quotas.antigravity, halfWidth, width));
-  lines.push("");
+  if (!quota || quota.ok === false || !windows.length) {
+    const note = truncate(String(quota?.note || "sin datos"), Math.max(0, inner - 2));
+    lines.push(bodyLine(` ${note} `));
+  } else {
+    const labelW = 5;
+    const pctMax = 5;
+    const barW = Math.max(5, inner - 14);
+    const shown = windows.slice(0, 3);
+    for (const w of shown) {
+      const label = truncate(String(w.label || w.key || ""), labelW).padEnd(labelW);
+      const pct = fmtPct(w.usedPercent);
+      const bar = blockBar(w.usedPercent, barW, quotaColor(Number(w.remainingPercent)));
+      const content = ` ${label} ${bar} ${pct.padStart(pctMax)} `;
+      lines.push(bodyLine(content));
+    }
+  }
 
-  // MiniMax quota
-  lines.push(...quotaSection("MiniMax", colors.cyan, quotas.minimax, halfWidth, width));
-  lines.push("");
+  const upcomingResets = windows
+    .map((w) => w.reset)
+    .filter((r) => r != null)
+    .map((r) => (r instanceof Date ? r : new Date(r)))
+    .filter((d) => !Number.isNaN(d.getTime()));
+  let cdText = "--";
+  if (upcomingResets.length) {
+    upcomingResets.sort((a, b) => a.getTime() - b.getTime());
+    cdText = fmtCountdown(upcomingResets[0]);
+  }
 
-  // OpenCode quota
-  lines.push(...quotaSection("OpenCode", colors.green, quotas.opencode, halfWidth, width));
+  let tag = "";
+  const tagged = windows.find((w) => w.source === "web" || w.source === "server" || w.source === "local");
+  if (tagged?.source) {
+    tag = ` [${tagged.source}]`;
+  } else {
+    const family = windows.find((w) => w.family)?.family;
+    if (family) tag = ` [${family}]`;
+  }
+  const more = windows.length > 3 ? ` +${windows.length - 3} \u21B5` : "";
+  const footContent = ` \u21BB ${cdText}${tag}${more} `;
+  lines.push(bodyLine(footContent));
 
-  return lines.slice(0, maxHeight);
+  lines.push(`${borderColor}\u2514${"\u2500".repeat(inner)}\u2518${RESET}`);
+  return lines;
+}
+
+function drawQuotaDetail(width, provider, quota) {
+  const meta = PROVIDER_META[provider] || { label: provider, color: colors.gray, icon: "?" };
+  const lines = [];
+  const noteRaw = quota?.note ? String(quota.note) : "";
+  const maxNote = Math.max(0, width - meta.label.length - 8);
+  const noteSuffix = noteRaw ? ` \u2014 ${truncate(noteRaw, maxNote)}` : "";
+  const title = ` ${meta.icon} ${meta.label}${noteSuffix}`;
+  lines.push(fit(`${colors.bold}${meta.color}${title}${RESET}`, width));
+  lines.push(hr(width));
+
+  if (!quota || quota.ok === false) {
+    lines.push(fit(` ${colors.gray}${truncate(String(quota?.note || "sin datos"), Math.max(0, width - 2))}${RESET}`, width));
+    return lines;
+  }
+
+  const windows = Array.isArray(quota.windows) ? quota.windows : [];
+  if (!windows.length) {
+    lines.push(fit(` ${colors.gray}${truncate(String(quota.note || "sin datos"), Math.max(0, width - 2))}${RESET}`, width));
+    return lines;
+  }
+
+  const barW = Math.max(8, Math.floor(width * 0.4));
+  const hasFamily = windows.some((w) => w.family);
+  const labelW = 20;
+
+  if (hasFamily) {
+    const groups = new Map();
+    for (const w of windows) {
+      const fam = w.family || "default";
+      if (!groups.has(fam)) groups.set(fam, []);
+      groups.get(fam).push(w);
+    }
+    const order = ["gemini", "otros"].filter((k) => groups.has(k));
+    for (const k of Object.keys(groups)) if (!order.includes(k)) order.push(k);
+    for (const fam of order) {
+      const ws = groups.get(fam);
+      const famLabel = fam === "gemini" ? "Gemini" : fam === "otros" ? "Otros" : fam;
+      lines.push(fit(`${colors.bold}${colors.yellow} ${famLabel}${RESET}`, width));
+      for (const w of ws) {
+        lines.push(fit(detailQuotaLine(w, barW, labelW), width));
+      }
+    }
+  } else {
+    for (const w of windows) {
+      lines.push(fit(detailQuotaLine(w, barW, labelW), width));
+    }
+  }
+
+  return lines;
+}
+
+function detailQuotaLine(w, barW, labelW) {
+  const label = truncate(String(w.label || w.key || ""), labelW).padEnd(labelW);
+  const pct = fmtPct(w.usedPercent);
+  const cd = fmtCountdown(w.reset);
+  const bar = blockBar(w.usedPercent, barW, quotaColor(Number(w.remainingPercent)));
+  return ` ${label} ${bar} ${pct} usado  \u21BB ${cd}`;
 }
 
 function quotaSection(label, color, quota, barWidth, totalWidth) {
@@ -2754,6 +2958,30 @@ function quotaColor(remainingPercent) {
   return colors.green;
 }
 
+function fmtCountdown(date) {
+  if (!date) return "--";
+  const target = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(target.getTime())) return "--";
+  const diffMs = target.getTime() - Date.now();
+  if (diffMs <= 0) return "<1m";
+
+  const totalMinutes = Math.ceil(diffMs / 60000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+
+  if (days > 0) return `${days}d${hours}h`;
+  if (hours > 0) return `${hours}h${minutes}m`;
+  return `${Math.max(1, minutes)}m`;
+}
+
+function blockBar(usedPercent, width, color) {
+  const size = Math.max(1, width);
+  const pct = Number.isFinite(usedPercent) ? usedPercent : 0;
+  const filled = Math.max(0, Math.min(size, Math.round((Math.max(0, Math.min(100, pct)) / 100) * size)));
+  return `${color}${"█".repeat(filled)}${colors.gray}${"░".repeat(Math.max(0, size - filled))}${RESET}`;
+}
+
 function fmtPct(value) {
   const n = Number(value || 0);
   return `${n.toFixed(n >= 10 ? 0 : 1)}%`;
@@ -2927,6 +3155,10 @@ export {
   visibleLength,
   fit,
   fmtPct,
+  fmtCountdown,
+  blockBar,
+  drawQuotaTab,
+  PROVIDER_META,
   fmtMoney,
   fmtInt,
   fmtCompact,
