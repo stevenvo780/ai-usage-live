@@ -57,6 +57,8 @@ const ANTIGRAVITY_QUOTA_CACHE_PATH = path.join(CONFIG_DIR, "antigravity-quota-ca
 const ANTIGRAVITY_TOKEN_PATH = path.join(homedir(), ".gemini", "antigravity-cli", "antigravity-oauth-token");
 const ANTIGRAVITY_PROJECTS_PATH = path.join(homedir(), ".gemini", "antigravity-cli", "cache", "projects.json");
 const ANTIGRAVITY_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
+const OPENCODE_SERVER_CACHE_PATH = path.join(CONFIG_DIR, "opencode-server-cache.json");
+const OPENCODE_WEB_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 const args = parseArgs(process.argv.slice(2));
 const state = {
@@ -278,6 +280,9 @@ async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ig
     ? await collectOpenCodeUsage(quotaConfig, { ignoreCache: ignoreLiveCache || ignoreMiniMaxCache })
     : staleOpenCodeUsage("OpenCode Go se esta capturando; mostrando ultimo dato conocido.")
       || { source: "opencode", ok: false, note: "OpenCode Go se esta capturando en segundo plano." };
+  sources.opencodeServer = includeLive
+    ? await collectOpenCodeServerUsage(quotaConfig.opencode, { ignoreCache: ignoreLiveCache || ignoreMiniMaxCache })
+    : (readJsonSafe(OPENCODE_SERVER_CACHE_PATH) ? { ...readJsonSafe(OPENCODE_SERVER_CACHE_PATH), cacheHit: true, cacheStale: true } : { ok: false });
   const liveQuotaSettled = await liveQuotaPromise;
   sources.claudeLive = liveQuotaSettled[0].status === "fulfilled" ? liveQuotaSettled[0].value : { ok: false };
   sources.antigravityLive = liveQuotaSettled[1].status === "fulfilled" ? liveQuotaSettled[1].value : { ok: false };
@@ -557,6 +562,8 @@ function defaultQuotaConfig() {
       weeklyCost: 30,
       monthlyCost: 60,
       apiKey: null,
+      cookie: null,
+      workspaceId: null,
       serverOverride: {
         enabled: false,
         fiveHourUsed: null,
@@ -605,7 +612,7 @@ function buildQuotaState(sources, config) {
     codex: buildCodexQuota(sources.codex, config.codex),
     claude: buildClaudeQuota(sources.claude, sources.claudeBlocks, config.claude, sources.claudeLive),
     minimax: buildMiniMaxQuota(sources.minimax, config.minimax),
-    opencode: buildOpenCodeQuota(sources.opencodeLive, config.opencode),
+    opencode: buildOpenCodeQuota(sources.opencodeLive, config.opencode, sources.opencodeServer),
     antigravity: buildAntigravityQuota(sources.antigravity, config.antigravity, sources.antigravityLive),
   };
 }
@@ -1031,7 +1038,28 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
   };
 }
 
-function buildOpenCodeQuota(usage, config = {}) {
+function buildOpenCodeQuota(usage, config = {}, server = null) {
+  const data = usage?.data || usage || {};
+
+  // 0) Cuota REAL desde opencode.ai/auth (scrape web autenticado). Precedencia maxima.
+  if (server?.ok && Array.isArray(server.windows) && server.windows.length) {
+    const localBits = [];
+    if (typeof data.cost5h === "number") localBits.push(`5h ${fmtMoney(data.cost5h)}`);
+    if (typeof data.costWeek === "number") localBits.push(`sem ${fmtMoney(data.costWeek)}`);
+    if (typeof data.costMonth === "number") localBits.push(`mes ${fmtMoney(data.costMonth)}`);
+    return {
+      source: "opencode",
+      kind: "detected-percent",
+      ok: true,
+      windows: server.windows,
+      totalCost: data.totalCost || 0,
+      totalTokens: data.totalTokens || 0,
+      sessionCount: data.sessionCount || 0,
+      serverOverride: false,
+      note: `Cuota real (opencode.ai/auth)${server.cacheStale ? " [cache]" : ""}.${localBits.length ? `  ·  estimado local (tarifa publica): ${localBits.join("  ")}` : ""}`,
+    };
+  }
+
   if (!usage) {
     return { source: "opencode", kind: "unknown", ok: false, note: "Sin datos." };
   }
@@ -1039,7 +1067,6 @@ function buildOpenCodeQuota(usage, config = {}) {
     return { source: "opencode", kind: "unknown", ok: false, note: usage.note || "OpenCode Go no configurado." };
   }
 
-  const data = usage.data || usage;
   const fiveHourCost = Number(config.fiveHourCost || 0);
   const weeklyCost = Number(config.weeklyCost || 0);
   const monthlyCost = Number(config.monthlyCost || 0);
@@ -1549,6 +1576,102 @@ function staleOpenCodeUsage(note) {
     cacheStale: true,
     note,
   };
+}
+
+function staleOpenCodeServer(note) {
+  const stale = readJsonSafe(OPENCODE_SERVER_CACHE_PATH);
+  if (stale?.ok) return { ...stale, cacheHit: true, cacheStale: true, note: `${note} Usando cache.` };
+  return { ok: false, note };
+}
+
+function parseResetDuration(text) {
+  let ms = 0;
+  let found = false;
+  const re = /(\d+)\s*(day|hour|minute|second)s?/gi;
+  let m;
+  while ((m = re.exec(text))) {
+    found = true;
+    const n = Number(m[1]);
+    const unit = m[2].toLowerCase();
+    ms += n * (unit === "day" ? 86400000 : unit === "hour" ? 3600000 : unit === "minute" ? 60000 : 1000);
+  }
+  return found ? new Date(Date.now() + ms) : null;
+}
+
+function parseOpenCodeServerUsage(html) {
+  // El dashboard de opencode.ai/auth es SSR (SolidStart). Quitamos los marcadores
+  // de hidratacion y extraemos los 3 bloques Rolling/Weekly/Monthly.
+  const clean = String(html).replace(/<!--\$-->/g, "").replace(/<!--\/-->/g, "");
+  const specs = [
+    { match: "Rolling", key: "5h", label: "5 horas" },
+    { match: "Weekly", key: "week", label: "semanal" },
+    { match: "Monthly", key: "month", label: "mensual" },
+  ];
+  const resets = [...clean.matchAll(/reset-time">\s*Resets in\s*([^<]+?)\s*<\/span>/g)].map((r) => r[1].trim());
+  const windows = [];
+  let resetIdx = 0;
+  for (const spec of specs) {
+    const re = new RegExp(`usage-label">${spec.match} Usage</span><span data-slot="usage-value">\\s*(\\d+)\\s*%`);
+    const m = clean.match(re);
+    if (!m) continue;
+    const usedPercent = Math.max(0, Math.min(100, Number(m[1])));
+    const resetText = resets[resetIdx] || "";
+    resetIdx += 1;
+    windows.push({
+      key: spec.key,
+      label: spec.label,
+      usedPercent,
+      remainingPercent: Math.max(0, 100 - usedPercent),
+      reset: parseResetDuration(resetText),
+      resetText,
+      source: "web",
+    });
+  }
+  if (!windows.length) return { ok: false, note: "no pude parsear opencode.ai/go (cambio el HTML o cookie invalida)." };
+  return { ok: true, windows };
+}
+
+async function collectOpenCodeServerUsage(config = {}, { ignoreCache = false } = {}) {
+  // Cuota REAL del plan Go via scrape autenticado de opencode.ai/auth (no hay API).
+  if (process.env.AI_USAGE_OPENCODE_WEB === "0") return { ok: false, disabled: true, note: "OpenCode web desactivado." };
+  const cookie = config?.cookie;
+  const workspaceId = config?.workspaceId;
+  if (!cookie || !workspaceId) {
+    return { ok: false, note: "Sin cookie/workspaceId de opencode.ai (pon opencode.cookie y opencode.workspaceId en quotas.json)." };
+  }
+  const cacheMinutes = Number(process.env.OPENCODE_USAGE_CACHE_MINUTES ?? config.liveCaptureCacheMinutes ?? 5);
+  if (!ignoreCache) {
+    const cached = readJsonCache(OPENCODE_SERVER_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
+    if (cached) return { ...cached, cacheHit: true };
+  }
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    let html;
+    let httpStatus;
+    try {
+      const resp = await fetch(`https://opencode.ai/workspace/${workspaceId}/go`, {
+        headers: { "User-Agent": OPENCODE_WEB_UA, Cookie: `auth=${cookie}`, Accept: "text/html" },
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      httpStatus = resp.status;
+      if (resp.status >= 300) {
+        const hint = resp.status === 302 || resp.status === 401 || resp.status === 403 ? " (cookie expirada? repega la cookie auth)" : "";
+        return staleOpenCodeServer(`opencode.ai HTTP ${resp.status}${hint}.`);
+      }
+      html = await resp.text();
+    } finally {
+      clearTimeout(timer);
+    }
+    const parsed = parseOpenCodeServerUsage(html);
+    if (!parsed.ok) return staleOpenCodeServer(parsed.note);
+    const output = { source: "opencode", ...parsed, capturedAt: new Date().toISOString(), cacheHit: false };
+    writeJsonCache(OPENCODE_SERVER_CACHE_PATH, output);
+    return output;
+  } catch (error) {
+    return staleOpenCodeServer(`opencode.ai web fallo: ${shortError(error)}`);
+  }
 }
 
 async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } = {}) {
@@ -2546,11 +2669,10 @@ function renderPlainSummary(snap) {
       }
       if (Array.isArray(oq.windows) && oq.windows.length) {
         for (const w of oq.windows) {
-          const used = fmtMoney(w.used || 0);
-          const limit = fmtMoney(w.limit || 0);
-          const reset = w.reset ? ` reset=${fmtReset(w.reset)}` : "";
-          const tag = w.source === "server" ? " [server]" : " [local]";
-          lines.push(`OpenCode Go ${w.label}: used=${used}/${limit} (${fmtPct(w.usedPercent)}) remaining=${fmtPct(w.remainingPercent)}${reset}${tag}`);
+          const reset = w.reset ? ` reset=${fmtReset(w.reset)}` : (w.resetText ? ` reset="${w.resetText}"` : "");
+          const tag = w.source === "web" ? " [web]" : w.source === "server" ? " [server]" : " [local]";
+          const amount = w.used != null ? `${fmtMoney(w.used)}/${fmtMoney(w.limit || 0)} ` : "";
+          lines.push(`OpenCode Go ${w.label}: used=${amount}(${fmtPct(w.usedPercent)}) remaining=${fmtPct(w.remainingPercent)}${reset}${tag}`);
         }
       } else {
         lines.push(`OpenCode Go: cost=${fmtMoney(oq.totalCost || 0)} tokens=${fmtInt(oq.totalTokens || 0)} sessions=${oq.sessionCount || 0}`);
@@ -2793,6 +2915,8 @@ export {
   buildOpenCodeQuota,
   buildAntigravityQuota,
   buildTokenQuota,
+  parseOpenCodeServerUsage,
+  parseResetDuration,
   parseClaudeUsageOutput,
   claudeWindowKey,
   claudeWindowLabel,

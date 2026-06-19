@@ -153,7 +153,10 @@ case "${1:-show}" in
 const fs = require("fs");
 const file = process.argv[2];
 const config = JSON.parse(fs.readFileSync(file, "utf8"));
-if (config.minimax?.apiKey) config.minimax.apiKey = `${config.minimax.apiKey.slice(0, 8)}...redacted`;
+const redact = (v) => (typeof v === "string" && v ? `${v.slice(0, 6)}...redacted` : v);
+if (config.minimax?.apiKey) config.minimax.apiKey = redact(config.minimax.apiKey);
+if (config.opencode?.apiKey) config.opencode.apiKey = redact(config.opencode.apiKey);
+if (config.opencode?.cookie) config.opencode.cookie = redact(config.opencode.cookie);
 console.log(JSON.stringify(config, null, 2));
 NODE
     ;;
