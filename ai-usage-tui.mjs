@@ -1010,13 +1010,23 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
         reset: b.resetTime ? new Date(b.resetTime) : null,
       };
     });
+    // Modelos no-Gemini que Antigravity ofrece (Claude/GPT, desde `agy models`).
+    // La API de cuota NO expone su uso, asi que los listamos como "disponibles".
+    const offered = Array.isArray(usage?.models) ? usage.models : [];
+    let extraCount = 0;
+    for (const m of offered) {
+      if (/gemini/i.test(m)) continue; // los Gemini ya van con cuota real arriba
+      windows.push({ key: m, label: m, family: "otros", available: true });
+      extraCount += 1;
+    }
     const unit = live.buckets[0]?.tokenType || "req";
+    const offeredNote = extraCount ? ` + ${extraCount} disponibles sin cuota (Claude/GPT)` : "";
     return {
       source: "antigravity",
       kind: "detected-percent",
       ok: true,
       windows,
-      note: `Antigravity (API real, ${unit}, ${windows.length} modelos).  ${statsNote}${live.cacheStale ? "  [cache]" : ""}`,
+      note: `Antigravity (API real, ${unit}, ${windows.length - extraCount} con cuota${offeredNote}).  ${statsNote}${live.cacheStale ? "  [cache]" : ""}`,
     };
   }
 
@@ -2171,7 +2181,7 @@ function renderQuotaCard(cardW, provider, quota, selected) {
     const labelW = 8;
     const pctMax = 5;
     const barW = Math.max(5, inner - (labelW + pctMax + 4));
-    const shown = windows.slice(0, 3);
+    const shown = windows.filter((w) => !w.available).slice(0, 3);
     for (const w of shown) {
       const label = truncate(String(w.label || w.key || ""), labelW).padEnd(labelW);
       const pct = fmtPct(w.usedPercent);
@@ -2231,7 +2241,7 @@ function drawQuotaDetail(width, provider, quota) {
 
   const barW = Math.max(8, Math.floor(width * 0.4));
   const hasFamily = windows.some((w) => w.family);
-  const labelW = 20;
+  const labelW = 28;
 
   if (hasFamily) {
     const groups = new Map();
@@ -2261,6 +2271,9 @@ function drawQuotaDetail(width, provider, quota) {
 
 function detailQuotaLine(w, barW, labelW) {
   const label = truncate(String(w.label || w.key || ""), labelW).padEnd(labelW);
+  if (w.available) {
+    return ` ${label} ${colors.gray}\u2014 disponible (sin cuota expuesta por la API)${RESET}`;
+  }
   const pct = fmtPct(w.usedPercent);
   const cd = fmtCountdown(w.reset);
   const bar = blockBar(w.usedPercent, barW, quotaColor(Number(w.remainingPercent)));
