@@ -4,6 +4,9 @@ Terminal dashboard for local AI CLI usage — monitors Claude Code, Codex CLI, A
 
 ## Features
 
+- **Interactive card grid dashboard** with drill-down detailed view per provider (v0.7.0)
+  - One card per provider (Claude, Codex, Antigravity, MiniMax, OpenCode) featuring provider icon, block mini-bars (% used) per window, and compact reset countdowns (e.g., `↻ 1h27m`, `↻ 23h54m`)
+  - Detailed drill-down view with Antigravity grouping models by family (Gemini / Others)
 - **Real-time quota monitoring** for Claude, Codex, Antigravity, and MiniMax
 - **Effective token counting** — separates cache-read tokens from real consumption so Claude usage isn't inflated by prompt caching (cache reads can be 97%+ of reported totalTokens)
 - **Live quota detection** from `claude /usage` and real quota for Antigravity via Google's consumer API
@@ -17,7 +20,7 @@ Terminal dashboard for local AI CLI usage — monitors Claude Code, Codex CLI, A
 
 ```bash
 bash package-ai-usage-live.sh
-sudo dpkg -i dist/ai-usage-live_0.6.0_all.deb
+sudo dpkg -i dist/ai-usage-live_0.7.0_all.deb
 ```
 
 ### Manual
@@ -47,9 +50,11 @@ ai-usage-quota edit                    # Edit quota limits
 ```text
 q exit
 r refresh (forces live provider refresh)
-1 daily, 2 weekly, 3 monthly, 4 session, 5 blocks
-a all, c Claude, x Codex, v Antigravity, m MiniMax, o OpenCode
-up/down select model
+tab change tab
+up/down/left/right navigate cards in the grid
+enter open detailed view of selected provider
+esc return to grid
+c Claude, x Codex, v Antigravity, m MiniMax, o OpenCode (directly select provider card)
 ```
 
 ## Data sources
