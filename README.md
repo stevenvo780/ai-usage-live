@@ -4,12 +4,12 @@ Terminal dashboard for local AI CLI usage — monitors Claude Code, Codex CLI, A
 
 ## Features
 
-- **Interactive card grid dashboard** with drill-down detailed view per provider (v0.7.0)
+- **Interactive card grid dashboard** with drill-down detailed view per provider (v0.8.0)
   - One card per provider (Claude, Codex, Antigravity, MiniMax, OpenCode) featuring provider icon, block mini-bars (% used) per window, and compact reset countdowns (e.g., `↻ 1h27m`, `↻ 23h54m`)
-  - Detailed drill-down view with Antigravity grouping models by family (Gemini / Others)
+  - Detailed drill-down view with Antigravity grouping models by family (Gemini / Claude/GPT)
 - **Real-time quota monitoring** for Claude, Codex, Antigravity, and MiniMax
 - **Effective token counting** — separates cache-read tokens from real consumption so Claude usage isn't inflated by prompt caching (cache reads can be 97%+ of reported totalTokens)
-- **Live quota detection** from `claude /usage` and real quota for Antigravity via Google's consumer API
+- **Live quota detection** from `claude /usage` and real quota for Antigravity via CLI capture / Google's consumer API
 - **Codex rate-limit detection** from local session events
 - **Model-by-model breakdown** with sorting by effective tokens
 - **Auto-refresh** with configurable interval
@@ -20,7 +20,7 @@ Terminal dashboard for local AI CLI usage — monitors Claude Code, Codex CLI, A
 
 ```bash
 bash package-ai-usage-live.sh
-sudo dpkg -i dist/ai-usage-live_0.7.0_all.deb
+sudo dpkg -i dist/ai-usage-live_0.8.0_all.deb
 ```
 
 ### Manual
@@ -65,7 +65,7 @@ c Claude, x Codex, v Antigravity, m MiniMax, o OpenCode (directly select provide
 | Claude quota | `claude -p /usage` | Reports session, weekly (all), weekly (Sonnet) percentages |
 | Codex CLI | `ccusage` local logs + rate_limits from sessions | Auto-detects 5h and weekly windows |
 | Gemini CLI | (Removido) | Proveedor removido. Google revocó el OAuth de gemini-cli (`invalid_grant`). Antigravity es ahora la vía de acceso a los modelos Gemini. |
-| Antigravity | Local transcript analysis + Cuota real automática | Es la vía de acceso a los modelos Gemini. Cuota real detectada automáticamente vía API `cloudcode-pa` (URL: `POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`) + consumo local (sesiones, pasos, actividad) derivado de transcripts locales. |
+| Antigravity | Local transcript analysis + Cuota real automática (CLI + API fallback) | Es la vía de acceso a los modelos Gemini, Claude y GPT-OSS. Muestra cuota real de todos los modelos (Gemini Flash/Pro, Claude Opus, Claude Sonnet y GPT-OSS). Captura la cuota como fuente principal ejecutando el comando interactivo `/usage` del CLI `agy`/`antigravity` mediante el script `antigravity-usage-capture.py` (que automatiza el TUI vía pty y parsea su salida). Como fallback para Gemini, usa la API de Google Cloud Code (`cloudcode-pa retrieveUserQuota`). Consumo local derivado de transcripts locales. |
 | MiniMax | Coding Plan API + local cache | Requires `MINIMAX_API_KEY` or `minimax.apiKey` in quota config |
 | OpenCode Go | Cuota real vía scrape web autenticado + fallback override/local | Requires `opencode` installed with `opencode-go` provider. Soporta scrape web (cookie + workspaceId), override manual o estimado local. |
 
@@ -128,22 +128,24 @@ Useful fields:
 }
 ```
 
-Para **Antigravity**, la cuota real se obtiene automáticamente y no requiere configuración manual. Sin embargo, los campos `monthlyCredits`, `usedCredits` y `resetsAt` (con valores numéricos y formato ISO respectivamente) se pueden configurar opcionalmente en `quotas.json` como fallback si la API de cuota real falla.
+Para **Antigravity**, la cuota real se obtiene automáticamente y no requiere configuración manual. Sin embargo, los campos `monthlyCredits`, `usedCredits` y `resetsAt` (con valores numéricos y formato ISO respectivamente) se pueden configurar opcionalmente en `quotas.json` como fallback si la captura de cuota real falla.
 
-Set `AI_USAGE_ANTIGRAVITY_LIVE=0` to disable Antigravity live quota capture.
+Set `AI_USAGE_ANTIGRAVITY_LIVE=0` to disable Antigravity live quota capture, and `AI_USAGE_ANTIGRAVITY_USAGE=0` to disable CLI capture (using API SDK only).
 
-### Antigravity (Gemini)
+### Antigravity
 
-Antigravity es ahora la vía de acceso principal a los modelos Gemini, ya que Google lo expone a través de esta herramienta. Se renderiza como "Antigravity (Gemini)" en los tabs de Cuotas y en la vista `--once`.
+Antigravity es la vía de acceso principal a los modelos Gemini, Claude (Opus, Sonnet) y GPT-OSS. Se renderiza en el dashboard y en la vista `--once` bajo la tarjeta/sección de Antigravity.
 
-- **Cuota real automática**: Muestra la cuota real automáticamente consumiendo la API de Google Cloud Code:
-  - **URL**: `POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`
-  - **Auth**: Token de tipo Bearer obtenido desde `~/.gemini/antigravity-cli/antigravity-oauth-token`
-  - **Project**: Proyecto ID leído desde `~/.gemini/antigravity-cli/cache/projects.json`
-  - **Respuesta**: Procesa el arreglo de `buckets[]` por modelo Gemini con `remainingFraction` y `resetTime` (para el tokenType `REQUESTS`).
-  - **Sin configuración manual**: No requiere credenciales nuevas ni configuración adicional de claves de API.
-- **Cuota manual (Fallback)**: Si la API de cuota falla o no se detecta la sesión activa, el dashboard utilizará como fallback los valores manuales configurados en `antigravity.monthlyCredits`, `usedCredits` y `resetsAt` de `quotas.json`.
-- **Consumo**: El consumo interno (sesiones, pasos del modelo y timestamps de actividad) se deriva analizando directamente los transcripts locales generados por Antigravity.
+- **Cuota real de todos los modelos**: Muestra la cuota real de todos los modelos disponibles en Antigravity (no solo Gemini).
+  - **Captura por CLI (Fuente Principal)**: Ejecuta de forma automática el comando interactivo `/usage` de la herramienta CLI `agy` o `antigravity`. Utiliza para ello el script `antigravity-usage-capture.py` (requiere que el CLI esté instalado y la sesión iniciada), el cual inicializa un pseudo-terminal (pty) para automatizar la interacción y parsear la salida.
+  - **API SDK de Google (Fallback)**: Si la captura por CLI falla o está desactivada (`AI_USAGE_ANTIGRAVITY_USAGE=0`), se realiza un fallback a la API de Google Cloud Code (`cloudcode-pa retrieveUserQuota`), la cual solo reporta cuota para los modelos Gemini (URL: `POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`).
+  - **Cuota manual**: Si ambas opciones fallan, se recurre a los valores de fallback manuales configurados en `antigravity.monthlyCredits`, `usedCredits` y `resetsAt` de `quotas.json`.
+- **Agrupación de límites**: Las cuotas se consolidan en 2 grupos:
+  - **Gemini**: Incluye Gemini Flash, Gemini Pro, etc.
+  - **Claude/GPT**: Incluye Claude Opus, Claude Sonnet y GPT-OSS.
+  - Cada uno de estos dos grupos dispone de límites específicos para ventanas de 5 horas y semanales, mostrando el porcentaje de uso actual y el tiempo restante de refresco.
+- **Detalle en el Dashboard**: Al pulsar `Enter` sobre la tarjeta de Antigravity en la interfaz TUI, se abre la vista detallada agrupando por Gemini y Claude/GPT, listando los límites con barras de progreso y temporizadores de cuenta regresiva (countdown).
+- **Consumo local**: El consumo interno de la sesión (sesiones individuales, pasos del modelo y timestamps de actividad) se sigue deduciendo del análisis de transcripts locales de Antigravity.
 
 ### Gemini CLI (Removido)
 
@@ -198,8 +200,9 @@ La cookie es un secreto de sesión sensible:
 |---|---|---|
 | `REFRESH_SEC` | `10` | Auto-refresh interval in seconds |
 | `AI_USAGE_CLAUDE_LIVE` | `1` | Set to `0` to disable Claude /usage |
-| `AI_USAGE_ANTIGRAVITY_LIVE` | `1` | Set to `0` to disable Antigravity live quota API capture / Establece en `0` para desactivar la API de cuota de Antigravity |
-| `ANTIGRAVITY_USAGE_CACHE_MINUTES` | `15` | Antigravity quota API cache duration / Minutos de caché para la API de cuota de Antigravity |
+| `AI_USAGE_ANTIGRAVITY_USAGE` | `1` | Set to `0` to disable CLI capture, using API SDK only / Establece en `0` para desactivar la captura del CLI y usar solo la API SDK |
+| `AI_USAGE_ANTIGRAVITY_LIVE` | `1` | Set to `0` to disable Antigravity live quota capture / Establece en `0` para desactivar la captura de cuota real de Antigravity |
+| `ANTIGRAVITY_USAGE_CACHE_MINUTES` | `15` | Antigravity quota cache duration / Minutos de caché para la cuota de Antigravity |
 | `MINIMAX_API_KEY` | — | MiniMax Coding Plan API key |
 | `AI_USAGE_MINIMAX_LIVE` | `1` | Set to `0` to disable MiniMax API capture |
 | `MINIMAX_USAGE_CACHE_MINUTES` | `0` | MiniMax API cache duration |
