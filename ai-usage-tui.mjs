@@ -2117,8 +2117,9 @@ function drawQuotaTab(width, maxHeight, snap) {
 
 function drawQuotaGrid(width, maxHeight, quotas, selected) {
   const gap = 2;
-  const cols = width >= 110 ? 4 : width >= 75 ? 3 : width >= 50 ? 2 : 1;
-  const cardW = Math.max(22, Math.min(30, Math.floor((width - (cols - 1) * gap) / cols)));
+  const targetW = 52; // tarjetas ~el doble de anchas; las columnas se adaptan al ancho
+  const cols = Math.max(1, Math.floor((width + gap) / (targetW + gap)));
+  const cardW = Math.max(30, Math.floor((width - (cols - 1) * gap) / cols));
 
   const cardList = PROVIDER_ORDER.map((provider) =>
     renderQuotaCard(cardW, provider, quotas[provider], provider === selected),
@@ -2150,25 +2151,26 @@ function renderQuotaCard(cardW, provider, quota, selected) {
   const meta = PROVIDER_META[provider] || { label: provider, color: colors.gray, icon: "?" };
   const inner = Math.max(4, cardW - 2);
   const lines = [];
+  // Resaltado = borde en bold+color del proveedor; sin seleccionar = borde gris.
+  // El titulo siempre en el color del proveedor; el contenido en colores normales.
+  // (Sin inverse: antes pintaba TODA la tarjeta seleccionada y se veia horrible.)
   const borderColor = selected ? `${colors.bold}${meta.color}` : colors.gray;
-  const inv = selected ? colors.inverse : "";
 
   const headPrefix = ` ${meta.icon} ${meta.label} `;
   const headFill = Math.max(1, inner - visibleLength(headPrefix));
-  lines.push(`${borderColor}${inv}\u250C${headPrefix}${"\u2500".repeat(headFill)}\u2510${RESET}`);
+  lines.push(`${borderColor}\u250C${RESET}${meta.color}${headPrefix}${RESET}${borderColor}${"\u2500".repeat(headFill)}\u2510${RESET}`);
 
   const windows = quota && quota.ok !== false && Array.isArray(quota.windows) ? quota.windows : [];
-  const bodyBorder = `${meta.color}${inv}`;
   const bodyLine = (content) =>
-    `${bodyBorder}\u2502${fit(content, inner)}\u2502${RESET}`;
+    `${borderColor}\u2502${RESET}${fit(content, inner)}${borderColor}\u2502${RESET}`;
 
   if (!quota || quota.ok === false || !windows.length) {
     const note = truncate(String(quota?.note || "sin datos"), Math.max(0, inner - 2));
     lines.push(bodyLine(` ${note} `));
   } else {
-    const labelW = 5;
+    const labelW = 8;
     const pctMax = 5;
-    const barW = Math.max(5, inner - 14);
+    const barW = Math.max(5, inner - (labelW + pctMax + 4));
     const shown = windows.slice(0, 3);
     for (const w of shown) {
       const label = truncate(String(w.label || w.key || ""), labelW).padEnd(labelW);
