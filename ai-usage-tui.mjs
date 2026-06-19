@@ -693,6 +693,31 @@ function buildCodexQuota(usage, config = {}) {
   };
 }
 
+function parseClaudeResetText(text) {
+  // Claude /usage da el reset como texto absoluto, ej "Jun 22, 10am (UTC)" o
+  // "Jun 19, 7:10pm (UTC)". Lo parseamos a Date (UTC) para el countdown.
+  const t = normalizeResetText(text);
+  if (!t) return null;
+  const m = t.match(/([A-Za-z]{3,})\s+(\d{1,2}),?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+  if (!m) {
+    const d = new Date(t);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const months = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+  const mon = months[m[1].slice(0, 3).toLowerCase()];
+  if (mon == null) return null;
+  const day = Number(m[2]);
+  let hour = Number(m[3]);
+  const min = m[4] ? Number(m[4]) : 0;
+  const ap = (m[5] || "").toLowerCase();
+  if (ap === "pm" && hour < 12) hour += 12;
+  if (ap === "am" && hour === 12) hour = 0;
+  const now = new Date();
+  let d = new Date(Date.UTC(now.getUTCFullYear(), mon, day, hour, min));
+  if (d.getTime() < now.getTime() - 86400000) d = new Date(Date.UTC(now.getUTCFullYear() + 1, mon, day, hour, min));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 function buildClaudeQuota(usage, blocksRaw, config = {}, live = null) {
   const blocks = Array.isArray(blocksRaw?.blocks) ? blocksRaw.blocks : [];
   const active = blocks.find((block) => block.isActive) || blocks.at(-1) || null;
@@ -711,11 +736,15 @@ function buildClaudeQuota(usage, blocksRaw, config = {}, live = null) {
     : null;
 
   if (live?.ok && Array.isArray(live.windows) && live.windows.length) {
+    const windows = live.windows.map((w) => ({
+      ...w,
+      reset: w.reset || parseClaudeResetText(w.resetText),
+    }));
     return {
       source: "claude",
       kind: "detected-percent",
       ok: true,
-      windows: live.windows,
+      windows,
       activeBlock,
       live,
       note: live.cacheHit
@@ -2200,6 +2229,9 @@ function renderQuotaCard(cardW, provider, quota, selected) {
   if (upcomingResets.length) {
     upcomingResets.sort((a, b) => a.getTime() - b.getTime());
     cdText = fmtCountdown(upcomingResets[0]);
+  } else {
+    const wt = windows.find((w) => w.resetText)?.resetText;
+    if (wt) cdText = shortText(wt, 18);
   }
 
   let tag = "";
@@ -2275,7 +2307,7 @@ function detailQuotaLine(w, barW, labelW) {
     return ` ${label} ${colors.gray}\u2014 disponible (sin cuota expuesta por la API)${RESET}`;
   }
   const pct = fmtPct(w.usedPercent);
-  const cd = fmtCountdown(w.reset);
+  const cd = w.reset ? fmtCountdown(w.reset) : (w.resetText ? shortText(w.resetText, 24) : "--");
   const bar = blockBar(w.usedPercent, barW, quotaColor(Number(w.remainingPercent)));
   return ` ${label} ${bar} ${pct} usado  \u21BB ${cd}`;
 }
@@ -3160,6 +3192,7 @@ export {
   buildTokenQuota,
   parseOpenCodeServerUsage,
   parseResetDuration,
+  parseClaudeResetText,
   parseClaudeUsageOutput,
   claudeWindowKey,
   claudeWindowLabel,

@@ -15,6 +15,7 @@ import {
   parseClaudeUsageOutput,
   parseOpenCodeServerUsage,
   parseResetDuration,
+  parseClaudeResetText,
   claudeWindowKey,
   claudeWindowLabel,
   numberFromAny,
@@ -541,4 +542,23 @@ test("blockBar: 50% in width=10 -> 5 filled and 5 empty cells", () => {
 test("blockBar: NaN produces no filled cells and does not crash", () => {
   const out = stripAnsi(blockBar(NaN, 10, ""));
   assert(!out.includes("█"));
+});
+
+test("parseClaudeResetText: 'Jun 22, 10am (UTC)' -> Date at 10:00 UTC, future", () => {
+  const d = parseClaudeResetText("Jun 22, 10am (UTC)");
+  assert(d instanceof Date);
+  assert.strictEqual(d.getUTCHours(), 10);
+  assert.strictEqual(d.getUTCMinutes(), 0);
+  assert.strictEqual(d.getUTCMonth(), 5); // junio
+});
+
+test("parseClaudeResetText: '7:10pm' -> 19:10 UTC", () => {
+  const d = parseClaudeResetText("Jun 19, 7:10pm (UTC)");
+  assert.strictEqual(d.getUTCHours(), 19);
+  assert.strictEqual(d.getUTCMinutes(), 10);
+});
+
+test("parseClaudeResetText: garbage/empty -> null", () => {
+  assert.strictEqual(parseClaudeResetText("nonsense xyz"), null);
+  assert.strictEqual(parseClaudeResetText(""), null);
 });
