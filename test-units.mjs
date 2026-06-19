@@ -13,6 +13,8 @@ import {
   buildAntigravityQuota,
   buildTokenQuota,
   parseClaudeUsageOutput,
+  parseOpenCodeServerUsage,
+  parseResetDuration,
   claudeWindowKey,
   claudeWindowLabel,
   numberFromAny,
@@ -465,4 +467,45 @@ test("buildAntigravityQuota: sin live, con config manual -> configured-credits",
   assert.strictEqual(q.limit, 1000);
   assert.strictEqual(q.usedPercent, 25);
   assert.strictEqual(q.remainingPercent, 75);
+});
+
+test("parseOpenCodeServerUsage: extrae rolling/weekly/monthly", () => {
+  const html = '<span data-slot="usage-label">Rolling Usage</span><span data-slot="usage-value"><!--$-->25<!--/-->%</span><div data-slot="progress"><div data-slot="progress-bar" style="width:25%"></div></div><span data-slot="reset-time"><!--$-->Resets in<!--/--> <!--$-->1 hour 11 minutes<!--/--></span><span data-slot="usage-label">Weekly Usage</span><span data-slot="usage-value"><!--$-->52<!--/-->%</span><span data-slot="reset-time"><!--$-->Resets in<!--/--> <!--$-->2 days 6 hours<!--/--></span><span data-slot="usage-label">Monthly Usage</span><span data-slot="usage-value"><!--$-->26<!--/-->%</span><span data-slot="reset-time"><!--$-->Resets in<!--/--> <!--$-->5 days<!--/--></span>';
+  const r = parseOpenCodeServerUsage(html);
+
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.windows.length, 3);
+
+  const w5h = r.windows.find((w) => w.key === "5h");
+  const wWeek = r.windows.find((w) => w.key === "week");
+  const wMonth = r.windows.find((w) => w.key === "month");
+  assert.ok(w5h);
+  assert.ok(wWeek);
+  assert.ok(wMonth);
+
+  assert.strictEqual(w5h.usedPercent, 25);
+  assert.strictEqual(w5h.remainingPercent, 75);
+  assert.strictEqual(w5h.source, "web");
+  assert.strictEqual(wWeek.usedPercent, 52);
+  assert.strictEqual(wMonth.usedPercent, 26);
+
+  for (const w of r.windows) {
+    assert.ok(w.reset === null || w.reset instanceof Date, `window ${w.key}.reset debe ser Date o null`);
+    assert.ok(w.resetText, `window ${w.key}.resetText debe ser truthy`);
+  }
+});
+
+test("parseOpenCodeServerUsage: HTML vacío -> ok false", () => {
+  const result = parseOpenCodeServerUsage("<html></html>");
+  assert.strictEqual(result.ok, false);
+});
+
+test("parseResetDuration: '2 days 6 hours' -> Date ~ +54h", () => {
+  const d = parseResetDuration("2 days 6 hours");
+  assert.ok(d instanceof Date);
+  const deltaMs = d.getTime() - Date.now();
+  assert.ok(deltaMs >= 53.9 * HOUR_MS);
+  assert.ok(deltaMs <= 54.1 * HOUR_MS);
+
+  assert.strictEqual(parseResetDuration("texto sin numeros"), null);
 });
