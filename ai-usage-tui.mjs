@@ -40,8 +40,8 @@ const SOURCE_META = {
   opencode: { label: "OpenCode", color: colors.green },
 };
 
-const ALL_SOURCES = ["claude", "codex", "gemini", "opencode"];
-const SOURCE_KEYS = ["all", "claude", "codex", "gemini", "antigravity", "minimax", "opencode"];
+const ALL_SOURCES = ["claude", "codex", "opencode"];
+const SOURCE_KEYS = ["all", "claude", "codex", "antigravity", "minimax", "opencode"];
 const VIEW_KEYS = ["daily", "weekly", "monthly", "session", "blocks"];
 const TAB_KEYS = ["cuotas", "consumo"];
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -53,6 +53,10 @@ const GEMINI_QUOTA_CACHE_PATH = path.join(CONFIG_DIR, "gemini-quota-cache.json")
 const MINIMAX_USAGE_CACHE_PATH = path.join(CONFIG_DIR, "minimax-usage-cache.json");
 const OPENCODE_USAGE_CACHE_PATH = path.join(CONFIG_DIR, "opencode-usage-cache.json");
 const OPENCODE_DB_PATH = path.join(homedir(), ".local", "share", "opencode", "opencode.db");
+const ANTIGRAVITY_QUOTA_CACHE_PATH = path.join(CONFIG_DIR, "antigravity-quota-cache.json");
+const ANTIGRAVITY_TOKEN_PATH = path.join(homedir(), ".gemini", "antigravity-cli", "antigravity-oauth-token");
+const ANTIGRAVITY_PROJECTS_PATH = path.join(homedir(), ".gemini", "antigravity-cli", "cache", "projects.json");
+const ANTIGRAVITY_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 
 const args = parseArgs(process.argv.slice(2));
 const state = {
@@ -141,7 +145,8 @@ Views:
   daily, weekly, monthly, session, blocks
 
 Sources:
-  all, claude, codex, gemini, antigravity, minimax, opencode
+  all, claude, codex, antigravity, minimax, opencode
+  (gemini-cli fue removido: Google revocó su OAuth; usa Antigravity para Gemini)
 
 Opciones:
   --since YYYY-MM-DD
@@ -151,7 +156,7 @@ Opciones:
 
 Teclas:
   q salir, r refrescar, 1 daily, 2 weekly, 3 monthly, 4 session, 5 blocks
-  a todos, c Claude, x Codex, g Gemini, v Antigravity, m MiniMax, o OpenCode, flechas mover modelo
+  a todos, c Claude, x Codex, v Antigravity, m MiniMax, o OpenCode, flechas mover modelo
 `);
 }
 
@@ -220,7 +225,7 @@ async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ig
   const liveQuotaPromise = includeLive
     ? Promise.allSettled([
         collectClaudeUsageLive(quotaConfig.claude, { ignoreCache: ignoreLiveCache }),
-        collectGeminiQuotaLive(quotaConfig.gemini, { ignoreCache: ignoreLiveCache }),
+        collectAntigravityQuotaLive(quotaConfig.antigravity, { ignoreCache: ignoreLiveCache }),
       ])
     : Promise.resolve([
         {
@@ -235,10 +240,10 @@ async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ig
         {
           status: "fulfilled",
           value: staleLiveQuota(
-            "gemini",
-            GEMINI_QUOTA_CACHE_PATH,
-            "Gemini /stats model se esta capturando; mostrando ultimo dato conocido.",
-            "Gemini /stats model se esta capturando en segundo plano.",
+            "antigravity",
+            ANTIGRAVITY_QUOTA_CACHE_PATH,
+            "Antigravity quota se esta capturando; mostrando ultimo dato conocido.",
+            "Antigravity quota se esta capturando en segundo plano.",
           ),
         },
       ]);
@@ -275,7 +280,7 @@ async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ig
       || { source: "opencode", ok: false, note: "OpenCode Go se esta capturando en segundo plano." };
   const liveQuotaSettled = await liveQuotaPromise;
   sources.claudeLive = liveQuotaSettled[0].status === "fulfilled" ? liveQuotaSettled[0].value : { ok: false };
-  sources.geminiLive = liveQuotaSettled[1].status === "fulfilled" ? liveQuotaSettled[1].value : { ok: false };
+  sources.antigravityLive = liveQuotaSettled[1].status === "fulfilled" ? liveQuotaSettled[1].value : { ok: false };
   const quotas = buildQuotaState(sources, quotaConfig);
 
   return {
@@ -598,10 +603,9 @@ function buildQuotaState(sources, config) {
     configPath: config.configPath,
     codex: buildCodexQuota(sources.codex, config.codex),
     claude: buildClaudeQuota(sources.claude, sources.claudeBlocks, config.claude, sources.claudeLive),
-    gemini: buildGeminiQuota(sources.gemini, config.gemini, sources.geminiLive),
     minimax: buildMiniMaxQuota(sources.minimax, config.minimax),
     opencode: buildOpenCodeQuota(sources.opencodeLive, config.opencode),
-    antigravity: buildAntigravityQuota(sources.antigravity, config.antigravity),
+    antigravity: buildAntigravityQuota(sources.antigravity, config.antigravity, sources.antigravityLive),
   };
 }
 
@@ -871,11 +875,91 @@ function numberFromAny(obj, keys) {
   return null;
 }
 
-function buildAntigravityQuota(usage, config = {}) {
-  // Antigravity es la ruta viva a los modelos Gemini tras la deautenticacion del
-  // gemini-cli (Google revoco su OAuth). Google no expone una cuota local estable,
-  // asi que la cuota se toma de limites manuales en quotas.json; el consumo (sesiones,
-  // pasos de modelo, ultima actividad) si se deriva de los transcripts locales.
+function pickAntigravityProject(projects) {
+  // projects.json mapea dir -> uuid de proyecto; la cuota es por cuenta, asi que
+  // cualquier proyecto valido sirve. Preferimos el del home.
+  if (!projects || typeof projects !== "object") return null;
+  const home = homedir();
+  if (typeof projects[home] === "string") return projects[home];
+  const values = Object.values(projects).filter((value) => typeof value === "string");
+  return values[0] || null;
+}
+
+function staleAntigravityQuota(note) {
+  const stale = readJsonSafe(ANTIGRAVITY_QUOTA_CACHE_PATH);
+  if (stale?.ok) {
+    return { ...stale, cacheHit: true, cacheStale: true, note: `${note} Usando cache.` };
+  }
+  return { source: "antigravity", ok: false, note };
+}
+
+async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false } = {}) {
+  // Cuota REAL del plan consumer de Antigravity (Gemini) via el backend
+  // cloudcode-pa.googleapis.com:retrieveUserQuota, usando el oauth-token local.
+  if (process.env.AI_USAGE_ANTIGRAVITY_LIVE === "0" || config.liveCapture === false) {
+    return { source: "antigravity", ok: false, disabled: true, note: "Antigravity API desactivada." };
+  }
+
+  const cacheMinutes = Number(process.env.ANTIGRAVITY_USAGE_CACHE_MINUTES ?? config.liveCaptureCacheMinutes ?? 15);
+  if (!ignoreCache) {
+    const cached = readJsonCache(ANTIGRAVITY_QUOTA_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
+    if (cached) return { ...cached, cacheHit: true };
+  }
+
+  const tokenRaw = readJsonSafe(ANTIGRAVITY_TOKEN_PATH);
+  const accessToken = tokenRaw?.token?.access_token || tokenRaw?.access_token;
+  if (!accessToken) {
+    return staleAntigravityQuota("No encuentro token de Antigravity (~/.gemini/antigravity-cli/antigravity-oauth-token).");
+  }
+
+  const project = pickAntigravityProject(readJsonSafe(ANTIGRAVITY_PROJECTS_PATH));
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    let resp;
+    try {
+      resp = await fetch(ANTIGRAVITY_QUOTA_URL, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify(project ? { project } : {}),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!resp.ok) {
+      const detail = resp.status === 403 ? " (sin permiso/suscripcion para este endpoint)" : "";
+      return staleAntigravityQuota(`Antigravity API HTTP ${resp.status}${detail}.`);
+    }
+    const data = await resp.json();
+    const buckets = (Array.isArray(data.buckets) ? data.buckets : [])
+      .map((b) => ({
+        modelId: b.modelId || "",
+        remainingFraction: Number(b.remainingFraction),
+        resetTime: b.resetTime || null,
+        tokenType: b.tokenType || "",
+      }))
+      .filter((b) => Number.isFinite(b.remainingFraction));
+    const output = {
+      source: "antigravity",
+      ok: true,
+      buckets,
+      capturedAt: new Date().toISOString(),
+      cacheHit: false,
+      note: "Antigravity quota (API cloudcode-pa).",
+    };
+    writeJsonCache(ANTIGRAVITY_QUOTA_CACHE_PATH, output);
+    return output;
+  } catch (error) {
+    return staleAntigravityQuota(`Antigravity API fallo: ${shortError(error)}`);
+  }
+}
+
+function buildAntigravityQuota(usage, config = {}, live = null) {
+  // Antigravity es la ruta viva a modelos Gemini (Google revoco el OAuth del gemini-cli).
+  // Cuota REAL desde la API consumer; fallback a limites manuales; consumo (sesiones,
+  // pasos de modelo, ultima actividad) derivado de transcripts locales.
   const installed = Boolean(usage?.installed);
   const sessions = usage?.sessions ?? 0;
   const modelSteps = usage?.modelSteps ?? 0;
@@ -884,19 +968,41 @@ function buildAntigravityQuota(usage, config = {}) {
   if (lastActivity) statBits.push(`ult ${timeOnly(lastActivity)}`);
   const statsNote = statBits.join("  ");
 
-  if (!installed) {
+  // 1) Cuota REAL desde la API (retrieveUserQuota). Mostramos los buckets Gemini.
+  if (live?.ok && Array.isArray(live.buckets) && live.buckets.length) {
+    const gemini = live.buckets.filter((b) => /gemini/i.test(b.modelId));
+    const pool = gemini.length ? gemini : live.buckets;
+    const sorted = [...pool].sort((a, b) => a.remainingFraction - b.remainingFraction);
+    const shown = sorted.slice(0, 6);
+    const windows = shown.map((b) => {
+      const remPct = Math.max(0, Math.min(100, b.remainingFraction * 100));
+      return {
+        key: b.modelId,
+        label: shortText(b.modelId.replace(/-preview$/, ""), 16),
+        usedPercent: Math.max(0, Math.min(100, 100 - remPct)),
+        remainingPercent: remPct,
+        reset: b.resetTime ? new Date(b.resetTime) : null,
+      };
+    });
+    const extra = sorted.length - shown.length;
+    const unit = live.buckets[0]?.tokenType || "req";
     return {
       source: "antigravity",
-      kind: "unknown",
-      ok: false,
-      note: "Antigravity no instalado (no encuentro antigravity/agy).",
+      kind: "detected-percent",
+      ok: true,
+      windows,
+      note: `Gemini via Antigravity (API real, ${unit}${extra > 0 ? `, +${extra} modelos` : ""}).  ${statsNote}${live.cacheStale ? "  [cache]" : ""}`,
     };
   }
 
+  if (!installed && !(live && live.ok === false && live.note)) {
+    return { source: "antigravity", kind: "unknown", ok: false, note: "Antigravity no instalado (no encuentro antigravity/agy)." };
+  }
+
+  // 2) Fallback: limites manuales en quotas.json.
   const monthlyCredits = config?.monthlyCredits != null ? Number(config.monthlyCredits) : null;
   const usedCredits = config?.usedCredits != null ? Number(config.usedCredits) : null;
   const resetsAt = config?.resetsAt ? new Date(config.resetsAt) : null;
-
   if (Number.isFinite(monthlyCredits) && monthlyCredits > 0) {
     const used = Number.isFinite(usedCredits) ? Math.max(0, usedCredits) : 0;
     const usedPercent = Math.min(999, (used / monthlyCredits) * 100);
@@ -914,11 +1020,13 @@ function buildAntigravityQuota(usage, config = {}) {
     };
   }
 
+  // 3) Sin cuota: surface el motivo de la API si lo hay.
+  const apiNote = live?.note ? `${live.note}  ` : "";
   return {
     source: "antigravity",
     kind: "unknown",
     ok: true,
-    note: `Ruta a Gemini (gemini-cli deautenticado). Sin cuota local; pon antigravity.monthlyCredits/usedCredits en quotas.json.  ${statsNote}`,
+    note: `${apiNote}Gemini via Antigravity.  ${statsNote}`,
   };
 }
 
@@ -1720,7 +1828,6 @@ function handleKey(key) {
   else if (key === "a") setSource("all");
   else if (key === "c") setSource("claude");
   else if (key === "x") setSource("codex");
-  else if (key === "g") setSource("gemini");
   else if (key === "v") setSource("antigravity");
   else if (key === "m") setSource("minimax");
   else if (key === "o") setSource("opencode");
@@ -1811,11 +1918,7 @@ function drawQuotaTab(width, maxHeight, snap) {
   lines.push(...quotaSection("Codex", colors.green, quotas.codex, halfWidth, width));
   lines.push("");
 
-  // Gemini quota
-  lines.push(...quotaSection("Gemini", colors.blue, quotas.gemini, halfWidth, width));
-  lines.push("");
-
-  // Antigravity quota (ruta a modelos Gemini tras la deautenticacion del gemini-cli)
+  // Antigravity quota (Gemini via API real; reemplaza al gemini-cli que Google deautenticó)
   lines.push(...quotaSection("Antigravity (Gemini)", colors.yellow, quotas.antigravity, halfWidth, width));
   lines.push("");
 
@@ -2371,7 +2474,7 @@ function visibleModels() {
 function renderPlainSummary(snap) {
   const lines = [];
   lines.push(`AI Usage TUI snapshot (${snap.view}) since ${snap.since}`);
-  for (const source of ["all", "claude", "codex", "gemini"]) {
+  for (const source of ["all", "claude", "codex"]) {
     const usage = snap.sources[source];
     if (!usage) continue;
     const effective = usage.totals.effectiveTokens ?? usage.totals.totalTokens;
@@ -2408,21 +2511,6 @@ function renderPlainSummary(snap) {
       lines.push(`Claude active block: used=${fmtInt(q.used)}${q.limit ? ` limit=${fmtInt(q.limit)} remaining=${fmtInt(q.remaining)}` : " limit=not configured"} reset=${fmtReset(q.activeBlock.end)}`);
     } else {
       lines.push(`Claude active block tokens=${fmtInt(q.activeBlock.used)} reset=${fmtReset(q.activeBlock.end)}`);
-    }
-  }
-  if (snap.quotas?.gemini?.kind === "detected-requests") {
-    const q = snap.quotas.gemini;
-    const resetSuffix = q.resetAt
-      ? ` reset=${fmtReset(q.resetAt)}`
-      : (q.resetText ? ` reset="${q.resetText}"` : "");
-    lines.push(
-      `Gemini quota: used=${fmtPct(q.usedPercent)} remaining=${fmtPct(q.remainingPercent)}${q.limitRequests ? ` requests=${fmtInt(q.remainingRequests)}/${fmtInt(q.limitRequests)}` : ""}${resetSuffix}${q.tier ? ` tier="${q.tier}"` : ""}`,
-    );
-    for (const item of q.modelQuotas || []) {
-      const mqReset = item.resetAt
-        ? ` reset=${fmtReset(item.resetAt)}`
-        : (item.resetText ? ` reset="${item.resetText}"` : "");
-      lines.push(`Gemini model quota ${item.model}: used=${fmtPct(item.usedPercent)} remaining=${fmtPct(item.remainingPercent)}${mqReset}`);
     }
   }
   if (snap.quotas?.minimax) {
@@ -2467,7 +2555,12 @@ function renderPlainSummary(snap) {
   }
   if (snap.quotas?.antigravity) {
     const aq = snap.quotas.antigravity;
-    if (aq.kind === "configured-credits" && aq.limit) {
+    if (aq.kind === "detected-percent" && Array.isArray(aq.windows) && aq.windows.length) {
+      for (const w of aq.windows) {
+        lines.push(`Antigravity quota ${w.label}: used=${fmtPct(w.usedPercent)} remaining=${fmtPct(w.remainingPercent)}${w.reset ? ` reset=${fmtReset(w.reset)}` : ""}`);
+      }
+      if (aq.note) lines.push(`Antigravity: ${aq.note}`);
+    } else if (aq.kind === "configured-credits" && aq.limit) {
       lines.push(`Antigravity quota: used=${fmtNumber(aq.used)}/${fmtNumber(aq.limit)} (${fmtPct(aq.usedPercent)}) remaining=${fmtPct(aq.remainingPercent)}${aq.resetsAt ? ` reset=${fmtReset(aq.resetsAt)}` : ""}`);
     } else if (aq.note) {
       lines.push(`Antigravity quota: ${aq.note}`);
