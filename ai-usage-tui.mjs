@@ -565,7 +565,8 @@ function defaultQuotaConfig() {
         reset5h: null,
         resetWeek: null,
         resetMonth: null,
-        note: "Pega aqui los valores reales de opencode.ai/auth (cost en USD y resets ISO). Cuando enabled=true, reemplaza el estimado local.",
+        capturedAt: null,
+        note: "Pega aqui los valores reales de opencode.ai/auth (cost en USD y resets ISO). Pon capturedAt (ISO) al pegar para ver la frescura. Cuando enabled=true, reemplaza el estimado local.",
       },
     },
   };
@@ -1153,6 +1154,11 @@ function buildOpenCodeQuota(usage, config = {}) {
       ? (override.note ? `Override manual: ${override.note}` : "Override manual desde opencode.ai/auth.")
       : (usage.note || (usage.cacheHit ? "OpenCode Go desde cache local." : "OpenCode Go DB local."));
     if (useOverride) {
+      const capturedAt = Date.parse(override.capturedAt || "");
+      if (Number.isFinite(capturedAt)) {
+        const ageH = Math.max(0, Math.round((Date.now() - capturedAt) / 3600000));
+        noteText = `${ageH >= 12 ? `[stale ${ageH}h - actualiza opencode.ai/auth] ` : `[hace ${ageH}h] `}${noteText}`;
+      }
       const localBits = [];
       if (typeof data.cost5h === "number") localBits.push(`5h ${fmtMoney(data.cost5h)}`);
       if (typeof data.costWeek === "number") localBits.push(`sem ${fmtMoney(data.costWeek)}`);
