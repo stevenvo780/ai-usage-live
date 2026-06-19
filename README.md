@@ -335,7 +335,7 @@ La cookie es un secreto de sesión sensible:
 | `AI_USAGE_CLAUDE_LIVE` | `1` | Set to `0` to disable Claude /usage |
 | `AI_USAGE_ANTIGRAVITY_USAGE` | `1` | Set to `0` to disable CLI capture, using API SDK only / Establece en `0` para desactivar la captura del CLI y usar solo la API SDK |
 | `AI_USAGE_ANTIGRAVITY_LIVE` | `1` | Set to `0` to disable Antigravity live quota capture / Establece en `0` para desactivar la captura de cuota real de Antigravity |
-| `ANTIGRAVITY_USAGE_CACHE_MINUTES` | `15` | Antigravity quota cache duration / Minutos de caché para la cuota de Antigravity |
+| `ANTIGRAVITY_USAGE_CACHE_MINUTES` | `3` | Antigravity quota cache duration / Minutos de caché para la cuota de Antigravity (la captura `/usage` tarda ~4-5s) |
 | `MINIMAX_API_KEY` | — | MiniMax Coding Plan API key |
 | `AI_USAGE_MINIMAX_LIVE` | `1` | Set to `0` to disable MiniMax API capture |
 | `MINIMAX_USAGE_CACHE_MINUTES` | `0` | MiniMax API cache duration |

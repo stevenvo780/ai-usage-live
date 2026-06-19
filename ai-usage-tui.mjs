@@ -985,7 +985,7 @@ async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false } 
     return { source: "antigravity", ok: false, disabled: true, note: "Antigravity API desactivada." };
   }
 
-  const cacheMinutes = Number(process.env.ANTIGRAVITY_USAGE_CACHE_MINUTES ?? config.liveCaptureCacheMinutes ?? 15);
+  const cacheMinutes = Number(process.env.ANTIGRAVITY_USAGE_CACHE_MINUTES ?? config.liveCaptureCacheMinutes ?? 3);
   if (!ignoreCache) {
     const cached = readJsonCache(ANTIGRAVITY_QUOTA_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
     if (cached) return { ...cached, cacheHit: true };
@@ -1092,12 +1092,14 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
       }
     }
     if (windows.length) {
+      const ageMs = live.capturedAt ? Date.now() - Date.parse(live.capturedAt) : NaN;
+      const ageTag = Number.isFinite(ageMs) ? `  [hace ${Math.max(0, Math.round(ageMs / 60000))}m]` : "";
       return {
         source: "antigravity",
         kind: "detected-percent",
         ok: true,
         windows,
-        note: `Antigravity /usage (CLI, ${live.groups.length} grupos: Gemini + Claude/GPT).  ${statsNote}${live.cacheStale ? "  [cache]" : ""}`,
+        note: `Antigravity /usage (CLI, ${live.groups.length} grupos: Gemini + Claude/GPT).  ${statsNote}${ageTag}${live.cacheStale ? "  [cache vieja]" : ""}`,
       };
     }
   }
