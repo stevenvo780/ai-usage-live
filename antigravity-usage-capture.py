@@ -51,6 +51,9 @@ def parse(text):
     limit = None
 
     def new_group(name):
+        for existing in groups:
+            if existing["name"] == name:
+                return existing  # reusar: si el panel se redibuja, actualiza el mismo grupo
         g = {"name": name, "models": "", "weekly": None, "fiveHour": None}
         groups.append(g)
         return g
@@ -59,7 +62,16 @@ def parse(text):
         s = raw.strip()
         if not s:
             continue
+        low = s.lower()
         up = s.upper()
+        # Detener al llegar al texto de ayuda / footer del panel: evita que frases como
+        # "...your weekly limit is tied to your tier" se confundan con la cabecera de seccion
+        # y que fragmentos sueltos (re-render tras esc) sobrescriban valores ya parseados.
+        if (low.startswith("within each group") or s.startswith("│")
+                or low.startswith("↑/↓") or low.startswith("esc to")):
+            cur = None
+            limit = None
+            continue
         if "GEMINI MODELS" in up:
             cur = new_group("Gemini")
             limit = None
@@ -70,13 +82,14 @@ def parse(text):
             continue
         if cur is None:
             continue
-        if s.lower().startswith("models within this group:"):
+        if low.startswith("models within this group:"):
             cur["models"] = s.split(":", 1)[1].strip()
             continue
-        if "weekly limit" in s.lower():
+        # Cabeceras de seccion EXACTAS (no la palabra suelta dentro del texto de ayuda).
+        if low == "weekly limit":
             limit = "weekly"
             continue
-        if "five hour limit" in s.lower() or "5 hour limit" in s.lower() or "5-hour limit" in s.lower():
+        if low in ("five hour limit", "5 hour limit", "5-hour limit"):
             limit = "fiveHour"
             continue
         if limit:
@@ -86,7 +99,10 @@ def parse(text):
                 cur[limit] = {"remainingPercent": round(float(m.group(1))), "refreshText": refresh}
                 limit = None
                 continue
-            if "quota available" in s.lower() or re.search(r"\b100(?:\.0+)?\s*%", s):
+            # "Quota available" / 100% solo es valido para el limite de 5h. El semanal
+            # SIEMPRE muestra "X% remaining · Refreshes in Y", asi que un 100/placeholder
+            # en weekly es un frame de carga -> se ignora y se espera el dato real.
+            if limit == "fiveHour" and ("quota available" in low or re.search(r"\b100(?:\.0+)?\s*%", s)):
                 cur[limit] = {"remainingPercent": 100, "refreshText": ""}
                 limit = None
                 continue
@@ -137,15 +153,29 @@ def run():
             os.write(fd, b"/usage\r")
             sent = True
             sent_at = time.monotonic()
-        if sent and "GEMINI MODELS" in text.upper() and time.monotonic() - sent_at > 1.5:
-            time.sleep(0.8)
-            r, _, _ = select.select([fd], [], [], 0.5)
-            if r:
-                try:
-                    buf.extend(os.read(fd, 65536))
-                except OSError:
-                    pass
-            break
+        # Parsear el buffer en cada iteracion y romper solo cuando AMBOS grupos tienen
+        # su limite semanal REAL (con "Refreshes in"); asi evitamos capturar el frame de
+        # "Loading quota summary..." con placeholders. Fallback por si tarda demasiado.
+        if sent and time.monotonic() - sent_at > 1.5:
+            snap = parse(clean(buf))
+            ready = {}
+            if snap.get("ok"):
+                for g in snap["groups"]:
+                    wk = g.get("weekly") or {}
+                    ready[g["name"]] = bool(wk.get("refreshText"))
+            done = ready.get("Gemini") and ready.get("Claude/GPT")
+            fallback = "GEMINI MODELS" in text.upper() and time.monotonic() - sent_at > 12
+            if done or fallback:
+                time.sleep(0.8)
+                for _ in range(4):
+                    r, _, _ = select.select([fd], [], [], 0.4)
+                    if not r:
+                        break
+                    try:
+                        buf.extend(os.read(fd, 65536))
+                    except OSError:
+                        break
+                break
 
     try:
         os.write(fd, b"\x1b")  # cerrar panel
@@ -162,6 +192,13 @@ def run():
         except OSError:
             pass
     result = parse(text)
+    if result.get("ok"):
+        # Un grupo cargado SIEMPRE trae weekly con "Refreshes in". Si falta, fue una carga
+        # parcial (placeholder): devolvemos ok:False para que el dashboard conserve el ultimo
+        # dato bueno (cache) en vez de mostrar 100% falsos.
+        incomplete = [g["name"] for g in result["groups"] if not ((g.get("weekly") or {}).get("refreshText"))]
+        if incomplete:
+            result = {"ok": False, "note": f"Carga parcial de /usage ({', '.join(incomplete)}); se conserva el dato anterior."}
     result["capturedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return result
 
