@@ -73,11 +73,16 @@ let ccusageCommand = null;
 let refreshTimer = null;
 let pendingRefresh = null;
 
-main().catch((error) => {
-  cleanup();
-  console.error(error?.stack || String(error));
-  process.exit(1);
-});
+const INVOKED_DIRECTLY =
+  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (INVOKED_DIRECTLY) {
+  main().catch((error) => {
+    cleanup();
+    console.error(error?.stack || String(error));
+    process.exit(1);
+  });
+}
 
 async function main() {
   ccusageCommand = detectCcusage();
@@ -136,7 +141,7 @@ Views:
   daily, weekly, monthly, session, blocks
 
 Sources:
-  all, claude, codex, gemini, antigravity, minimax
+  all, claude, codex, gemini, antigravity, minimax, opencode
 
 Opciones:
   --since YYYY-MM-DD
@@ -596,6 +601,7 @@ function buildQuotaState(sources, config) {
     gemini: buildGeminiQuota(sources.gemini, config.gemini, sources.geminiLive),
     minimax: buildMiniMaxQuota(sources.minimax, config.minimax),
     opencode: buildOpenCodeQuota(sources.opencodeLive, config.opencode),
+    antigravity: buildAntigravityQuota(sources.antigravity, config.antigravity),
   };
 }
 
@@ -865,7 +871,56 @@ function numberFromAny(obj, keys) {
   return null;
 }
 
-// removed buildAntigravityQuota as it lacks local api data
+function buildAntigravityQuota(usage, config = {}) {
+  // Antigravity es la ruta viva a los modelos Gemini tras la deautenticacion del
+  // gemini-cli (Google revoco su OAuth). Google no expone una cuota local estable,
+  // asi que la cuota se toma de limites manuales en quotas.json; el consumo (sesiones,
+  // pasos de modelo, ultima actividad) si se deriva de los transcripts locales.
+  const installed = Boolean(usage?.installed);
+  const sessions = usage?.sessions ?? 0;
+  const modelSteps = usage?.modelSteps ?? 0;
+  const lastActivity = usage?.lastActivity || null;
+  const statBits = [`sesiones=${sessions}`, `pasos=${modelSteps}`];
+  if (lastActivity) statBits.push(`ult ${timeOnly(lastActivity)}`);
+  const statsNote = statBits.join("  ");
+
+  if (!installed) {
+    return {
+      source: "antigravity",
+      kind: "unknown",
+      ok: false,
+      note: "Antigravity no instalado (no encuentro antigravity/agy).",
+    };
+  }
+
+  const monthlyCredits = config?.monthlyCredits != null ? Number(config.monthlyCredits) : null;
+  const usedCredits = config?.usedCredits != null ? Number(config.usedCredits) : null;
+  const resetsAt = config?.resetsAt ? new Date(config.resetsAt) : null;
+
+  if (Number.isFinite(monthlyCredits) && monthlyCredits > 0) {
+    const used = Number.isFinite(usedCredits) ? Math.max(0, usedCredits) : 0;
+    const usedPercent = Math.min(999, (used / monthlyCredits) * 100);
+    return {
+      source: "antigravity",
+      kind: "configured-credits",
+      ok: true,
+      used,
+      limit: monthlyCredits,
+      remaining: Math.max(0, monthlyCredits - used),
+      usedPercent,
+      remainingPercent: Math.max(0, 100 - usedPercent),
+      resetsAt,
+      note: `Cuota manual (Gemini via Antigravity).  ${statsNote}`,
+    };
+  }
+
+  return {
+    source: "antigravity",
+    kind: "unknown",
+    ok: true,
+    note: `Ruta a Gemini (gemini-cli deautenticado). Sin cuota local; pon antigravity.monthlyCredits/usedCredits en quotas.json.  ${statsNote}`,
+  };
+}
 
 function buildOpenCodeQuota(usage, config = {}) {
   if (!usage) {
@@ -986,9 +1041,16 @@ function buildOpenCodeQuota(usage, config = {}) {
 
   if (windows.length) {
     const allServer = windows.every((w) => w.source === "server");
-    const noteText = useOverride
+    let noteText = useOverride
       ? (override.note ? `Override manual: ${override.note}` : "Override manual desde opencode.ai/auth.")
       : (usage.note || (usage.cacheHit ? "OpenCode Go desde cache local." : "OpenCode Go DB local."));
+    if (useOverride) {
+      const localBits = [];
+      if (typeof data.cost5h === "number") localBits.push(`5h ${fmtMoney(data.cost5h)}`);
+      if (typeof data.costWeek === "number") localBits.push(`sem ${fmtMoney(data.costWeek)}`);
+      if (typeof data.costMonth === "number") localBits.push(`mes ${fmtMoney(data.costMonth)}`);
+      if (localBits.length) noteText += `  ·  estimado local (tarifa publica): ${localBits.join("  ")}`;
+    }
     return {
       source: "opencode",
       kind: "detected-percent",
@@ -1400,6 +1462,7 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
     const { stdout } = await execFileAsync("sqlite3", [OPENCODE_DB_PATH, "-json",
       "SELECT s.model, s.cost, s.tokens_input, s.tokens_output, s.tokens_cache_read, s.tokens_cache_write, s.time_created " +
       "FROM session s WHERE json_extract(s.model, '$.providerID') = 'opencode-go' " +
+      "OR json_extract(s.model, '$.providerID') LIKE 'opencode-go:%' " +
       "ORDER BY s.time_created DESC"], {
       encoding: "utf8",
       maxBuffer: 10 * 1024 * 1024,
@@ -1431,10 +1494,12 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
 
     let cost5h = 0, costWeek = 0, costMonth = 0, totalCost = 0;
     let totalTokens = 0, totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0;
+    let earliestIn5h = null;
 
     for (const row of rows) {
-      const ts = row.time_created;
+      const ts = Number(row.time_created);
       const cost = Number(row.cost || 0);
+      if (!Number.isFinite(ts)) continue;
       totalCost += cost;
       totalTokens += Number(row.tokens_input || 0) + Number(row.tokens_output || 0);
       totalInput += Number(row.tokens_input || 0);
@@ -1442,7 +1507,10 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
       totalCacheRead += Number(row.tokens_cache_read || 0);
       totalCacheWrite += Number(row.tokens_cache_write || 0);
 
-      if (ts >= fiveHoursAgo) cost5h += cost;
+      if (ts >= fiveHoursAgo) {
+        cost5h += cost;
+        if (earliestIn5h === null || ts < earliestIn5h) earliestIn5h = ts;
+      }
       if (ts >= weekStartMs) costWeek += cost;
       if (ts >= monthStartMs) costMonth += cost;
     }
@@ -1473,7 +1541,7 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
         totalCacheRead: totalCacheRead,
         totalCacheWrite: totalCacheWrite,
         sessionCount: rows.length,
-        reset5h: new Date(now + 5 * HOUR).toISOString(),
+        reset5h: new Date((earliestIn5h !== null ? earliestIn5h : now) + 5 * HOUR).toISOString(),
         resetWeek: nextWeek.toISOString(),
         resetMonth: new Date(nextMonth).toISOString(),
       },
@@ -1745,6 +1813,10 @@ function drawQuotaTab(width, maxHeight, snap) {
 
   // Gemini quota
   lines.push(...quotaSection("Gemini", colors.blue, quotas.gemini, halfWidth, width));
+  lines.push("");
+
+  // Antigravity quota (ruta a modelos Gemini tras la deautenticacion del gemini-cli)
+  lines.push(...quotaSection("Antigravity (Gemini)", colors.yellow, quotas.antigravity, halfWidth, width));
   lines.push("");
 
   // MiniMax quota
@@ -2393,6 +2465,14 @@ function renderPlainSummary(snap) {
       lines.push(`OpenCode: ${oq.note || "sin datos"}`);
     }
   }
+  if (snap.quotas?.antigravity) {
+    const aq = snap.quotas.antigravity;
+    if (aq.kind === "configured-credits" && aq.limit) {
+      lines.push(`Antigravity quota: used=${fmtNumber(aq.used)}/${fmtNumber(aq.limit)} (${fmtPct(aq.usedPercent)}) remaining=${fmtPct(aq.remainingPercent)}${aq.resetsAt ? ` reset=${fmtReset(aq.resetsAt)}` : ""}`);
+    } else if (aq.note) {
+      lines.push(`Antigravity quota: ${aq.note}`);
+    }
+  }
   lines.push(`Quota config: ${snap.quotas?.configPath || QUOTA_CONFIG_PATH}`);
   return lines.join("\n");
 }
@@ -2431,7 +2511,9 @@ function zipCards(cards, width) {
 
 function bar(value, max, width, color) {
   const size = Math.max(1, width);
-  const filled = Math.max(0, Math.min(size, Math.round((value / Math.max(1, max)) * size)));
+  const v = Number.isFinite(value) ? value : 0;
+  const m = Number.isFinite(max) && max > 0 ? max : 1;
+  const filled = Math.max(0, Math.min(size, Math.round((v / m) * size)));
   return `${color}${"#".repeat(filled)}${colors.gray}${"-".repeat(size - filled)}${RESET}`;
 }
 
@@ -2527,7 +2609,28 @@ function shortText(value, width) {
 }
 
 function truncateAnsi(value, width) {
-  return truncate(stripAnsi(value), width);
+  const text = String(value);
+  if (width <= 0) return "";
+  if (visibleLength(text) <= width) return text;
+  const limit = Math.max(0, width - 1); // reserva 1 col para el "."
+  let out = "";
+  let visible = 0;
+  let sawAnsi = false;
+  for (let i = 0; i < text.length && visible < limit; ) {
+    if (text[i] === "\x1b") {
+      const match = text.slice(i).match(/^\x1b\[[0-9;?]*[A-Za-z]/);
+      if (match) {
+        out += match[0];
+        i += match[0].length;
+        sawAnsi = true;
+        continue;
+      }
+    }
+    out += text[i];
+    visible += 1;
+    i += 1;
+  }
+  return `${out}.${sawAnsi ? RESET : ""}`;
 }
 
 function stripAnsi(value) {
@@ -2577,3 +2680,31 @@ function exit(code) {
   cleanup();
   process.exit(code);
 }
+
+// Exports para pruebas unitarias (no se ejecuta main() al importar; ver INVOKED_DIRECTLY).
+export {
+  normalizeTotals,
+  sumRows,
+  extractModels,
+  mergeModels,
+  buildCodexQuota,
+  buildClaudeQuota,
+  buildGeminiQuota,
+  buildMiniMaxQuota,
+  buildOpenCodeQuota,
+  buildAntigravityQuota,
+  buildTokenQuota,
+  parseClaudeUsageOutput,
+  claudeWindowKey,
+  claudeWindowLabel,
+  numberFromAny,
+  bar,
+  truncateAnsi,
+  stripAnsi,
+  visibleLength,
+  fit,
+  fmtPct,
+  fmtMoney,
+  fmtInt,
+  fmtCompact,
+};

@@ -217,6 +217,7 @@ def run_capture():
     start = time.monotonic()
     deadline = start + timeout
     sent_stats = False
+    auth_dead = False
     sent_extra_enter = False
     sent_model = False
     sent_model_extra_enter = False
@@ -239,6 +240,16 @@ def run_capture():
             elapsed = time.monotonic() - start
             prompt_ready = "Type your message" in text
             fallback_ready = elapsed > 25.0 and "Waiting for authentication" not in text
+
+            # Google revoco el OAuth del gemini-cli: bail rapido en vez de colgar el timeout.
+            if (
+                "Failed to authenticate" in text
+                or "invalid_grant" in text
+                or "FatalAuthenticationError" in text
+                or "Please visit the following URL to authorize" in text
+            ):
+                auth_dead = True
+                break
 
             if not sent_stats and (prompt_ready or fallback_ready):
                 os.write(master_fd, b"/stats model\r")
@@ -300,6 +311,13 @@ def run_capture():
                 pass
 
     parsed = parse_stats(buffer)
+    if auth_dead:
+        parsed["ok"] = False
+        parsed["authDead"] = True
+        parsed["note"] = (
+            "Gemini CLI deautenticado: Google revoco el OAuth del gemini-cli. "
+            "Reautentica con `gemini` (/auth) o usa Antigravity."
+        )
     debug_file = os.environ.get("AI_USAGE_GEMINI_DEBUG_FILE")
     if debug_file:
         with open(debug_file, "w", encoding="utf-8") as handle:
