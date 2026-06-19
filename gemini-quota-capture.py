@@ -211,6 +211,7 @@ def run_capture():
         stderr=slave_fd,
         close_fds=True,
         env=env,
+        start_new_session=True,  # grupo propio -> se puede matar con killpg sin dejar huerfanos
     )
     os.close(slave_fd)
 
@@ -297,12 +298,18 @@ def run_capture():
         except OSError:
             pass
         if proc.poll() is None:
+            # Matar TODO el grupo (gemini es Node y puede tener hijos) para no dejar
+            # procesos huerfanos (ppid=1) que se acumulan y cargan el sistema.
             try:
-                proc.terminate()
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            try:
                 proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            except OSError:
+            except (subprocess.TimeoutExpired, OSError):
                 pass
         if temp_settings_path:
             try:

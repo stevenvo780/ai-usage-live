@@ -14,6 +14,7 @@ Salida: JSON en stdout. Variables de entorno:
 import json
 import os
 import pty
+import signal
 import re
 import select
 import struct
@@ -179,9 +180,17 @@ def run():
 
     try:
         os.write(fd, b"\x1b")  # cerrar panel
-        os.kill(pid, 9)
     except OSError:
         pass
+    # Matar TODO el grupo de procesos (agy es un TUI Node que puede tener hijos):
+    # killpg evita dejar procesos huerfanos (ppid=1) que se acumulan y cargan el sistema.
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
     text = clean(buf)
     debug = os.environ.get("AI_USAGE_ANTIGRAVITY_DEBUG_FILE")
