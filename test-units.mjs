@@ -415,3 +415,54 @@ test("truncateAnsi: preserves the color code seen before the cut", () => {
   assert(out.endsWith("\x1b[0m")); // RESET appended
   assert(visibleLength(out) <= 6);
 });
+
+test("buildAntigravityQuota: live buckets -> detected-percent with used = (1-remainingFraction)*100", () => {
+  const live = {
+    ok: true,
+    buckets: [
+      {
+        modelId: "gemini-3-pro-preview",
+        remainingFraction: 0.5,
+        resetTime: "2026-06-20T16:00:00Z",
+        tokenType: "REQUESTS",
+      },
+      {
+        modelId: "gemini-2.5-flash",
+        remainingFraction: 1,
+        resetTime: "2026-06-20T16:00:00Z",
+        tokenType: "REQUESTS",
+      },
+    ],
+  };
+  const q = buildAntigravityQuota({ installed: true, sessions: 5, modelSteps: 10 }, {}, live);
+  assert.strictEqual(q.kind, "detected-percent");
+  assert(Array.isArray(q.windows));
+  assert(q.windows.length > 0);
+  const w = q.windows.find((x) => x.label.startsWith("gemini-3-pro"));
+  assert(w, "should have a gemini-3-pro window");
+  assert.strictEqual(w.usedPercent, 50);
+  assert.strictEqual(w.remainingPercent, 50);
+  assert(!w.label.includes("-preview"), `label should not include "-preview", got: ${w.label}`);
+});
+
+test("buildAntigravityQuota: live preferred over config manual", () => {
+  const live = {
+    ok: true,
+    buckets: [
+      { modelId: "gemini-3-pro-preview", remainingFraction: 0.5, resetTime: "2026-06-20T16:00:00Z", tokenType: "REQUESTS" },
+      { modelId: "gemini-2.5-flash", remainingFraction: 1, resetTime: "2026-06-20T16:00:00Z", tokenType: "REQUESTS" },
+    ],
+  };
+  const q = buildAntigravityQuota({ installed: true }, { monthlyCredits: 1000, usedCredits: 900 }, live);
+  assert.strictEqual(q.kind, "detected-percent");
+  assert(Array.isArray(q.windows));
+});
+
+test("buildAntigravityQuota: sin live, con config manual -> configured-credits", () => {
+  const q = buildAntigravityQuota({ installed: true }, { monthlyCredits: 1000, usedCredits: 250 }, null);
+  assert.strictEqual(q.kind, "configured-credits");
+  assert.strictEqual(q.used, 250);
+  assert.strictEqual(q.limit, 1000);
+  assert.strictEqual(q.usedPercent, 25);
+  assert.strictEqual(q.remainingPercent, 75);
+});
