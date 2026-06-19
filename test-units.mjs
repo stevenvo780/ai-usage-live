@@ -23,6 +23,8 @@ import {
   stripAnsi,
   visibleLength,
   fit,
+  fmtCountdown,
+  blockBar,
 } from "./ai-usage-tui.mjs";
 
 const HOUR_MS = 3600000;
@@ -508,4 +510,35 @@ test("parseResetDuration: '2 days 6 hours' -> Date ~ +54h", () => {
   assert.ok(deltaMs <= 54.1 * HOUR_MS);
 
   assert.strictEqual(parseResetDuration("texto sin numeros"), null);
+});
+
+test("fmtCountdown: null and undefined return --", () => {
+  assert.strictEqual(fmtCountdown(null), "--");
+  assert.strictEqual(fmtCountdown(undefined), "--");
+});
+
+test("fmtCountdown: ~1.5h formats as XhYm", () => {
+  const out = fmtCountdown(new Date(Date.now() + 5400000));
+  assert.match(out, /^1h\d{1,2}m$/);
+});
+
+test("fmtCountdown: ~2 days formats as XdYh", () => {
+  const out = fmtCountdown(new Date(Date.now() + (2 * 86400000 + 3600000)));
+  assert.match(out, /^2d\s?\d+h$/);
+});
+
+test("fmtCountdown: past/now returns string without throwing", () => {
+  const out = fmtCountdown(new Date(Date.now() - 1000));
+  assert.strictEqual(typeof out, "string");
+});
+
+test("blockBar: 50% in width=10 -> 5 filled and 5 empty cells", () => {
+  const out = stripAnsi(blockBar(50, 10, ""));
+  assert.strictEqual((out.match(/█/g) || []).length, 5);
+  assert.strictEqual((out.match(/░/g) || []).length, 5);
+});
+
+test("blockBar: NaN produces no filled cells and does not crash", () => {
+  const out = stripAnsi(blockBar(NaN, 10, ""));
+  assert(!out.includes("█"));
 });
