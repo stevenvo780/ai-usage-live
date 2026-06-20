@@ -70,6 +70,7 @@ const ANTIGRAVITY_PROJECTS_PATH = path.join(homedir(), ".gemini", "antigravity-c
 const ANTIGRAVITY_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 const OPENCODE_SERVER_CACHE_PATH = path.join(CONFIG_DIR, "opencode-server-cache.json");
 const OPENCODE_WEB_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const CODEX_PROBE_CACHE_PATH = path.join(CONFIG_DIR, "codex-probe-cache.json");
 
 const args = parseArgs(process.argv.slice(2));
 const state = {
@@ -302,6 +303,9 @@ async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ig
   const liveQuotaSettled = await liveQuotaPromise;
   sources.claudeLive = liveQuotaSettled[0].status === "fulfilled" ? liveQuotaSettled[0].value : { ok: false };
   sources.antigravityLive = liveQuotaSettled[1].status === "fulfilled" ? liveQuotaSettled[1].value : { ok: false };
+  sources.codexLive = includeLive
+    ? await collectCodexLive(quotaConfig.codex, { ignoreCache: ignoreLiveCache })
+    : (readJsonSafe(CODEX_PROBE_CACHE_PATH) || { ok: false });
   const quotas = buildQuotaState(sources, quotaConfig);
 
   return {
@@ -554,6 +558,8 @@ function defaultQuotaConfig() {
     codex: {
       useDetectedRateLimits: true,
       dailyTokens: null,
+      probe: false,
+      probeCacheMinutes: 15,
     },
     gemini: {
       liveCapture: true,
@@ -625,7 +631,7 @@ function deepMerge(base, override, extra = {}) {
 function buildQuotaState(sources, config) {
   return {
     configPath: config.configPath,
-    codex: buildCodexQuota(sources.codex, config.codex),
+    codex: buildCodexQuota(sources.codex, config.codex, sources.codexLive),
     claude: buildClaudeQuota(sources.claude, sources.claudeBlocks, config.claude, sources.claudeLive),
     minimax: buildMiniMaxQuota(sources.minimax, config.minimax),
     opencode: buildOpenCodeQuota(sources.opencodeLive, config.opencode, sources.opencodeServer),
@@ -633,10 +639,23 @@ function buildQuotaState(sources, config) {
   };
 }
 
-function buildCodexQuota(usage, config = {}) {
-  const detected = config.useDetectedRateLimits !== false ? collectCodexRateLimits() : null;
+function buildCodexQuota(usage, config = {}, live = null) {
   const manual = buildTokenQuota("codex", usage, config.dailyTokens, "dia");
-  if (!detected) return manual;
+  // Probe en vivo (codex-probe.py): si trae rate_limits frescos, son la fuente; si Codex
+  // esta LIMITADO lo marcamos; si no, leemos las sesiones pasivas (~/.codex/sessions).
+  const fromLive = Boolean(live?.ok && live.rate_limits);
+  const limited = Boolean(live?.ok && live.limited);
+  const detected = fromLive ? live.rate_limits : (config.useDetectedRateLimits !== false ? collectCodexRateLimits() : null);
+  if (!detected) {
+    if (limited) {
+      return {
+        source: "codex", kind: "detected-percent", ok: true, windows: [], creditsList: [], manual,
+        limited: true, limitedRetry: live.retryText || "", stale: false,
+        note: `LIMITE ALCANZADO — reintentar ${live.retryText || "mas tarde"}`,
+      };
+    }
+    return manual;
+  }
 
   const entries = Array.isArray(detected) ? detected : [detected];
   const windows = [];
@@ -673,14 +692,15 @@ function buildCodexQuota(usage, config = {}) {
   // el dashboard lo lee pasivo de ~/.codex/sessions. Si el ultimo dato es viejo o su ventana
   // ya reseteo, el % puede no reflejar el uso actual -> lo marcamos como stale.
   const detectedTimes = entries.map((e) => Date.parse(e.detectedAt || "")).filter(Number.isFinite);
-  const freshestMs = detectedTimes.length ? Math.max(...detectedTimes) : NaN;
-  const ageMin = Number.isFinite(freshestMs) ? Math.max(0, Math.round((Date.now() - freshestMs) / 60000)) : null;
+  const freshestMs = fromLive ? Date.now() : (detectedTimes.length ? Math.max(...detectedTimes) : NaN);
+  const ageMin = fromLive ? 0 : (Number.isFinite(freshestMs) ? Math.max(0, Math.round((Date.now() - freshestMs) / 60000)) : null);
   for (const w of windows) {
-    if (w.reset instanceof Date && w.reset.getTime() < Date.now()) w.stale = true;
+    if (!fromLive && w.reset instanceof Date && w.reset.getTime() < Date.now()) w.stale = true;
   }
-  const codexStale = (ageMin != null && ageMin >= 20) || windows.some((w) => w.stale);
+  const codexStale = !fromLive && ((ageMin != null && ageMin >= 20) || windows.some((w) => w.stale));
   const ageStr = ageMin == null ? "" : ageMin >= 120 ? `${Math.round(ageMin / 60)}h` : `${ageMin}m`;
-  const ageTag = ageMin != null && ageMin >= 20 ? `  [dato de hace ${ageStr}; usa codex para refrescar]` : "";
+  const ageTag = !fromLive && ageMin != null && ageMin >= 20 ? `  [dato de hace ${ageStr}; usa codex para refrescar]` : "";
+  const limitTag = limited ? `LIMITE ALCANZADO (reintentar ${live.retryText || "mas tarde"}).  ` : "";
   const codexDetectedAt = Number.isFinite(freshestMs) ? new Date(freshestMs).toISOString() : null;
 
   if (!windows.length && creditsList.length) {
@@ -693,7 +713,9 @@ function buildCodexQuota(usage, config = {}) {
       manual,
       detectedAt: codexDetectedAt,
       stale: codexStale,
-      note: creditsList.map((c) => {
+      limited,
+      limitedRetry: limited ? live.retryText : undefined,
+      note: limitTag + creditsList.map((c) => {
         const name = c.limitId === "premium" ? "mini" : c.limitId;
         return c.unlimited ? `${name}: ilimitado` : c.has_credits ? `${name}: balance ${c.balance}` : `${name}: sin creditos`;
       }).join(" | ") + ageTag,
@@ -710,7 +732,9 @@ function buildCodexQuota(usage, config = {}) {
     manual,
     detectedAt: codexDetectedAt,
     stale: codexStale,
-    note: (windows.length ? "Rate limit detectado desde sesiones Codex." : "Codex sin rate_limits recientes.") + ageTag,
+    limited,
+    limitedRetry: limited ? live.retryText : undefined,
+    note: limitTag + (fromLive ? "Codex (probe en vivo)." : windows.length ? "Rate limit detectado desde sesiones Codex." : "Codex sin rate_limits recientes.") + ageTag,
   };
 }
 
@@ -1376,6 +1400,42 @@ function buildOpenCodeQuota(usage, config = {}, server = null) {
       ? "serverOverride.enabled=true pero falta fiveHourUsed/weeklyUsed/monthlyUsed o los limites fiveHourCost/weeklyCost/monthlyCost."
       : "Configura fiveHourCost, weeklyCost o monthlyCost en quotas.json para ver barras de cuota Go.",
   };
+}
+
+async function collectCodexLive(config = {}, { ignoreCache = false } = {}) {
+  // Codex no expone una query de cuota gratis. codex-probe.py hace una mini-llamada
+  // `codex exec --json`: si Codex esta LIMITADO el backend responde un error (RAPIDO y
+  // GRATIS) con la hora de reintento; si no, devuelve rate_limits frescos. Opt-in via
+  // quotas.json codex.probe (solo el caso NO-limitado consume un poco de cuota).
+  if (config?.probe !== true || process.env.AI_USAGE_CODEX_PROBE === "0") return { ok: false, disabled: true };
+  if (!commandExists("codex")) return { ok: false, note: "codex no instalado." };
+  const cacheMinutes = Number(process.env.CODEX_PROBE_CACHE_MINUTES ?? config.probeCacheMinutes ?? 10);
+  if (!ignoreCache) {
+    const cached = readJsonCache(CODEX_PROBE_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
+    if (cached) return { ...cached, cacheHit: true };
+  }
+  const helper = path.join(SCRIPT_DIR, "codex-probe.py");
+  if (!existsSync(helper)) return { ok: false, note: "falta codex-probe.py." };
+  try {
+    const { stdout } = await execFileAsync("python3", [helper], {
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: 35000,
+      env: { ...process.env, CODEX_PROBE_TIMEOUT: "16" },
+    });
+    const parsed = JSON.parse(stdout);
+    if (parsed?.ok) {
+      writeJsonCache(CODEX_PROBE_CACHE_PATH, parsed);
+      return parsed;
+    }
+    const stale = readJsonSafe(CODEX_PROBE_CACHE_PATH);
+    if (stale?.ok) return { ...stale, cacheHit: true, cacheStale: true };
+    return parsed || { ok: false };
+  } catch (error) {
+    const stale = readJsonSafe(CODEX_PROBE_CACHE_PATH);
+    if (stale?.ok) return { ...stale, cacheHit: true, cacheStale: true };
+    return { ok: false, note: `codex probe fallo: ${shortError(error)}` };
+  }
 }
 
 function collectCodexRateLimits() {
@@ -2346,8 +2406,9 @@ function renderQuotaCard(cardW, provider, quota, selected) {
     if (family) tag = ` [${family}]`;
   }
   const more = windows.length > 3 ? ` +${windows.length - 3} \u21B5` : "";
+  const limitTag = quota?.limited ? ` [LIMITE${quota.limitedRetry ? ` ${quota.limitedRetry}` : ""}]` : "";
   const staleTag = quota?.stale ? " [viejo]" : "";
-  const footContent = ` \u21BB ${cdText}${tag}${staleTag}${more} `;
+  const footContent = ` \u21BB ${cdText}${tag}${limitTag}${staleTag}${more} `;
   lines.push(bodyLine(footContent));
 
   lines.push(`${borderColor}\u2514${"\u2500".repeat(inner)}\u2518${RESET}`);
@@ -3315,6 +3376,8 @@ function buildAgentQuotaSummary(snap) {
       ok: quota.ok !== false,
       kind: quota.kind || "unknown",
       stale: quota.stale || undefined,
+      limited: quota.limited || undefined,
+      limitedRetry: quota.limitedRetry || undefined,
       windows,
       note: quota.note || "",
     };
