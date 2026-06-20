@@ -1,6 +1,6 @@
 {
   "name": "ai-usage-live",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "Terminal dashboard for local AI CLI usage (Claude, Codex, Antigravity/Gemini, MiniMax, OpenCode Go).",
   "type": "module",
   "bin": { "ai-usage-live": "./ai-usage-live", "ai-usage": "./ai-usage.sh", "ai-usage-quota": "./ai-usage-quota", "ai-usage-mcp": "./ai-usage-mcp.mjs" },

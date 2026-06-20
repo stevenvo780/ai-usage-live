@@ -657,7 +657,10 @@ function buildCodexQuota(usage, config = {}, live = null) {
   // esta LIMITADO lo marcamos; si no, leemos las sesiones pasivas (~/.codex/sessions).
   const fromLive = Boolean(live?.ok && live.rate_limits);
   const limited = Boolean(live?.ok && live.limited);
-  const detected = fromLive ? live.rate_limits : (config.useDetectedRateLimits !== false ? collectCodexRateLimits() : null);
+  // Si el probe EN VIVO dice LIMITADO, esa es la verdad actual: NO mostramos barras viejas de
+  // sesiones (~/.codex/sessions). Son de ANTES del tope y contradicen el estado real (verias
+  // "5h 18%" junto a "[LIMITE]") -> confunde. Limitado => tarjeta de limite directo, sin barras.
+  const detected = limited ? null : (fromLive ? live.rate_limits : (config.useDetectedRateLimits !== false ? collectCodexRateLimits() : null));
   if (!detected) {
     if (limited) {
       return {
