@@ -6,6 +6,8 @@ import {
   extractModels,
   mergeModels,
   buildCodexQuota,
+  parseCodexRetryTime,
+  fmtTimeInTz,
   buildClaudeQuota,
   buildGeminiQuota,
   buildMiniMaxQuota,
@@ -30,6 +32,36 @@ import {
 } from "./ai-usage-tui.mjs";
 
 const HOUR_MS = 3600000;
+
+test("parseCodexRetryTime: parses '5:43 AM' to next occurrence in host TZ", () => {
+  const d = parseCodexRetryTime("5:43 AM");
+  assert.ok(d instanceof Date);
+  assert.equal(d.getHours(), 5);
+  assert.equal(d.getMinutes(), 43);
+  assert.ok(d.getTime() > Date.now()); // siempre la proxima ocurrencia
+});
+
+test("parseCodexRetryTime: handles PM and noon/midnight, rejects junk", () => {
+  assert.equal(parseCodexRetryTime("11:30 PM").getHours(), 23);
+  assert.equal(parseCodexRetryTime("12:00 AM").getHours(), 0);
+  assert.equal(parseCodexRetryTime("12:15 PM").getHours(), 12);
+  assert.equal(parseCodexRetryTime("nope"), null);
+});
+
+test("fmtTimeInTz: converts a UTC instant to America/Bogota (UTC-5)", () => {
+  const utc543 = new Date("2026-06-20T05:43:00Z"); // 5:43 AM UTC
+  assert.equal(fmtTimeInTz(utc543, "America/Bogota"), "12:43 AM"); // = medianoche pasada en CO
+  assert.equal(fmtTimeInTz(utc543, ""), null); // sin tz -> null
+});
+
+test("buildCodexQuota: limited -> local retry time, countdown, no stale bars", () => {
+  const q = buildCodexQuota({}, { probe: true, timezone: "America/Bogota" }, { ok: true, limited: true, retryText: "5:43 AM" });
+  assert.equal(q.limited, true);
+  assert.equal(q.limitedRetry, "12:43 AM"); // convertido a hora local del usuario
+  assert.deepEqual(q.windows, []); // no muestra barras viejas de sesiones
+  assert.match(q.note, /reintentar 12:43 AM/);
+  assert.match(q.note, /en ~/); // incluye countdown
+});
 
 test("normalizeTotals: basic inputs with cache tokens", () => {
   const result = normalizeTotals({

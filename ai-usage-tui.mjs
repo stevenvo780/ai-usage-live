@@ -651,6 +651,35 @@ function buildQuotaState(sources, config) {
   };
 }
 
+function fmtTimeInTz(date, tz) {
+  if (!date || !tz) return null;
+  try {
+    return new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: tz }).format(date);
+  } catch {
+    return null;
+  }
+}
+
+function parseCodexRetryTime(text) {
+  // Codex dice "try again at 5:43 AM" SIN zona ni fecha; formatea esa hora en la TZ LOCAL del
+  // host (aqui UTC). La parseamos en esa MISMA TZ local -> instante absoluto (proxima ocurrencia).
+  // Asi el countdown sale correcto y a prueba de zona: la web te lo muestra en TU hora, el CLI en
+  // la del host; el instante real es el mismo. Para mostrar tu hora local: fmtTimeInTz(date, tz).
+  const m = String(text || "").match(/(\d{1,2}):(\d{2})\s*([AP]M)?/i);
+  if (!m) return null;
+  let hour = Number(m[1]);
+  const min = Number(m[2]);
+  const ap = (m[3] || "").toUpperCase();
+  if (ap === "PM" && hour < 12) hour += 12;
+  if (ap === "AM" && hour === 12) hour = 0;
+  if (hour > 23 || min > 59) return null;
+  const now = new Date();
+  const d = new Date(now);
+  d.setHours(hour, min, 0, 0);
+  if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
+  return d;
+}
+
 function buildCodexQuota(usage, config = {}, live = null) {
   const manual = buildTokenQuota("codex", usage, config.dailyTokens, "dia");
   // Probe en vivo (codex-probe.py): si trae rate_limits frescos, son la fuente; si Codex
@@ -663,10 +692,19 @@ function buildCodexQuota(usage, config = {}, live = null) {
   const detected = limited ? null : (fromLive ? live.rate_limits : (config.useDetectedRateLimits !== false ? collectCodexRateLimits() : null));
   if (!detected) {
     if (limited) {
+      // Codex da la hora de reintento como texto en la TZ del host (UTC). La convertimos a un
+      // instante absoluto para countdown (a prueba de zona) y, si hay tz configurada, a tu hora.
+      const retryDate = parseCodexRetryTime(live.retryText);
+      const tz = config.timezone || process.env.AI_USAGE_TZ || "";
+      const retryLocal = fmtTimeInTz(retryDate, tz);
+      const cd = retryDate ? fmtCountdown(retryDate) : "";
+      const retryShown = retryLocal || live.retryText || "mas tarde";
+      const hostNote = !retryLocal && live.retryText ? " (hora host/UTC)" : "";
       return {
         source: "codex", kind: "detected-percent", ok: true, windows: [], creditsList: [], manual,
-        limited: true, limitedRetry: live.retryText || "", stale: false,
-        note: `LIMITE ALCANZADO — reintentar ${live.retryText || "mas tarde"}`,
+        limited: true, limitedRetry: retryShown, limitedRetryRaw: live.retryText || "",
+        resetAt: retryDate ? retryDate.toISOString() : null, stale: false,
+        note: `LIMITE ALCANZADO — reintentar ${retryShown}${hostNote}${cd ? ` (en ~${cd})` : ""}`,
       };
     }
     return manual;
@@ -2410,6 +2448,10 @@ function renderQuotaCard(cardW, provider, quota, selected) {
   } else {
     const wt = windows.find((w) => w.resetText)?.resetText;
     if (wt) cdText = shortText(wt, 18);
+    else if (quota?.resetAt) {
+      const d = quota.resetAt instanceof Date ? quota.resetAt : new Date(quota.resetAt);
+      if (!Number.isNaN(d.getTime())) cdText = fmtCountdown(d);
+    }
   }
 
   let tag = "";
@@ -3417,6 +3459,9 @@ export {
   extractModels,
   mergeModels,
   buildCodexQuota,
+  parseCodexRetryTime,
+  fmtTimeInTz,
+  renderQuotaCard,
   buildClaudeQuota,
   buildGeminiQuota,
   buildMiniMaxQuota,
