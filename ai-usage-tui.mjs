@@ -268,12 +268,13 @@ async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ig
       ]);
 
   const ccusageJobs = [];
-  ccusageJobs.push(["all", ccusageJson([], view)]);
-  ccusageJobs.push(["claudeBlocks", ccusageJson(["claude"], "blocks")]);
+  const ccOpts = { ignoreCache: ignoreLiveCache };
+  ccusageJobs.push(["all", ccusageJson([], view, ccOpts)]);
+  ccusageJobs.push(["claudeBlocks", ccusageJson(["claude"], "blocks", ccOpts)]);
 
   for (const source of ALL_SOURCES) {
     if (sourceSupportsView(source, view)) {
-      ccusageJobs.push([source, ccusageJson([source], view)]);
+      ccusageJobs.push([source, ccusageJson([source], view, ccOpts)]);
     }
   }
 
@@ -342,7 +343,16 @@ function sourceSupportsView(source, view) {
   return true;
 }
 
-async function ccusageJson(prefix, view) {
+async function ccusageJson(prefix, view, { ignoreCache = false } = {}) {
+  // ccusage (npx) tarda ~10s; lo cacheamos CCUSAGE_CACHE_SECONDS (default 60s) por-query para
+  // que los refreshes y el MCP/hook (cada prompt) no re-corran npx cada vez. `r` lo ignora.
+  const key = `${prefix.join("-") || "all"}-${view}-${state.since || "x"}-${state.until || "x"}`.replace(/[^a-z0-9-]/gi, "");
+  const cacheFile = path.join(CONFIG_DIR, `ccusage-cache-${key}.json`);
+  const cacheSeconds = Number(process.env.CCUSAGE_CACHE_SECONDS ?? 60);
+  if (!ignoreCache && cacheSeconds > 0) {
+    const cached = readJsonCache(cacheFile, cacheSeconds * 1000);
+    if (cached && "data" in cached) return cached.data;
+  }
   const args = [...ccusageCommand.args, ...prefix, view, "--json"];
   if (state.since) args.push("--since", state.since);
   if (state.until) args.push("--until", state.until);
@@ -352,7 +362,9 @@ async function ccusageJson(prefix, view) {
     maxBuffer: 50 * 1024 * 1024,
     timeout: 30000,
   });
-  return JSON.parse(stdout);
+  const data = JSON.parse(stdout);
+  if (cacheSeconds > 0) writeJsonCache(cacheFile, { data });
+  return data;
 }
 
 function normalizeUsage(source, raw, view) {
