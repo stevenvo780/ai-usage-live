@@ -20,7 +20,7 @@ Terminal dashboard for local AI CLI usage — monitors Claude Code, Codex CLI, A
 
 ```bash
 bash package-ai-usage-live.sh
-sudo dpkg -i dist/ai-usage-live_0.9.0_all.deb
+sudo dpkg -i dist/ai-usage-live_0.10.0_all.deb
 ```
 
 ### Manual
@@ -196,7 +196,7 @@ O bien, usando la ruta absoluta al script en sistemas donde no esté el binario 
 |---|---|---|
 | Claude Code | `ccusage` local logs | Effective tokens = input + cacheCreate + output (excludes cache reads) |
 | Claude quota | `claude -p /usage` | Reports session, weekly (all), weekly (Sonnet) percentages |
-| Codex CLI | `ccusage` local logs + rate_limits from sessions | Auto-detects 5h and weekly windows |
+| Codex CLI | `ccusage` local logs + rate_limits from sessions | Rate limit detection (passive from sessions) + live probe (`codex-probe.py`, opt-in via `quotas.json`). Probe free when rate-limited; costs ~13K tokens when sounding. |
 | Gemini CLI | (Removido) | Proveedor removido. Google revocó el OAuth de gemini-cli (`invalid_grant`). Antigravity es ahora la vía de acceso a los modelos Gemini. |
 | Antigravity | Local transcript analysis + Cuota real automática (CLI + API fallback) | Es la vía de acceso a los modelos Gemini, Claude y GPT-OSS. Muestra cuota real de todos los modelos (Gemini Flash/Pro, Claude Opus, Claude Sonnet y GPT-OSS). Captura la cuota como fuente principal ejecutando el comando interactivo `/usage` del CLI `agy`/`antigravity` mediante el script `antigravity-usage-capture.py` (que automatiza el TUI vía pty y parsea su salida). Como fallback para Gemini, usa la API de Google Cloud Code (`cloudcode-pa retrieveUserQuota`). Consumo local derivado de transcripts locales. |
 | MiniMax | Coding Plan API + local cache | Requires `MINIMAX_API_KEY` or `minimax.apiKey` in quota config |
@@ -228,6 +228,8 @@ Useful fields:
   },
   "codex": {
     "useDetectedRateLimits": true,
+    "probe": false,
+    "probeCacheMinutes": 15,
     "dailyTokens": null
   },
   "antigravity": {
@@ -333,6 +335,9 @@ La cookie es un secreto de sesión sensible:
 |---|---|---|
 | `REFRESH_SEC` | `10` | Auto-refresh interval in seconds |
 | `AI_USAGE_CLAUDE_LIVE` | `1` | Set to `0` to disable Claude /usage |
+| `AI_USAGE_CODEX_PROBE` | `1` | Set to `0` to disable Codex live probe |
+| `CODEX_PROBE_CACHE_MINUTES` | `15` | Codex probe cache duration |
+| `CODEX_PROBE_TIMEOUT` | `16` | Timeout for Codex probe execution (in seconds) |
 | `AI_USAGE_ANTIGRAVITY_USAGE` | `1` | Set to `0` to disable CLI capture, using API SDK only / Establece en `0` para desactivar la captura del CLI y usar solo la API SDK |
 | `AI_USAGE_ANTIGRAVITY_LIVE` | `1` | Set to `0` to disable Antigravity live quota capture / Establece en `0` para desactivar la captura de cuota real de Antigravity |
 | `ANTIGRAVITY_USAGE_CACHE_MINUTES` | `3` | Antigravity quota cache duration / Minutos de caché para la cuota de Antigravity (la captura `/usage` tarda ~4-5s) |
