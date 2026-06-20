@@ -669,6 +669,20 @@ function buildCodexQuota(usage, config = {}) {
     }
   }
 
+  // Frescura: el rate_limit de Codex SOLO se escribe al USAR codex (no hay query en vivo);
+  // el dashboard lo lee pasivo de ~/.codex/sessions. Si el ultimo dato es viejo o su ventana
+  // ya reseteo, el % puede no reflejar el uso actual -> lo marcamos como stale.
+  const detectedTimes = entries.map((e) => Date.parse(e.detectedAt || "")).filter(Number.isFinite);
+  const freshestMs = detectedTimes.length ? Math.max(...detectedTimes) : NaN;
+  const ageMin = Number.isFinite(freshestMs) ? Math.max(0, Math.round((Date.now() - freshestMs) / 60000)) : null;
+  for (const w of windows) {
+    if (w.reset instanceof Date && w.reset.getTime() < Date.now()) w.stale = true;
+  }
+  const codexStale = (ageMin != null && ageMin >= 20) || windows.some((w) => w.stale);
+  const ageStr = ageMin == null ? "" : ageMin >= 120 ? `${Math.round(ageMin / 60)}h` : `${ageMin}m`;
+  const ageTag = ageMin != null && ageMin >= 20 ? `  [dato de hace ${ageStr}; usa codex para refrescar]` : "";
+  const codexDetectedAt = Number.isFinite(freshestMs) ? new Date(freshestMs).toISOString() : null;
+
   if (!windows.length && creditsList.length) {
     return {
       source: "codex",
@@ -677,10 +691,12 @@ function buildCodexQuota(usage, config = {}) {
       plan: entries[0]?.plan_type || entries[0]?.limit_id || "",
       creditsList,
       manual,
+      detectedAt: codexDetectedAt,
+      stale: codexStale,
       note: creditsList.map((c) => {
         const name = c.limitId === "premium" ? "mini" : c.limitId;
         return c.unlimited ? `${name}: ilimitado` : c.has_credits ? `${name}: balance ${c.balance}` : `${name}: sin creditos`;
-      }).join(" | "),
+      }).join(" | ") + ageTag,
     };
   }
 
@@ -692,7 +708,9 @@ function buildCodexQuota(usage, config = {}) {
     windows,
     creditsList,
     manual,
-    note: windows.length ? "Rate limit detectado desde sesiones Codex." : "Codex sin rate_limits recientes.",
+    detectedAt: codexDetectedAt,
+    stale: codexStale,
+    note: (windows.length ? "Rate limit detectado desde sesiones Codex." : "Codex sin rate_limits recientes.") + ageTag,
   };
 }
 
@@ -2328,7 +2346,8 @@ function renderQuotaCard(cardW, provider, quota, selected) {
     if (family) tag = ` [${family}]`;
   }
   const more = windows.length > 3 ? ` +${windows.length - 3} \u21B5` : "";
-  const footContent = ` \u21BB ${cdText}${tag}${more} `;
+  const staleTag = quota?.stale ? " [viejo]" : "";
+  const footContent = ` \u21BB ${cdText}${tag}${staleTag}${more} `;
   lines.push(bodyLine(footContent));
 
   lines.push(`${borderColor}\u2514${"\u2500".repeat(inner)}\u2518${RESET}`);
@@ -3289,11 +3308,13 @@ function buildAgentQuotaSummary(snap) {
       if (w.source) entry.source = w.source;
       if (w.resetText) entry.resetText = w.resetText;
       if (w.available) entry.available = true;
+      if (w.stale) entry.stale = true;
       return entry;
     });
     out.providers[provider] = {
       ok: quota.ok !== false,
       kind: quota.kind || "unknown",
+      stale: quota.stale || undefined,
       windows,
       note: quota.note || "",
     };
