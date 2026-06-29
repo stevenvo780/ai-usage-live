@@ -94,19 +94,38 @@ def parse(text):
             limit = "fiveHour"
             continue
         if limit:
+            # --- Formato viejo (inline): "X% remaining · Refreshes in Y" ---
             m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*remaining\b(?:.*?refreshes in\s*([0-9hmd ]+))?", s, re.I)
             if m:
                 refresh = (m.group(2) or "").strip().rstrip("·").strip()
                 cur[limit] = {"remainingPercent": round(float(m.group(1))), "refreshText": refresh}
                 limit = None
                 continue
-            # "Quota available" / 100% solo es valido para el limite de 5h. El semanal
-            # SIEMPRE muestra "X% remaining · Refreshes in Y", asi que un 100/placeholder
-            # en weekly es un frame de carga -> se ignora y se espera el dato real.
-            if limit == "fiveHour" and ("quota available" in low or re.search(r"\b100(?:\.0+)?\s*%", s)):
-                cur[limit] = {"remainingPercent": 100, "refreshText": ""}
-                limit = None
-                continue
+            # --- Formato nuevo (agy >=1.0.13): la barra "[███...░░░] NN.NN%" da el % RESTANTE
+            # y la linea de estado va aparte: "Refreshes in Y" | "Quota available" | "Disabled: ...".
+            existing = cur.get(limit)
+            if existing is None:
+                mp = re.search(r"(\d+(?:\.\d+)?)\s*%", s)
+                if mp:
+                    cur[limit] = {"remainingPercent": round(float(mp.group(1))), "refreshText": ""}
+                    continue  # la linea de estado (refresh) viene en la siguiente linea
+                if "quota available" in low:  # cupo lleno sin barra (raro): 100% restante
+                    cur[limit] = {"remainingPercent": 100, "refreshText": ""}
+                    limit = None
+                    continue
+                if low.startswith("disabled"):  # 5h no aplica (semanal agotado): sin %, saltar
+                    limit = None
+                    continue
+            else:
+                # Ya tenemos el %; la linea de estado completa el refresh y cierra el limite.
+                mr = re.search(r"refreshes?\s+in\s+([0-9hmd ]+)", low)
+                if mr:
+                    existing["refreshText"] = mr.group(1).strip().rstrip("·").strip()
+                    limit = None
+                    continue
+                if "quota available" in low or low.startswith("disabled"):
+                    limit = None
+                    continue
 
     groups = [g for g in groups if g.get("weekly") or g.get("fiveHour")]
     if not groups:
@@ -138,6 +157,8 @@ def run():
     start = time.monotonic()
     sent = False
     sent_at = None
+    trust_done = False
+    trust_at = None
     while time.monotonic() - start < timeout:
         r, _, _ = select.select([fd], [], [], 0.3)
         if r:
@@ -149,24 +170,36 @@ def run():
                 break
             buf.extend(chunk)
         text = clean(buf)
+        low = text.lower()
         elapsed = time.monotonic() - start
-        if not sent and ("for shortcuts" in text or "esc to" in text.lower() or elapsed > 9):
+        # Antigravity CLI >=1.0.13 muestra "Do you trust the contents of this project?" ANTES del
+        # prompt. Si no lo confirmamos, el menu se come el "/usage" (el \r elige "Yes" y el texto
+        # se pierde) y el panel nunca aparece. Confirmamos "Yes, I trust this folder" (el default).
+        if not trust_done and ("do you trust" in low or "i trust this folder" in low):
+            os.write(fd, b"\r")
+            trust_done = True
+            trust_at = time.monotonic()
+            continue
+        # Aun no confirmado y el dialogo sigue visible -> NO disparar /usage por el fallback de
+        # tiempo (lo consumiria el menu). Esperamos a confirmarlo arriba.
+        trust_pending = (not trust_done) and ("do you trust" in low or "i trust this folder" in low)
+        if not sent and not trust_pending and ("for shortcuts" in text or "esc to" in low or elapsed > 9):
+            # Tras confirmar la confianza, dale un respiro para que cargue el prompt principal.
+            if trust_at and time.monotonic() - trust_at < 1.0:
+                continue
             os.write(fd, b"/usage\r")
             sent = True
             sent_at = time.monotonic()
-        # Parsear el buffer en cada iteracion y romper solo cuando AMBOS grupos tienen
-        # su limite semanal REAL (con "Refreshes in"); asi evitamos capturar el frame de
-        # "Loading quota summary..." con placeholders. Fallback por si tarda demasiado.
+        # El panel termino de dibujarse cuando aparece su PIE ("Within each group..." / "↑/↓
+        # Scroll" / "esc Close"). Es el signal mas robusto y no depende del formato interno de
+        # cada limite (que cambio en agy 1.0.13). Asi evitamos capturar un frame a medio cargar.
+        # Fallback por si el pie no llega a tiempo.
         if sent and time.monotonic() - sent_at > 1.5:
-            snap = parse(clean(buf))
-            ready = {}
-            if snap.get("ok"):
-                for g in snap["groups"]:
-                    wk = g.get("weekly") or {}
-                    ready[g["name"]] = bool(wk.get("refreshText"))
-            done = ready.get("Gemini") and ready.get("Claude/GPT")
-            fallback = "GEMINI MODELS" in text.upper() and time.monotonic() - sent_at > 12
-            if done or fallback:
+            low_now = clean(buf).lower()
+            panel_done = ("within each group" in low_now or "↑/↓ scroll" in low_now
+                          or "esc close" in low_now)
+            fallback = "gemini models" in low_now and time.monotonic() - sent_at > 12
+            if panel_done or fallback:
                 time.sleep(0.8)
                 for _ in range(4):
                     r, _, _ = select.select([fd], [], [], 0.4)
@@ -202,10 +235,12 @@ def run():
             pass
     result = parse(text)
     if result.get("ok"):
-        # Un grupo cargado SIEMPRE trae weekly con "Refreshes in". Si falta, fue una carga
-        # parcial (placeholder): devolvemos ok:False para que el dashboard conserve el ultimo
-        # dato bueno (cache) en vez de mostrar 100% falsos.
-        incomplete = [g["name"] for g in result["groups"] if not ((g.get("weekly") or {}).get("refreshText"))]
+        # Un grupo cargado trae su weekly con un % restante (la barra ya se dibujo). Si falta,
+        # fue una carga parcial (placeholder): devolvemos ok:False para que el dashboard conserve
+        # el ultimo dato bueno (cache) en vez de mostrar 100% falsos. Nota: a 100% el panel dice
+        # "Quota available" SIN "Refreshes in", asi que ya no exigimos refreshText.
+        incomplete = [g["name"] for g in result["groups"]
+                      if not isinstance((g.get("weekly") or {}).get("remainingPercent"), (int, float))]
         if incomplete:
             result = {"ok": False, "note": f"Carga parcial de /usage ({', '.join(incomplete)}); se conserva el dato anterior."}
     result["capturedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
