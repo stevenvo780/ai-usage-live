@@ -791,11 +791,46 @@ function buildCodexQuota(usage, config = {}, live = null) {
   };
 }
 
+function tzOffsetMs(utcMs, tz) {
+  // Cuanto ADELANTA `tz` respecto a UTC en ese instante (ms). America/Bogota -> -5h.
+  // Devuelve null si la zona es invalida para Intl (p.ej. abreviaturas como "PST").
+  try {
+    const dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz, hour12: false,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+    const parts = {};
+    for (const p of dtf.formatToParts(new Date(utcMs))) parts[p.type] = p.value;
+    const asUTC = Date.UTC(
+      Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+      Number(parts.hour) % 24, Number(parts.minute), Number(parts.second),
+    );
+    return Number.isNaN(asUTC) ? null : asUTC - utcMs;
+  } catch {
+    return null;
+  }
+}
+
+function zonedWallClockToUtc(year, mon, day, hour, min, tz, isUtc) {
+  // Convierte una hora de pared (year-mon-day hour:min) interpretada en `tz` al instante UTC.
+  const guess = Date.UTC(year, mon, day, hour, min);
+  if (isUtc) return guess;
+  const offset = tzOffsetMs(guess, tz);
+  return offset == null ? guess : guess - offset; // wall-clock en tz -> instante absoluto
+}
+
 function parseClaudeResetText(text) {
-  // Claude /usage da el reset como texto absoluto, ej "Jun 22, 10am (UTC)" o
-  // "Jun 19, 7:10pm (UTC)". Lo parseamos a Date (UTC) para el countdown.
+  // Claude /usage da el reset como texto absoluto con zona EXPLICITA entre parentesis, ej
+  // "Jun 22, 10am (UTC)" o "Jun 29, 10am (America/Bogota)". La hora es WALL-CLOCK en ESA zona,
+  // NO en UTC: hay que respetar la etiqueta o el countdown sale corrido (10am Bogota = 15:00
+  // UTC, +5h) y la sesion aparece "vencida". Claude varia la zona segun el TZ del entorno.
   const t = normalizeResetText(text);
   if (!t) return null;
+  // Zona explicita al final: "(UTC)", "(GMT)", "(America/Bogota)". Sin zona o UTC/GMT/Z -> UTC.
+  const tzMatch = t.match(/\(([^)]+)\)\s*$/);
+  const tz = tzMatch ? tzMatch[1].trim() : "";
+  const isUtc = !tz || /^(utc|gmt|z)$/i.test(tz);
   const m = t.match(/([A-Za-z]{3,})\s+(\d{1,2}),?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
   if (!m) {
     const d = new Date(t);
@@ -811,8 +846,11 @@ function parseClaudeResetText(text) {
   if (ap === "pm" && hour < 12) hour += 12;
   if (ap === "am" && hour === 12) hour = 0;
   const now = new Date();
-  let d = new Date(Date.UTC(now.getUTCFullYear(), mon, day, hour, min));
-  if (d.getTime() < now.getTime() - 86400000) d = new Date(Date.UTC(now.getUTCFullYear() + 1, mon, day, hour, min));
+  let d = new Date(zonedWallClockToUtc(now.getUTCFullYear(), mon, day, hour, min, tz, isUtc));
+  // Claude no incluye el anio: si el instante quedo >1 dia en el pasado, es del proximo anio.
+  if (d.getTime() < now.getTime() - 86400000) {
+    d = new Date(zonedWallClockToUtc(now.getUTCFullYear() + 1, mon, day, hour, min, tz, isUtc));
+  }
   return Number.isNaN(d.getTime()) ? null : d;
 }
 

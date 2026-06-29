@@ -591,6 +591,29 @@ test("parseClaudeResetText: '7:10pm' -> 19:10 UTC", () => {
   assert.strictEqual(d.getUTCMinutes(), 10);
 });
 
+test("parseClaudeResetText: respeta zona no-UTC (America/Bogota = UTC-5)", () => {
+  // Claude a veces anota la hora en una zona nombrada; "10am (America/Bogota)" es las
+  // 15:00 UTC, NO las 10:00 UTC. Asumir UTC dejaba el reset corrido +5h (sesion "vencida").
+  const d = parseClaudeResetText("Jun 29, 10am (America/Bogota)");
+  assert(d instanceof Date);
+  assert.strictEqual(d.getUTCHours(), 15);
+  assert.strictEqual(d.getUTCMinutes(), 0);
+});
+
+test("parseClaudeResetText: el MISMO instante en dos zonas da el mismo Date", () => {
+  // "10am (America/Bogota)" === "3pm (UTC)" (Claude varia la etiqueta segun el TZ del entorno).
+  const bogota = parseClaudeResetText("Jun 29, 10am (America/Bogota)");
+  const utc = parseClaudeResetText("Jun 29, 3pm (UTC)");
+  assert.strictEqual(bogota.getTime(), utc.getTime());
+});
+
+test("parseClaudeResetText: zona invalida cae a UTC (sin romper)", () => {
+  // Una zona que Intl no reconoce -> se interpreta como UTC (no peor que antes; no lanza).
+  const d = parseClaudeResetText("Jun 22, 10am (Narnia/Cair_Paravel)");
+  assert(d instanceof Date);
+  assert.strictEqual(d.getUTCHours(), 10);
+});
+
 test("parseClaudeResetText: garbage/empty -> null", () => {
   assert.strictEqual(parseClaudeResetText("nonsense xyz"), null);
   assert.strictEqual(parseClaudeResetText(""), null);
