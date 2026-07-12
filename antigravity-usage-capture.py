@@ -46,6 +46,10 @@ def clean(buf):
     return s
 
 
+def redact_sensitive(value):
+    return re.sub(r"[\w.+-]+@[\w.-]+\.\w+", "account", str(value))
+
+
 def parse(text):
     groups = []
     cur = None
@@ -144,6 +148,7 @@ def run():
         os.environ["TERM"] = "xterm-256color"
         os.environ["COLUMNS"] = "120"
         os.environ["LINES"] = "44"
+        os.environ.setdefault("AGY_CLI_HIDE_ACCOUNT_INFO", "1")
         os.execvp(binary, [binary])
 
     try:
@@ -230,7 +235,7 @@ def run():
     if debug:
         try:
             with open(debug, "w", encoding="utf-8") as handle:
-                handle.write(text)
+                handle.write(redact_sensitive(text))
         except OSError:
             pass
     result = parse(text)

@@ -40,15 +40,16 @@ const SOURCE_META = {
   opencode: { label: "OpenCode", color: colors.green },
 };
 
-const ALL_SOURCES = ["claude", "codex", "opencode"];
-const SOURCE_KEYS = ["all", "claude", "codex", "antigravity", "minimax", "opencode"];
+const ALL_SOURCES = ["claude", "codex", "gemini", "opencode"];
+const SOURCE_KEYS = ["all", "claude", "codex", "gemini", "antigravity", "minimax", "opencode"];
 // Orden de las tarjetas del grid de cuotas (drill-down con flechas + enter).
-const PROVIDER_ORDER = ["claude", "codex", "antigravity", "minimax", "opencode"];
+const PROVIDER_ORDER = ["claude", "codex", "gemini", "antigravity", "minimax", "opencode"];
 // Metadata visual de cada proveedor para el grid/detalle de cuotas.
 // Iconos single-width (NO emojis doble-ancho) para que no descuadren el TUI.
 const PROVIDER_META = {
   claude: { label: "Claude", color: colors.magenta, icon: "\u2726" },
   codex: { label: "Codex", color: colors.green, icon: "\u2B21" },
+  gemini: { label: "Gemini", color: colors.blue, icon: "\u25C8" },
   antigravity: { label: "Antigravity", color: colors.yellow, icon: "\u25C6" },
   minimax: { label: "MiniMax", color: colors.cyan, icon: "\u25B0" },
   opencode: { label: "OpenCode", color: colors.blue, icon: "\u26C1" },
@@ -56,6 +57,13 @@ const PROVIDER_META = {
 const VIEW_KEYS = ["daily", "weekly", "monthly", "session", "blocks"];
 const TAB_KEYS = ["cuotas", "consumo"];
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const APP_VERSION = (() => {
+  try {
+    return String(JSON.parse(readFileSync(path.join(SCRIPT_DIR, "package.json"), "utf8")).version);
+  } catch {
+    return "unknown";
+  }
+})();
 const CONFIG_BASE_DIR = process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config");
 const CONFIG_DIR = path.join(CONFIG_BASE_DIR, "ai-usage-live");
 const QUOTA_CONFIG_PATH = path.join(CONFIG_DIR, "quotas.json");
@@ -63,7 +71,11 @@ const CLAUDE_USAGE_CACHE_PATH = path.join(CONFIG_DIR, "claude-usage-cache.json")
 const GEMINI_QUOTA_CACHE_PATH = path.join(CONFIG_DIR, "gemini-quota-cache.json");
 const MINIMAX_USAGE_CACHE_PATH = path.join(CONFIG_DIR, "minimax-usage-cache.json");
 const OPENCODE_USAGE_CACHE_PATH = path.join(CONFIG_DIR, "opencode-usage-cache.json");
-const OPENCODE_DB_PATH = path.join(homedir(), ".local", "share", "opencode", "opencode.db");
+const OPENCODE_DB_FALLBACK_PATH = path.join(
+  process.env.XDG_DATA_HOME || path.join(homedir(), ".local", "share"),
+  "opencode",
+  "opencode.db",
+);
 const ANTIGRAVITY_QUOTA_CACHE_PATH = path.join(CONFIG_DIR, "antigravity-quota-cache.json");
 const ANTIGRAVITY_TOKEN_PATH = path.join(homedir(), ".gemini", "antigravity-cli", "antigravity-oauth-token");
 const ANTIGRAVITY_PROJECTS_PATH = path.join(homedir(), ".gemini", "antigravity-cli", "cache", "projects.json");
@@ -164,18 +176,18 @@ Views:
   daily, weekly, monthly, session, blocks
 
 Sources:
-  all, claude, codex, antigravity, minimax, opencode
-  (gemini-cli fue removido: Google revocó su OAuth; usa Antigravity para Gemini)
+  all, claude, codex, gemini, antigravity, minimax, opencode
 
 Opciones:
   --since YYYY-MM-DD
   --until YYYY-MM-DD
   --refresh SEGUNDOS
   --once
+  --json
 
 Teclas:
   q salir, r refrescar, 1 daily, 2 weekly, 3 monthly, 4 session, 5 blocks
-  a todos, c Claude, x Codex, v Antigravity, m MiniMax, o OpenCode, flechas mover modelo
+  a todos, c Claude, x Codex, g Gemini, v Antigravity, m MiniMax, o OpenCode, flechas mover modelo
 `);
 }
 
@@ -245,6 +257,7 @@ async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ig
     ? Promise.allSettled([
         collectClaudeUsageLive(quotaConfig.claude, { ignoreCache: ignoreLiveCache }),
         collectAntigravityQuotaLive(quotaConfig.antigravity, { ignoreCache: ignoreLiveCache }),
+        collectGeminiQuotaLive(quotaConfig.gemini, { ignoreCache: ignoreLiveCache }),
       ])
     : Promise.resolve([
         {
@@ -263,6 +276,15 @@ async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ig
             ANTIGRAVITY_QUOTA_CACHE_PATH,
             "Antigravity quota se esta capturando; mostrando ultimo dato conocido.",
             "Antigravity quota se esta capturando en segundo plano.",
+          ),
+        },
+        {
+          status: "fulfilled",
+          value: staleLiveQuota(
+            "gemini",
+            GEMINI_QUOTA_CACHE_PATH,
+            "Gemini /stats model se esta capturando; mostrando ultimo dato conocido.",
+            "Gemini /stats model se esta capturando en segundo plano.",
           ),
         },
       ]);
@@ -298,12 +320,14 @@ async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ig
     ? await collectOpenCodeUsage(quotaConfig, { ignoreCache: ignoreLiveCache || ignoreMiniMaxCache })
     : staleOpenCodeUsage("OpenCode Go se esta capturando; mostrando ultimo dato conocido.")
       || { source: "opencode", ok: false, note: "OpenCode Go se esta capturando en segundo plano." };
+  enrichUnifiedReasoning(sources);
   sources.opencodeServer = includeLive
     ? await collectOpenCodeServerUsage(quotaConfig.opencode, { ignoreCache: ignoreLiveCache || ignoreMiniMaxCache })
     : (readJsonSafe(OPENCODE_SERVER_CACHE_PATH) ? { ...readJsonSafe(OPENCODE_SERVER_CACHE_PATH), cacheHit: true, cacheStale: true } : { ok: false });
   const liveQuotaSettled = await liveQuotaPromise;
   sources.claudeLive = liveQuotaSettled[0].status === "fulfilled" ? liveQuotaSettled[0].value : { ok: false };
   sources.antigravityLive = liveQuotaSettled[1].status === "fulfilled" ? liveQuotaSettled[1].value : { ok: false };
+  sources.geminiLive = liveQuotaSettled[2].status === "fulfilled" ? liveQuotaSettled[2].value : { ok: false };
   sources.codexLive = includeLive
     ? await collectCodexLive(quotaConfig.codex, { ignoreCache: ignoreLiveCache })
     : (readJsonSafe(CODEX_PROBE_CACHE_PATH) || { ok: false });
@@ -391,7 +415,7 @@ function firstArray(raw) {
 function sumRows(rows) {
   const totals = {};
   for (const row of rows) {
-    for (const key of ["inputTokens", "outputTokens", "cacheCreationTokens", "cacheReadTokens", "totalTokens", "totalCost"]) {
+    for (const key of ["inputTokens", "outputTokens", "reasoningOutputTokens", "cacheCreationTokens", "cacheReadTokens", "totalTokens", "totalCost", "costUSD"]) {
       totals[key] = (totals[key] || 0) + Number(row[key] || 0);
     }
   }
@@ -401,12 +425,14 @@ function sumRows(rows) {
 function normalizeTotals(totals) {
   const inputTokens = Number(totals.inputTokens || 0);
   const outputTokens = Number(totals.outputTokens || 0);
+  const reasoningOutputTokens = Number(totals.reasoningOutputTokens || 0);
   const cacheCreationTokens = Number(totals.cacheCreationTokens || 0);
   const cacheReadTokens = Number(totals.cacheReadTokens || 0);
+  // ccusage/Codex reports reasoning as a subset of outputTokens, not an extra token bucket.
   const totalTokens = Number(totals.totalTokens || inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens);
   const effectiveTokens = inputTokens + cacheCreationTokens + outputTokens;
   const totalCost = Number(totals.totalCost || totals.cost || totals.costUSD || 0);
-  return { inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, totalTokens, effectiveTokens, totalCost };
+  return { inputTokens, outputTokens, reasoningOutputTokens, cacheCreationTokens, cacheReadTokens, totalTokens, effectiveTokens, totalCost };
 }
 
 function extractModels(row) {
@@ -421,6 +447,7 @@ function extractModels(row) {
         modelName,
         inputTokens: data.inputTokens,
         outputTokens: data.outputTokens,
+        reasoningOutputTokens: data.reasoningOutputTokens,
         cacheCreationTokens: data.cacheCreationTokens,
         cacheReadTokens: data.cacheReadTokens,
         totalTokens,
@@ -434,6 +461,7 @@ function extractModels(row) {
         modelName: row.modelsUsed[0],
         inputTokens: row.inputTokens,
         outputTokens: row.outputTokens,
+        reasoningOutputTokens: row.reasoningOutputTokens,
         cacheCreationTokens: row.cacheCreationTokens,
         cacheReadTokens: row.cacheReadTokens,
         totalTokens: row.totalTokens,
@@ -442,6 +470,62 @@ function extractModels(row) {
     ];
   }
   return [];
+}
+
+function enrichUnifiedReasoning(sources) {
+  const unified = sources?.all;
+  const codex = sources?.codex;
+  if (!unified?.totals) return;
+
+  const opencode = sources?.opencode;
+  const opencodeData = sources?.opencodeLive?.data || {};
+  const opencodeReasoning = Number(opencodeData.totalReasoning || 0);
+  const opencodeReasoningByModel = opencodeData.reasoningByModel && typeof opencodeData.reasoningByModel === "object"
+    ? opencodeData.reasoningByModel
+    : {};
+  let opencodeEffectiveDelta = 0;
+  if (opencode?.totals && opencodeReasoning > 0) {
+    const current = Number(opencode.totals.reasoningOutputTokens || 0);
+    const missing = Math.max(0, opencodeReasoning - current);
+    opencode.totals.reasoningOutputTokens = current + missing;
+    opencode.totals.effectiveTokens = Number(opencode.totals.effectiveTokens || 0) + missing;
+    opencodeEffectiveDelta = missing;
+    for (const model of opencode.models || []) {
+      const target = Number(opencodeReasoningByModel[String(model.modelName || "").toLowerCase()] || 0);
+      const modelCurrent = Number(model.reasoningOutputTokens || 0);
+      const modelMissing = Math.max(0, target - modelCurrent);
+      if (modelMissing <= 0) continue;
+      model.reasoningOutputTokens = modelCurrent + modelMissing;
+      model.effectiveTokens = Number(model.effectiveTokens || 0) + modelMissing;
+    }
+  }
+
+  const focusedReasoning = Number(codex?.totals?.reasoningOutputTokens || 0)
+    + Number(opencode?.totals?.reasoningOutputTokens || 0);
+  const unifiedReasoning = Number(unified.totals.reasoningOutputTokens || 0);
+  const missingReasoning = Math.max(0, focusedReasoning - unifiedReasoning);
+  if (missingReasoning > 0) {
+    unified.totals.reasoningOutputTokens = unifiedReasoning + missingReasoning;
+  }
+  // Solo OpenCode mantiene reasoning fuera de output; Codex ya lo incluye en outputTokens.
+  unified.totals.effectiveTokens = Number(unified.totals.effectiveTokens || 0) + opencodeEffectiveDelta;
+
+  const focusedByName = new Map();
+  for (const model of [...(codex?.models || []), ...(opencode?.models || [])]) {
+    const key = String(model.modelName || "").toLowerCase();
+    const current = focusedByName.get(key) || 0;
+    focusedByName.set(key, current + Number(model.reasoningOutputTokens || 0));
+  }
+  for (const model of unified.models || []) {
+    const focusedModelReasoning = Number(focusedByName.get(String(model.modelName || "").toLowerCase()) || 0);
+    if (focusedModelReasoning <= 0) continue;
+    const unifiedModelReasoning = Number(model.reasoningOutputTokens || 0);
+    const missingModelReasoning = Math.max(0, focusedModelReasoning - unifiedModelReasoning);
+    if (missingModelReasoning <= 0) continue;
+    model.reasoningOutputTokens = unifiedModelReasoning + missingModelReasoning;
+    const opencodeModelReasoning = Number(opencodeReasoningByModel[String(model.modelName || "").toLowerCase()] || 0);
+    model.effectiveTokens = Number(model.effectiveTokens || 0) + opencodeModelReasoning;
+  }
 }
 
 function fillFocusedModelGaps(sources) {
@@ -471,6 +555,7 @@ function mergeModels(models) {
       modelName: name,
       inputTokens: 0,
       outputTokens: 0,
+      reasoningOutputTokens: 0,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalTokens: 0,
@@ -478,6 +563,7 @@ function mergeModels(models) {
     };
     current.inputTokens += Number(model.inputTokens || 0);
     current.outputTokens += Number(model.outputTokens || 0);
+    current.reasoningOutputTokens += Number(model.reasoningOutputTokens || 0);
     current.cacheCreationTokens += Number(model.cacheCreationTokens || 0);
     current.cacheReadTokens += Number(model.cacheReadTokens || 0);
     current.cost += Number(model.cost || model.totalCost || 0);
@@ -556,7 +642,7 @@ function collectAntigravity() {
 
 function defaultQuotaConfig() {
   return {
-    version: 1,
+    version: 2,
     notes: [
       "Put your real plan limits here. Leave null when the provider does not expose a stable local limit.",
       "Token limits are local-dashboard limits, not official billing unless you copy them from the provider UI.",
@@ -568,6 +654,8 @@ function defaultQuotaConfig() {
       weeklyTokens: null,
     },
     codex: {
+      liveUsage: true,
+      liveUsageCacheSeconds: 60,
       useDetectedRateLimits: true,
       dailyTokens: null,
       probe: false,
@@ -580,17 +668,22 @@ function defaultQuotaConfig() {
       dailyRequests: null,
     },
     antigravity: {
+      liveCapture: true,
+      liveCaptureCacheMinutes: 3,
+      usageTimeoutSeconds: 40,
       monthlyCredits: null,
       usedCredits: null,
       resetsAt: null,
     },
     minimax: {
+      liveCapture: true,
       liveCaptureCacheMinutes: 0,
       monthlyCredits: null,
       resetsAt: null,
       apiKey: null,
     },
     opencode: {
+      liveCapture: true,
       liveCaptureCacheMinutes: 5,
       fiveHourCost: 12,
       weeklyCost: 30,
@@ -622,7 +715,9 @@ function loadQuotaConfig() {
       return { ...defaults, configPath: QUOTA_CONFIG_PATH, created: true };
     }
     const parsed = JSON.parse(readFileSync(QUOTA_CONFIG_PATH, "utf8"));
-    return deepMerge(defaults, parsed, { configPath: QUOTA_CONFIG_PATH, created: false });
+    const merged = deepMerge(defaults, parsed, { configPath: QUOTA_CONFIG_PATH, created: false });
+    merged.version = defaults.version;
+    return merged;
   } catch {
     return { ...defaults, configPath: QUOTA_CONFIG_PATH, created: false, error: "No pude leer quotas.json" };
   }
@@ -640,11 +735,56 @@ function deepMerge(base, override, extra = {}) {
   return { ...output, ...extra };
 }
 
+function conjunctiveQuotaAvailability(windows) {
+  const numeric = (windows || []).filter((window) => finiteNumberOrNull(window.remainingPercent) !== null);
+  const limitingWindows = numeric
+    .filter((window) => Number(window.remainingPercent) <= 0)
+    .map((window) => String(window.label || window.key || "limite"));
+  return {
+    available: numeric.length > 0 && limitingWindows.length === 0,
+    limited: limitingWindows.length > 0,
+    limitingWindows,
+    effectiveRemainingPercent: numeric.length
+      ? Math.min(...numeric.map((window) => Number(window.remainingPercent)))
+      : null,
+  };
+}
+
+function groupedQuotaAvailability(windows, groupField) {
+  const groups = new Map();
+  for (const window of windows || []) {
+    const group = String(window[groupField] || window.model || window.family || "default");
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(window);
+  }
+  const availableGroups = [];
+  const limitingGroups = [];
+  const groupRemaining = [];
+  for (const [group, entries] of groups) {
+    const numeric = entries.filter((entry) => finiteNumberOrNull(entry.remainingPercent) !== null);
+    const explicitAvailable = entries.some((entry) => entry.available === true);
+    const minimum = numeric.length
+      ? Math.min(...numeric.map((entry) => Number(entry.remainingPercent)))
+      : null;
+    if (explicitAvailable || (minimum !== null && minimum > 0)) availableGroups.push(group);
+    else if (minimum !== null && minimum <= 0) limitingGroups.push(group);
+    if (minimum !== null) groupRemaining.push(minimum);
+  }
+  return {
+    available: availableGroups.length > 0,
+    limited: groups.size > 0 && availableGroups.length === 0 && limitingGroups.length > 0,
+    availableGroups,
+    limitingGroups,
+    effectiveRemainingPercent: groupRemaining.length ? Math.max(...groupRemaining) : null,
+  };
+}
+
 function buildQuotaState(sources, config) {
   return {
     configPath: config.configPath,
     codex: buildCodexQuota(sources.codex, config.codex, sources.codexLive),
     claude: buildClaudeQuota(sources.claude, sources.claudeBlocks, config.claude, sources.claudeLive),
+    gemini: buildGeminiQuota(sources.gemini, config.gemini, sources.geminiLive),
     minimax: buildMiniMaxQuota(sources.minimax, config.minimax),
     opencode: buildOpenCodeQuota(sources.opencodeLive, config.opencode, sources.opencodeServer),
     antigravity: buildAntigravityQuota(sources.antigravity, config.antigravity, sources.antigravityLive),
@@ -680,18 +820,107 @@ function parseCodexRetryTime(text) {
   return d;
 }
 
+function valueFromAny(obj, keys) {
+  for (const key of keys) {
+    if (obj?.[key] !== undefined && obj?.[key] !== null) return obj[key];
+  }
+  return null;
+}
+
+function normalizeCodexWindow(window) {
+  if (!window || typeof window !== "object") return null;
+  const usedRaw = valueFromAny(window, ["used_percent", "usedPercent"]);
+  if (usedRaw === null) return null;
+  const usedPercent = Number(usedRaw);
+  const windowMinutes = Number(valueFromAny(window, ["window_minutes", "windowDurationMins"]));
+  const resetsAt = Number(valueFromAny(window, ["resets_at", "resetsAt"]));
+  if (!Number.isFinite(usedPercent)) return null;
+  return {
+    used_percent: Math.max(0, Math.min(100, usedPercent)),
+    window_minutes: Number.isFinite(windowMinutes) && windowMinutes > 0 ? windowMinutes : null,
+    resets_at: Number.isFinite(resetsAt) && resetsAt > 0
+      ? (resetsAt > 1e12 ? Math.round(resetsAt / 1000) : resetsAt)
+      : null,
+  };
+}
+
+function normalizeCodexIndividualLimit(limit) {
+  if (!limit || typeof limit !== "object") return null;
+  const remainingRaw = valueFromAny(limit, ["remaining_percent", "remainingPercent"]);
+  const remainingPercent = Number(remainingRaw);
+  if (remainingRaw === null || !Number.isFinite(remainingPercent)) return null;
+  const resetsAt = Number(valueFromAny(limit, ["resets_at", "resetsAt"]));
+  return {
+    remaining_percent: Math.max(0, Math.min(100, remainingPercent)),
+    resets_at: Number.isFinite(resetsAt) && resetsAt > 0
+      ? (resetsAt > 1e12 ? Math.round(resetsAt / 1000) : resetsAt)
+      : null,
+    limit: limit.limit ?? null,
+    used: limit.used ?? null,
+  };
+}
+
+function normalizeCodexRateLimitEntry(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const creditsRaw = entry.credits;
+  const credits = creditsRaw && typeof creditsRaw === "object"
+    ? {
+        has_credits: Boolean(valueFromAny(creditsRaw, ["has_credits", "hasCredits"])),
+        unlimited: Boolean(creditsRaw.unlimited),
+        balance: creditsRaw.balance ?? null,
+      }
+    : null;
+  return {
+    limit_id: String(valueFromAny(entry, ["limit_id", "limitId"]) || "codex"),
+    limit_name: valueFromAny(entry, ["limit_name", "limitName"]),
+    primary: normalizeCodexWindow(entry.primary),
+    secondary: normalizeCodexWindow(entry.secondary),
+    credits,
+    individual_limit: normalizeCodexIndividualLimit(valueFromAny(entry, ["individual_limit", "individualLimit"])),
+    plan_type: valueFromAny(entry, ["plan_type", "planType"]),
+    rate_limit_reached_type: valueFromAny(entry, ["rate_limit_reached_type", "rateLimitReachedType"]),
+    detectedAt: entry.detectedAt || entry.detected_at || null,
+    file: entry.file || null,
+  };
+}
+
+function codexWindowLabel(windowMinutes, fallbackLabel) {
+  const minutes = Number(windowMinutes);
+  if (!Number.isFinite(minutes) || minutes <= 0) return fallbackLabel;
+  if (minutes === 300) return "5h";
+  if (minutes === 10080) return "semana";
+  if (minutes % 10080 === 0) return `${minutes / 10080} sem`;
+  if (minutes % 1440 === 0) return `${minutes / 1440}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+}
+
+function normalizeResetCredits(value) {
+  if (!value || typeof value !== "object") return null;
+  const availableCount = Number(valueFromAny(value, ["available_count", "availableCount"]));
+  const credits = Array.isArray(value.credits) ? value.credits.map((credit) => ({
+    status: credit.status || "",
+    resetType: valueFromAny(credit, ["reset_type", "resetType"]) || "",
+    expiresAt: valueFromAny(credit, ["expires_at", "expiresAt"]) || null,
+  })) : [];
+  if (!Number.isFinite(availableCount) && !credits.length) return null;
+  return { availableCount: Number.isFinite(availableCount) ? availableCount : credits.length, credits };
+}
+
 function buildCodexQuota(usage, config = {}, live = null) {
   const manual = buildTokenQuota("codex", usage, config.dailyTokens, "dia");
-  // Probe en vivo (codex-probe.py): si trae rate_limits frescos, son la fuente; si Codex
-  // esta LIMITADO lo marcamos; si no, leemos las sesiones pasivas (~/.codex/sessions).
-  const fromLive = Boolean(live?.ok && live.rate_limits);
-  const limited = Boolean(live?.ok && live.limited);
-  // Si el probe EN VIVO dice LIMITADO, esa es la verdad actual: NO mostramos barras viejas de
-  // sesiones (~/.codex/sessions). Son de ANTES del tope y contradicen el estado real (verias
-  // "5h 18%" junto a "[LIMITE]") -> confunde. Limitado => tarjeta de limite directo, sin barras.
-  const detected = limited ? null : (fromLive ? live.rate_limits : (config.useDetectedRateLimits !== false ? collectCodexRateLimits() : null));
+  // Codex >=0.144 expone una lectura gratuita por app-server. El helper la normaliza al formato
+  // historico snake_case; las sesiones locales quedan como fallback para versiones anteriores.
+  const liveRateLimits = live?.rate_limits || live?.rateLimits || null;
+  const fromLive = Boolean(live?.ok && liveRateLimits);
+  const explicitlyLimited = Boolean(live?.ok && live.limited);
+  const detected = fromLive
+    ? liveRateLimits
+    : explicitlyLimited
+      ? null
+      : (config.useDetectedRateLimits !== false ? collectCodexRateLimits() : null);
   if (!detected) {
-    if (limited) {
+    if (explicitlyLimited) {
       // Codex da la hora de reintento como texto en la TZ del host (UTC). La convertimos a un
       // instante absoluto para countdown (a prueba de zona) y, si hay tz configurada, a tu hora.
       const retryDate = parseCodexRetryTime(live.retryText);
@@ -710,9 +939,13 @@ function buildCodexQuota(usage, config = {}, live = null) {
     return manual;
   }
 
-  const entries = Array.isArray(detected) ? detected : [detected];
+  const entries = (Array.isArray(detected) ? detected : [detected])
+    .map(normalizeCodexRateLimitEntry)
+    .filter(Boolean);
+  const reportedLimited = explicitlyLimited || entries.some((entry) => Boolean(entry.rate_limit_reached_type));
   const windows = [];
   const creditsList = [];
+  const resetCredits = normalizeResetCredits(live?.rate_limit_reset_credits || live?.rateLimitResetCredits);
 
   for (const entry of entries) {
     const limitId = entry.limit_id || "codex";
@@ -724,10 +957,13 @@ function buildCodexQuota(usage, config = {}, live = null) {
     ]) {
       const item = entry[name];
       if (!item || typeof item.used_percent !== "number") continue;
-      const label = limitId === "premium" ? `mini-${defaultLabel}` : defaultLabel;
+      const windowLabel = codexWindowLabel(item.window_minutes, defaultLabel);
+      const label = limitId === "premium" ? `mini-${windowLabel}` : windowLabel;
       windows.push({
+        key: `${limitId}_${name}_${item.window_minutes || windowLabel}`,
         label,
         limitId,
+        sourceWindow: name,
         usedPercent: item.used_percent,
         remainingPercent: Math.max(0, 100 - item.used_percent),
         reset: item.resets_at ? new Date(item.resets_at * 1000) : null,
@@ -739,18 +975,61 @@ function buildCodexQuota(usage, config = {}, live = null) {
     if (credits && typeof credits.has_credits === "boolean") {
       creditsList.push({ limitId, planType, ...credits });
     }
+    const individual = entry.individual_limit;
+    if (individual) {
+      windows.push({
+        key: `${limitId}_individual_limit`,
+        label: entry.limit_name || "limite mensual",
+        limitId,
+        sourceWindow: "individual",
+        windowType: "monthly-spend",
+        usedPercent: Math.max(0, 100 - individual.remaining_percent),
+        remainingPercent: individual.remaining_percent,
+        reset: individual.resets_at ? new Date(individual.resets_at * 1000) : null,
+        limitText: individual.limit == null ? "" : String(individual.limit),
+        usedText: individual.used == null ? "" : String(individual.used),
+      });
+    }
   }
+  const codexAvailability = groupedQuotaAvailability(windows, "limitId");
+  let reachedGroups = entries
+    .filter((entry) => Boolean(entry.rate_limit_reached_type))
+    .map((entry) => entry.limit_id);
+  if (explicitlyLimited && !reachedGroups.length) {
+    reachedGroups = entries.map((entry) => entry.limit_id);
+  }
+  reachedGroups = [...new Set(reachedGroups)];
+  if (reachedGroups.length) {
+    for (const window of windows) {
+      if (reachedGroups.includes(window.limitId)) window.status = "rate-limited";
+    }
+    codexAvailability.availableGroups = codexAvailability.availableGroups.filter((group) => !reachedGroups.includes(group));
+    codexAvailability.limitingGroups = [...new Set([...codexAvailability.limitingGroups, ...reachedGroups])];
+    codexAvailability.available = codexAvailability.availableGroups.length > 0;
+    codexAvailability.limited = !codexAvailability.available;
+    if (!codexAvailability.available) codexAvailability.effectiveRemainingPercent = 0;
+  }
+  const hasUsableCredits = creditsList.some((credit) => credit.unlimited || credit.has_credits);
+  if (hasUsableCredits && !codexAvailability.available && !reachedGroups.length) {
+    codexAvailability.available = true;
+    codexAvailability.limited = false;
+  }
+  const limited = codexAvailability.limited || (reportedLimited && !codexAvailability.available);
 
-  // Frescura: el rate_limit de Codex SOLO se escribe al USAR codex (no hay query en vivo);
-  // el dashboard lo lee pasivo de ~/.codex/sessions. Si el ultimo dato es viejo o su ventana
-  // ya reseteo, el % puede no reflejar el uso actual -> lo marcamos como stale.
+  // La lectura app-server trae capturedAt. Solo el fallback de sesiones puede quedar viejo si
+  // Codex no se ha usado recientemente o si una ventana ya se reinicio.
   const detectedTimes = entries.map((e) => Date.parse(e.detectedAt || "")).filter(Number.isFinite);
-  const freshestMs = fromLive ? Date.now() : (detectedTimes.length ? Math.max(...detectedTimes) : NaN);
-  const ageMin = fromLive ? 0 : (Number.isFinite(freshestMs) ? Math.max(0, Math.round((Date.now() - freshestMs) / 60000)) : null);
+  const liveCapturedMs = Date.parse(live?.capturedAt || "");
+  const freshestMs = fromLive
+    ? (Number.isFinite(liveCapturedMs) ? liveCapturedMs : Date.now())
+    : (detectedTimes.length ? Math.max(...detectedTimes) : NaN);
+  const ageMin = Number.isFinite(freshestMs) ? Math.max(0, Math.round((Date.now() - freshestMs) / 60000)) : null;
   for (const w of windows) {
-    if (!fromLive && w.reset instanceof Date && w.reset.getTime() < Date.now()) w.stale = true;
+    if ((!fromLive || live?.cacheStale) && w.reset instanceof Date && w.reset.getTime() < Date.now()) w.stale = true;
   }
-  const codexStale = !fromLive && ((ageMin != null && ageMin >= 20) || windows.some((w) => w.stale));
+  const codexStale = fromLive
+    ? Boolean(live?.cacheStale)
+    : ((ageMin != null && ageMin >= 20) || windows.some((w) => w.stale));
   const ageStr = ageMin == null ? "" : ageMin >= 120 ? `${Math.round(ageMin / 60)}h` : `${ageMin}m`;
   const ageTag = !fromLive && ageMin != null && ageMin >= 20 ? `  [dato de hace ${ageStr}; usa codex para refrescar]` : "";
   const limitTag = limited ? `LIMITE ALCANZADO (reintentar ${live.retryText || "mas tarde"}).  ` : "";
@@ -759,35 +1038,46 @@ function buildCodexQuota(usage, config = {}, live = null) {
   if (!windows.length && creditsList.length) {
     return {
       source: "codex",
+      dataSource: fromLive ? (live.source || "codex-app-server") : "codex-sessions",
       kind: "detected-credits",
       ok: true,
+      ...codexAvailability,
       plan: entries[0]?.plan_type || entries[0]?.limit_id || "",
       creditsList,
       manual,
+      resetCredits,
       detectedAt: codexDetectedAt,
+      observedAt: codexDetectedAt,
       stale: codexStale,
       limited,
       limitedRetry: limited ? live.retryText : undefined,
       note: limitTag + creditsList.map((c) => {
         const name = c.limitId === "premium" ? "mini" : c.limitId;
         return c.unlimited ? `${name}: ilimitado` : c.has_credits ? `${name}: balance ${c.balance}` : `${name}: sin creditos`;
-      }).join(" | ") + ageTag,
+      }).join(" | ") + (resetCredits?.availableCount ? ` | reinicios disponibles: ${resetCredits.availableCount}` : "") + ageTag,
     };
   }
 
   return {
     source: "codex",
+    dataSource: fromLive ? (live.source || "codex-app-server") : "codex-sessions",
     kind: "detected-percent",
     ok: true,
+    ...codexAvailability,
     plan: entries[0]?.plan_type || "",
     windows,
     creditsList,
+    resetCredits,
     manual,
     detectedAt: codexDetectedAt,
+    observedAt: codexDetectedAt,
     stale: codexStale,
     limited,
     limitedRetry: limited ? live.retryText : undefined,
-    note: limitTag + (fromLive ? "Codex (probe en vivo)." : windows.length ? "Rate limit detectado desde sesiones Codex." : "Codex sin rate_limits recientes.") + ageTag,
+    note: limitTag
+      + (fromLive ? "Codex app-server (consulta oficial)." : windows.length ? "Rate limit detectado desde sesiones Codex." : "Codex sin rate_limits recientes.")
+      + (resetCredits?.availableCount ? ` Reinicios disponibles: ${resetCredits.availableCount}.` : "")
+      + ageTag,
   };
 }
 
@@ -872,16 +1162,28 @@ function buildClaudeQuota(usage, blocksRaw, config = {}, live = null) {
     : null;
 
   if (live?.ok && Array.isArray(live.windows) && live.windows.length) {
-    const windows = live.windows.map((w) => ({
-      ...w,
-      reset: w.reset || parseClaudeResetText(w.resetText),
-    }));
+    const windows = live.windows.map((w) => {
+      const rawLabel = w.rawLabel || w.label || w.key || "";
+      return {
+        ...w,
+        key: claudeWindowKey(rawLabel),
+        label: claudeWindowLabel(rawLabel),
+        rawLabel,
+        reset: w.reset || parseClaudeResetText(w.resetText),
+      };
+    });
+    const globalWindows = windows.filter((window) => window.key === "session" || window.key === "week_all");
+    const availability = conjunctiveQuotaAvailability(globalWindows.length ? globalWindows : windows);
     return {
       source: "claude",
+      dataSource: "claude-cli",
       kind: "detected-percent",
       ok: true,
+      ...availability,
       windows,
       activeBlock,
+      observedAt: live.capturedAt || null,
+      stale: Boolean(live.cacheStale),
       live,
       note: live.cacheHit
         ? live.cacheStale
@@ -908,30 +1210,108 @@ function buildClaudeQuota(usage, blocksRaw, config = {}, live = null) {
 }
 
 function buildGeminiQuota(usage, config = {}, live = null) {
-  if (live?.ok && typeof live.usedPercent === "number") {
-    const usedPercent = Math.min(999, Number(live.usedPercent || 0));
-    const remainingPercent = Math.max(0, Number(live.remainingPercent ?? 100 - usedPercent));
+  const modelQuotas = Array.isArray(live?.modelQuotas) ? live.modelQuotas : [];
+  const hasGlobalQuota = live?.usedPercent !== null
+    && live?.usedPercent !== undefined
+    && Number.isFinite(Number(live.usedPercent));
+  if (live?.ok && (hasGlobalQuota || modelQuotas.length)) {
+    const usedPercent = hasGlobalQuota ? Math.min(999, Number(live.usedPercent)) : null;
+    const remainingPercent = hasGlobalQuota
+      ? Math.max(0, Number(live.remainingPercent ?? 100 - usedPercent))
+      : null;
     const limitRequests = Number(live.usageLimit || config.dailyRequests || 0) || null;
     const remainingRequests =
       live.remainingRequests != null
         ? Number(live.remainingRequests)
-        : limitRequests
+        : limitRequests && remainingPercent != null
           ? Math.max(0, Math.round((remainingPercent / 100) * limitRequests))
           : null;
+    const reset = dateFromProviderValue(live.resetAt);
+    const windows = [];
+    if (hasGlobalQuota) {
+      windows.push({
+        key: "daily_global",
+        label: "dia",
+        windowType: "daily",
+        windowMinutes: 1440,
+        usedPercent,
+        remainingPercent,
+        reset,
+        resetText: live.resetText || "",
+        limit: limitRequests,
+        remaining: remainingRequests,
+        used: limitRequests && remainingRequests != null ? Math.max(0, limitRequests - remainingRequests) : null,
+      });
+    }
+    for (const quota of modelQuotas) {
+      const modelUsed = quota.usedPercent == null ? NaN : Number(quota.usedPercent);
+      const modelRemaining = quota.remainingPercent == null ? NaN : Number(quota.remainingPercent);
+      if (!Number.isFinite(modelUsed) && !Number.isFinite(modelRemaining)) continue;
+      windows.push({
+        key: `model_${String(quota.model || "model").toLowerCase().replace(/[^a-z0-9]+/g, "_")}`,
+        label: quota.model || "modelo",
+        model: quota.model || "",
+        windowType: "model",
+        usedPercent: Number.isFinite(modelUsed) ? modelUsed : Math.max(0, 100 - modelRemaining),
+        remainingPercent: Number.isFinite(modelRemaining) ? modelRemaining : Math.max(0, 100 - modelUsed),
+        reset: dateFromProviderValue(quota.resetAt),
+        resetText: quota.resetText || "",
+      });
+    }
+    const modelWindows = windows.filter((window) => window.windowType === "model");
+    const availableModels = modelWindows
+      .filter((window) => window.remainingPercent > 0)
+      .map((window) => window.model || "modelo");
+    const unavailableModels = modelWindows
+      .filter((window) => window.remainingPercent <= 0)
+      .map((window) => window.model || "modelo");
+    const modelCapacity = modelWindows.length
+      ? Math.max(...modelWindows.map((window) => window.remainingPercent))
+      : null;
+    const globalAvailable = remainingPercent == null || remainingPercent > 0;
+    const modelsAvailable = !modelWindows.length || availableModels.length > 0;
+    const available = globalAvailable && modelsAvailable;
+    const limited = !available;
+    const capacityValues = [remainingPercent, modelCapacity].filter((value) => value !== null);
     return {
       source: "gemini",
+      dataSource: "gemini-cli",
       kind: "detected-requests",
       ok: true,
+      available,
+      limited,
+      effectiveRemainingPercent: capacityValues.length ? Math.min(...capacityValues) : null,
+      limitingWindows: remainingPercent !== null && remainingPercent <= 0 ? ["dia"] : [],
+      availableGroups: availableModels,
+      limitingGroups: unavailableModels,
+      unavailableModels,
+      windows,
       usedPercent,
       remainingPercent,
       limitRequests,
       remainingRequests,
       resetText: live.resetText || "",
-      resetAt: live.resetAt ? new Date(live.resetAt) : null,
+      resetAt: reset,
       tier: live.tier || "",
-      modelQuotas: Array.isArray(live.modelQuotas) ? live.modelQuotas : [],
+      plan: live.tier || "",
+      modelQuotas,
+      observedAt: live.capturedAt || null,
+      stale: Boolean(live.cacheStale),
       live,
       note: live.cacheHit ? "Gemini /stats model desde cache local." : "Gemini /stats model detectado desde el CLI.",
+    };
+  }
+
+  if (live?.needsAuth || live?.authDead) {
+    return {
+      source: "gemini",
+      kind: "unknown",
+      ok: false,
+      available: false,
+      needsAuth: true,
+      windows: [],
+      observedAt: live.capturedAt || null,
+      note: live.note || "Gemini CLI requiere autenticacion; ejecuta `gemini`.",
     };
   }
 
@@ -954,7 +1334,7 @@ function buildGeminiQuota(usage, config = {}, live = null) {
 
 function buildTokenQuota(source, usage, limit, windowLabel) {
   const numericLimit = Number(limit || 0);
-  const used = Number(usage?.totals?.totalTokens || 0);
+  const used = Number(usage?.totals?.effectiveTokens ?? usage?.totals?.totalTokens ?? 0);
   return {
     source,
     kind: numericLimit ? "configured-tokens" : "unknown",
@@ -965,6 +1345,41 @@ function buildTokenQuota(source, usage, limit, windowLabel) {
     usedPercent: numericLimit ? Math.min(999, (used / numericLimit) * 100) : null,
     windowLabel,
     note: numericLimit ? "Limite configurado localmente." : "Sin limite local configurado.",
+  };
+}
+
+function dateFromProviderValue(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const numeric = Number(value);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric > 0 && numeric < 1e12 ? numeric * 1000 : numeric)
+    : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function finiteNumberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function miniMaxWindowValues(model, prefix) {
+  const directRemaining = finiteNumberOrNull(model?.[`${prefix}_remaining_percent`]);
+  const status = finiteNumberOrNull(model?.[`${prefix}_status`]);
+  const total = finiteNumberOrNull(model?.[`${prefix}_total_count`]);
+  // Despite the historical field name, MiniMax returns remaining requests here.
+  const remainingCount = finiteNumberOrNull(model?.[`${prefix}_usage_count`]);
+  let remainingPercent = directRemaining;
+  if (remainingPercent === null && total !== null && total > 0 && remainingCount !== null) {
+    remainingPercent = (remainingCount / total) * 100;
+  }
+  return {
+    active: status === null || status === 1 || status === 2,
+    status,
+    remainingPercent: remainingPercent === null ? null : Math.max(0, Math.min(100, remainingPercent)),
+    limit: total !== null && total > 0 ? total : null,
+    remaining: total !== null && total > 0 && remainingCount !== null ? Math.max(0, remainingCount) : null,
+    used: total !== null && total > 0 && remainingCount !== null ? Math.max(0, total - remainingCount) : null,
   };
 }
 
@@ -981,37 +1396,74 @@ function buildMiniMaxQuota(usage, config = {}) {
   // Format 1: model_remains array (Coding Plan API) — per-model 5h + weekly windows
   if (Array.isArray(data.model_remains) && data.model_remains.length) {
     const windows = [];
+    const unavailableModels = [];
     for (const m of data.model_remains) {
       const modelName = m.model_name || "model";
-      const intervalPct = Number(m.current_interval_remaining_percent);
-      const weeklyPct = Number(m.current_weekly_remaining_percent);
-      if (Number.isFinite(intervalPct)) {
+      const interval = miniMaxWindowValues(m, "current_interval");
+      const weekly = miniMaxWindowValues(m, "current_weekly");
+      const intervalIsDaily = modelName !== "general";
+      if (interval.active && interval.remainingPercent !== null) {
         windows.push({
-          key: `interval_${modelName}`,
-          label: `${modelName} 5h`,
-          usedPercent: Math.max(0, Math.min(100, 100 - intervalPct)),
-          remainingPercent: Math.max(0, Math.min(100, intervalPct)),
-          reset: Number.isFinite(Number(m.end_time)) ? new Date(Number(m.end_time)) : null,
+          key: `${intervalIsDaily ? "daily" : "interval"}_${modelName}`,
+          label: `${modelName} ${intervalIsDaily ? "dia" : "5h"}`,
+          model: modelName,
+          windowType: intervalIsDaily ? "daily" : "rolling",
+          windowMinutes: intervalIsDaily ? 1440 : 300,
+          status: interval.status,
+          usedPercent: Math.max(0, 100 - interval.remainingPercent),
+          remainingPercent: interval.remainingPercent,
+          reset: dateFromProviderValue(m.end_time),
+          limit: interval.limit,
+          used: interval.used,
+          remaining: interval.remaining,
         });
       }
-      if (Number.isFinite(weeklyPct)) {
+      if (weekly.active && weekly.remainingPercent !== null) {
         windows.push({
           key: `weekly_${modelName}`,
           label: `${modelName} sem`,
-          usedPercent: Math.max(0, Math.min(100, 100 - weeklyPct)),
-          remainingPercent: Math.max(0, Math.min(100, weeklyPct)),
-          reset: Number.isFinite(Number(m.weekly_end_time)) ? new Date(Number(m.weekly_end_time)) : null,
+          model: modelName,
+          windowType: "weekly",
+          windowMinutes: 10080,
+          status: weekly.status,
+          usedPercent: Math.max(0, 100 - weekly.remainingPercent),
+          remainingPercent: weekly.remainingPercent,
+          reset: dateFromProviderValue(m.weekly_end_time),
+          limit: weekly.limit,
+          used: weekly.used,
+          remaining: weekly.remaining,
         });
       }
+      if (!interval.active && !weekly.active) unavailableModels.push(modelName);
     }
     if (windows.length) {
+      const availability = groupedQuotaAvailability(windows, "model");
       return {
         source: "minimax",
+        dataSource: "minimax-api",
         kind: "detected-percent",
         ok: true,
+        ...availability,
         windows,
+        unavailableModels,
+        observedAt: usage.capturedAt || null,
+        stale: Boolean(usage.cacheStale),
         raw: usage.raw || null,
-        note: usage.note || (usage.cacheHit ? "MiniMax desde cache local." : "MiniMax Coding Plan."),
+        note: usage.note || (usage.cacheHit ? "MiniMax desde cache local." : "MiniMax Token Plan."),
+      };
+    }
+    if (unavailableModels.length) {
+      return {
+        source: "minimax",
+        dataSource: "minimax-api",
+        kind: "unknown",
+        ok: false,
+        available: false,
+        windows: [],
+        unavailableModels,
+        observedAt: usage.capturedAt || null,
+        stale: Boolean(usage.cacheStale),
+        note: "MiniMax Token Plan sin modelos suscritos en esta cuenta.",
       };
     }
   }
@@ -1033,11 +1485,23 @@ function buildMiniMaxQuota(usage, config = {}) {
   const finalRemaining = remaining != null ? remaining : computedRemaining;
 
   const plan = data.current_package_name || data.planName || data.plan_name || data.packageName || "";
+  const windows = finalUsedPercent != null ? [{
+    key: "plan",
+    label: plan || "plan",
+    usedPercent: finalUsedPercent,
+    remainingPercent,
+    reset: resetAt,
+    resetText,
+  }] : [];
+  const availability = conjunctiveQuotaAvailability(windows);
 
   return {
     source: "minimax",
+    dataSource: usage.source || "minimax-api",
     kind: limit > 0 ? "configured-credits" : "detected-percent",
     ok: true,
+    ...availability,
+    windows,
     used,
     limit: limit || null,
     remaining: finalRemaining,
@@ -1046,6 +1510,8 @@ function buildMiniMaxQuota(usage, config = {}) {
     resetAt,
     resetText,
     plan,
+    observedAt: usage.capturedAt || null,
+    stale: Boolean(usage.cacheStale),
     raw: usage.raw || null,
     note: usage.note || (usage.cacheHit ? "MiniMax desde cache local." : "MiniMax API consultada."),
   };
@@ -1172,11 +1638,11 @@ async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false } 
     const buckets = (Array.isArray(data.buckets) ? data.buckets : [])
       .map((b) => ({
         modelId: b.modelId || "",
-        remainingFraction: Number(b.remainingFraction),
+        remainingFraction: finiteNumberOrNull(b.remainingFraction),
         resetTime: b.resetTime || null,
         tokenType: b.tokenType || "",
       }))
-      .filter((b) => Number.isFinite(b.remainingFraction));
+      .filter((b) => b.remainingFraction !== null);
     const output = {
       source: "antigravity",
       ok: true,
@@ -1193,8 +1659,8 @@ async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false } 
 }
 
 function buildAntigravityQuota(usage, config = {}, live = null) {
-  // Antigravity es la ruta viva a modelos Gemini (Google revoco el OAuth del gemini-cli).
-  // Cuota REAL desde la API consumer; fallback a limites manuales; consumo (sesiones,
+  // Antigravity ofrece una cuota separada de Gemini CLI y tambien agrupa modelos Claude/GPT.
+  // Cuota real desde CLI/API consumer; fallback a limites manuales; consumo (sesiones,
   // pasos de modelo, ultima actividad) derivado de transcripts locales.
   const installed = Boolean(usage?.installed);
   const sessions = usage?.sessions ?? 0;
@@ -1210,8 +1676,8 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
     for (const g of live.groups) {
       const fam = g.name || "grupo";
       for (const [key, label, w] of [["5h", "5 horas", g.fiveHour], ["sem", "semanal", g.weekly]]) {
-        const rem = w ? Number(w.remainingPercent) : NaN;
-        if (!Number.isFinite(rem)) continue;
+        const rem = finiteNumberOrNull(w?.remainingPercent);
+        if (rem === null) continue;
         const remPct = Math.max(0, Math.min(100, rem));
         windows.push({
           key: `${fam}-${key}`,
@@ -1227,53 +1693,65 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
     if (windows.length) {
       const ageMs = live.capturedAt ? Date.now() - Date.parse(live.capturedAt) : NaN;
       const ageTag = Number.isFinite(ageMs) ? `  [hace ${Math.max(0, Math.round(ageMs / 60000))}m]` : "";
+      const availability = groupedQuotaAvailability(windows, "family");
       return {
         source: "antigravity",
+        dataSource: "antigravity-cli",
         kind: "detected-percent",
         ok: true,
+        ...availability,
         windows,
+        observedAt: live.capturedAt || null,
+        stale: Boolean(live.cacheStale),
         note: `Antigravity /usage (CLI, ${live.groups.length} grupos: Gemini + Claude/GPT).  ${statsNote}${ageTag}${live.cacheStale ? "  [cache vieja]" : ""}`,
       };
     }
   }
 
-  // 2) Fallback API: retrieveUserQuota (Gemini por-modelo) + modelos ofrecidos como "disponibles".
+  // 2) Fallback API: retrieveUserQuota expone cuotas Gemini por modelo.
   if (live?.ok && Array.isArray(live.buckets) && live.buckets.length) {
     const isGemini = (b) => /gemini/i.test(b.modelId);
-    const sorted = [...live.buckets].sort((a, b) => {
+    const sorted = live.buckets
+      .filter((bucket) => finiteNumberOrNull(bucket.remainingFraction) !== null)
+      .map((bucket) => ({ ...bucket, remainingFraction: Number(bucket.remainingFraction) }))
+      .sort((a, b) => {
       const ga = isGemini(a) ? 0 : 1;
       const gb = isGemini(b) ? 0 : 1;
       if (ga !== gb) return ga - gb; // gemini primero
       return a.remainingFraction - b.remainingFraction; // dentro del grupo, mas usado primero
-    });
+      });
     const windows = sorted.map((b) => {
       const remPct = Math.max(0, Math.min(100, b.remainingFraction * 100));
       return {
         key: b.modelId,
         label: shortText(b.modelId.replace(/-preview$/, ""), 18),
+        model: b.modelId,
         family: isGemini(b) ? "gemini" : "otros",
         usedPercent: Math.max(0, Math.min(100, 100 - remPct)),
         remainingPercent: remPct,
         reset: b.resetTime ? new Date(b.resetTime) : null,
       };
     });
-    // Modelos no-Gemini que Antigravity ofrece (Claude/GPT, desde `agy models`).
-    // La API de cuota NO expone su uso, asi que los listamos como "disponibles".
-    const offered = Array.isArray(usage?.models) ? usage.models : [];
-    let extraCount = 0;
-    for (const m of offered) {
-      if (/gemini/i.test(m)) continue; // los Gemini ya van con cuota real arriba
-      windows.push({ key: m, label: m, family: "otros", available: true });
-      extraCount += 1;
-    }
+    // `agy models` solo confirma que un modelo se ofrece, no que tenga cuota.
+    const offeredModels = (Array.isArray(usage?.models) ? usage.models : [])
+      .filter((model) => !/gemini/i.test(model));
     const unit = live.buckets[0]?.tokenType || "req";
-    const offeredNote = extraCount ? ` + ${extraCount} disponibles sin cuota (Claude/GPT)` : "";
+    const offeredNote = offeredModels.length
+      ? `; ${offeredModels.length} Claude/GPT ofrecidos con cuota desconocida`
+      : "";
+    const availability = groupedQuotaAvailability(windows, "model");
     return {
       source: "antigravity",
+      dataSource: "antigravity-api",
       kind: "detected-percent",
       ok: true,
+      ...availability,
       windows,
-      note: `Antigravity (API real, ${unit}, ${windows.length - extraCount} con cuota${offeredNote}).  ${statsNote}${live.cacheStale ? "  [cache]" : ""}`,
+      unavailableModels: availability.limitingGroups,
+      offeredModels,
+      observedAt: live.capturedAt || null,
+      stale: Boolean(live.cacheStale),
+      note: `Antigravity (API real, ${unit}, ${windows.length} con cuota${offeredNote}).  ${statsNote}${live.cacheStale ? "  [cache]" : ""}`,
     };
   }
 
@@ -1288,10 +1766,19 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
   if (Number.isFinite(monthlyCredits) && monthlyCredits > 0) {
     const used = Number.isFinite(usedCredits) ? Math.max(0, usedCredits) : 0;
     const usedPercent = Math.min(999, (used / monthlyCredits) * 100);
+    const windows = [{
+      key: "manual",
+      label: "manual",
+      usedPercent,
+      remainingPercent: Math.max(0, 100 - usedPercent),
+      reset: resetsAt,
+    }];
     return {
       source: "antigravity",
       kind: "configured-credits",
       ok: true,
+      ...conjunctiveQuotaAvailability(windows),
+      windows,
       used,
       limit: monthlyCredits,
       remaining: Math.max(0, monthlyCredits - used),
@@ -1315,22 +1802,50 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
 function buildOpenCodeQuota(usage, config = {}, server = null) {
   const data = usage?.data || usage || {};
 
+  const availabilityFor = (windows) => {
+    const numeric = windows.filter((window) => finiteNumberOrNull(window.remainingPercent) !== null);
+    const limitingWindows = numeric
+      .filter((window) => Number(window.remainingPercent) <= 0 || /rate.?limited|blocked|exhausted/i.test(String(window.status || "")))
+      .map((window) => String(window.label || window.key || "limite"));
+    const effectiveRemainingPercent = numeric.length
+      ? Math.min(...numeric.map((window) => Number(window.remainingPercent)))
+      : null;
+    return {
+      available: numeric.length > 0 && limitingWindows.length === 0,
+      limited: limitingWindows.length > 0,
+      limitingWindows,
+      effectiveRemainingPercent,
+    };
+  };
+
   // 0) Cuota REAL desde opencode.ai/auth (scrape web autenticado). Precedencia maxima.
   if (server?.ok && Array.isArray(server.windows) && server.windows.length) {
     const localBits = [];
     if (typeof data.cost5h === "number") localBits.push(`5h ${fmtMoney(data.cost5h)}`);
     if (typeof data.costWeek === "number") localBits.push(`sem ${fmtMoney(data.costWeek)}`);
     if (typeof data.costMonth === "number") localBits.push(`mes ${fmtMoney(data.costMonth)}`);
+    const availability = availabilityFor(server.windows);
+    const requiredKeys = ["5h", "week", "month"];
+    const missingWindows = requiredKeys
+      .filter((key) => !server.windows.some((window) => window.key === key))
+      .map((key) => key === "5h" ? "5 horas" : key === "week" ? "semanal" : "mensual");
+    if (missingWindows.length) availability.available = false;
     return {
       source: "opencode",
+      dataSource: "opencode-web",
       kind: "detected-percent",
       ok: true,
       windows: server.windows,
+      ...availability,
+      incomplete: missingWindows.length > 0,
+      missingWindows,
+      observedAt: server.capturedAt || null,
+      stale: Boolean(server.cacheStale),
       totalCost: data.totalCost || 0,
       totalTokens: data.totalTokens || 0,
       sessionCount: data.sessionCount || 0,
       serverOverride: false,
-      note: `Cuota real (opencode.ai/auth)${server.cacheStale ? " [cache]" : ""}.${localBits.length ? `  ·  estimado local (tarifa publica): ${localBits.join("  ")}` : ""}`,
+      note: `${availability.limited ? `LIMITE ALCANZADO (${availability.limitingWindows.join(", ")}). ` : ""}${missingWindows.length ? `Cuota incompleta: falta ${missingWindows.join(", ")}; disponibilidad no confirmada. ` : ""}Cuota real (opencode.ai/auth)${server.cacheStale ? " [cache]" : ""}.${localBits.length ? `  ·  estimado local (tarifa publica): ${localBits.join("  ")}` : ""}`,
     };
   }
 
@@ -1451,14 +1966,19 @@ function buildOpenCodeQuota(usage, config = {}, server = null) {
 
   if (windows.length) {
     const allServer = windows.every((w) => w.source === "server");
+    const availability = availabilityFor(windows);
     let noteText = useOverride
       ? (override.note ? `Override manual: ${override.note}` : "Override manual desde opencode.ai/auth.")
       : (usage.note || (usage.cacheHit ? "OpenCode Go desde cache local." : "OpenCode Go DB local."));
+    let overrideStale = useOverride;
     if (useOverride) {
       const capturedAt = Date.parse(override.capturedAt || "");
       if (Number.isFinite(capturedAt)) {
         const ageH = Math.max(0, Math.round((Date.now() - capturedAt) / 3600000));
+        overrideStale = ageH >= 12;
         noteText = `${ageH >= 12 ? `[stale ${ageH}h - actualiza opencode.ai/auth] ` : `[hace ${ageH}h] `}${noteText}`;
+      } else {
+        noteText = `[stale - capturedAt desconocido] ${noteText}`;
       }
       const localBits = [];
       if (typeof data.cost5h === "number") localBits.push(`5h ${fmtMoney(data.cost5h)}`);
@@ -1468,14 +1988,18 @@ function buildOpenCodeQuota(usage, config = {}, server = null) {
     }
     return {
       source: "opencode",
+      dataSource: allServer ? "opencode-override" : "opencode-db",
       kind: "detected-percent",
       ok: true,
       windows,
+      ...availability,
+      observedAt: useOverride ? (override.capturedAt || null) : (usage.capturedAt || null),
+      stale: Boolean(usage.cacheStale) || overrideStale,
       totalCost: data.totalCost || 0,
       totalTokens: data.totalTokens || 0,
       sessionCount: data.sessionCount || 0,
       serverOverride: allServer,
-      note: noteText,
+      note: `${availability.limited ? `LIMITE ALCANZADO (${availability.limitingWindows.join(", ")}). ` : ""}${noteText}`,
     };
   }
 
@@ -1494,15 +2018,16 @@ function buildOpenCodeQuota(usage, config = {}, server = null) {
 }
 
 async function collectCodexLive(config = {}, { ignoreCache = false } = {}) {
-  // Codex no expone una query de cuota gratis. codex-probe.py hace una mini-llamada
-  // `codex exec --json`: si Codex esta LIMITADO el backend responde un error (RAPIDO y
-  // GRATIS) con la hora de reintento; si no, devuelve rate_limits frescos. Opt-in via
-  // quotas.json codex.probe (solo el caso NO-limitado consume un poco de cuota).
-  if (config?.probe !== true || process.env.AI_USAGE_CODEX_PROBE === "0") return { ok: false, disabled: true };
+  // Codex moderno ofrece account/rateLimits/read por app-server, sin crear una sesion ni gastar
+  // tokens. codex-probe.py conserva el antiguo `codex exec` solo como fallback opt-in.
+  if (process.env.AI_USAGE_CODEX_LIVE === "0" || config?.liveUsage === false) {
+    return { ok: false, disabled: true, note: "Codex app-server desactivado." };
+  }
   if (!commandExists("codex")) return { ok: false, note: "codex no instalado." };
-  const cacheMinutes = Number(process.env.CODEX_PROBE_CACHE_MINUTES ?? config.probeCacheMinutes ?? 10);
+  const legacyCacheMinutes = Number(process.env.CODEX_PROBE_CACHE_MINUTES ?? config.probeCacheMinutes ?? 1);
+  const cacheSeconds = Number(process.env.CODEX_USAGE_CACHE_SECONDS ?? config.liveUsageCacheSeconds ?? legacyCacheMinutes * 60);
   if (!ignoreCache) {
-    const cached = readJsonCache(CODEX_PROBE_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
+    const cached = readJsonCache(CODEX_PROBE_CACHE_PATH, Math.max(0, cacheSeconds) * 1000);
     if (cached) return { ...cached, cacheHit: true };
   }
   const helper = path.join(SCRIPT_DIR, "codex-probe.py");
@@ -1512,7 +2037,12 @@ async function collectCodexLive(config = {}, { ignoreCache = false } = {}) {
       encoding: "utf8",
       maxBuffer: 4 * 1024 * 1024,
       timeout: 35000,
-      env: { ...process.env, CODEX_PROBE_TIMEOUT: "16" },
+      env: {
+        ...process.env,
+        AI_USAGE_LIVE_VERSION: APP_VERSION,
+        CODEX_PROBE_TIMEOUT: process.env.CODEX_PROBE_TIMEOUT || "16",
+        CODEX_ALLOW_EXEC_PROBE: config.probe === true && process.env.AI_USAGE_CODEX_PROBE !== "0" ? "1" : "0",
+      },
     });
     const parsed = JSON.parse(stdout);
     if (parsed?.ok) {
@@ -1618,12 +2148,11 @@ async function collectClaudeUsageLive(config = {}, { ignoreCache = false } = {})
         const fallback = {
           ...stale,
           plan: parsed.plan || stale.plan || "",
-          capturedAt: new Date().toISOString(),
+          lastCheckedAt: new Date().toISOString(),
           cacheHit: true,
           cacheStale: true,
           note: "Claude no devolvio barras (limitado); mostrando ultimo dato conocido.",
         };
-        writeJsonCache(CLAUDE_USAGE_CACHE_PATH, fallback);
         return fallback;
       }
       // No prior windows to fall back on: report honestly instead of faking "unlimited".
@@ -1690,9 +2219,17 @@ function parseClaudeUsageOutput(text) {
 
 function claudeWindowKey(label) {
   const lower = label.toLowerCase();
-  if (lower.includes("sonnet")) return "week_sonnet";
-  if (lower.includes("week")) return "week_all";
   if (lower.includes("session")) return "session";
+  if (lower.includes("week")) {
+    const scope = lower.match(/\(([^)]+)\)/)?.[1]?.trim() || "";
+    if (!scope || scope === "all" || scope.includes("all model")) return "week_all";
+    const normalizedScope = scope
+      .replace(/\bonly\b/g, "")
+      .trim()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_|_$/g, "");
+    return `week_${normalizedScope || "other"}`;
+  }
   return lower.replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
 }
 
@@ -1700,7 +2237,11 @@ function claudeWindowLabel(label) {
   const key = claudeWindowKey(label);
   if (key === "session") return "sesion";
   if (key === "week_all") return "semana";
-  if (key === "week_sonnet") return "Sonnet";
+  if (key.startsWith("week_")) {
+    const scope = String(label).match(/\(([^)]+)\)/)?.[1]?.replace(/\bonly\b/gi, "").trim();
+    if (scope) return scope;
+    return key.slice(5).replace(/_/g, " ");
+  }
   return label;
 }
 
@@ -1739,7 +2280,20 @@ async function collectGeminiQuotaLive(config = {}, { ignoreCache = false } = {})
       capturedAt: parsed.capturedAt || new Date().toISOString(),
       cacheHit: false,
     };
-    writeJsonCache(GEMINI_QUOTA_CACHE_PATH, output);
+    if (output.ok) {
+      writeJsonCache(GEMINI_QUOTA_CACHE_PATH, output);
+      return output;
+    }
+    if (output.needsAuth || output.authError) return output;
+    const stale = readJsonSafe(GEMINI_QUOTA_CACHE_PATH);
+    if (stale?.ok) {
+      return {
+        ...stale,
+        cacheHit: true,
+        cacheStale: true,
+        note: `Gemini /stats model no se pudo parsear; usando cache anterior (${output.note || "formato desconocido"}).`,
+      };
+    }
     return output;
   } catch (error) {
     const stale = readJsonSafe(GEMINI_QUOTA_CACHE_PATH);
@@ -1783,7 +2337,7 @@ async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false } =
   }
 
   if (debug) {
-    process.stderr.write(`[minimax] key source: ${keyFromEnv ? "env" : keyFromFile ? "quotas.json" : "none"} (${apiKey ? apiKey.slice(0, 8) + "…" : "empty"})\n`);
+    process.stderr.write(`[minimax] key source: ${keyFromEnv ? "env" : keyFromFile ? "quotas.json" : "none"} (${apiKey ? "present" : "empty"})\n`);
   }
   if (!apiKey) {
     return {
@@ -1793,9 +2347,9 @@ async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false } =
     };
   }
 
-  const url = process.env.MINIMAX_USAGE_URL || "https://api.minimax.io/v1/api/openplatform/coding_plan/remains";
+  const url = process.env.MINIMAX_USAGE_URL || "https://www.minimax.io/v1/token_plan/remains";
   if (debug) {
-    process.stderr.write(`[minimax] GET ${url}\n[minimax] Authorization: Bearer ${apiKey.slice(0, 8)}…\n`);
+    process.stderr.write(`[minimax] GET ${url}\n[minimax] Authorization: Bearer [redacted]\n`);
   }
   try {
     const response = await fetch(url, {
@@ -1888,9 +2442,11 @@ function staleOpenCodeUsage(note) {
   };
 }
 
-function staleOpenCodeServer(note) {
+function staleOpenCodeServer(note, workspaceId = "") {
   const stale = readJsonSafe(OPENCODE_SERVER_CACHE_PATH);
-  if (stale?.ok) return { ...stale, cacheHit: true, cacheStale: true, note: `${note} Usando cache.` };
+  if (stale?.ok && (!workspaceId || stale.workspaceId === workspaceId)) {
+    return { ...stale, cacheHit: true, cacheStale: true, note: `${note} Usando cache.` };
+  }
   return { ok: false, note };
 }
 
@@ -1913,23 +2469,59 @@ function parseOpenCodeServerUsage(html) {
   // de hidratacion y extraemos los 3 bloques Rolling/Weekly/Monthly.
   const clean = String(html).replace(/<!--\$-->/g, "").replace(/<!--\/-->/g, "");
   const specs = [
-    { match: "Rolling", key: "5h", label: "5 horas" },
-    { match: "Weekly", key: "week", label: "semanal" },
-    { match: "Monthly", key: "month", label: "mensual" },
+    { match: "Rolling", object: "rollingUsage", key: "5h", label: "5 horas", windowMinutes: 300 },
+    { match: "Weekly", object: "weeklyUsage", key: "week", label: "semanal", windowMinutes: 10080 },
+    { match: "Monthly", object: "monthlyUsage", key: "month", label: "mensual", windowMinutes: null },
   ];
-  const resets = [...clean.matchAll(/reset-time">\s*Resets in\s*([^<]+?)\s*<\/span>/g)].map((r) => r[1].trim());
-  const windows = [];
-  let resetIdx = 0;
+
+  // SolidStart serializa tambien el estado de negocio. Es mas estable y, a diferencia de la
+  // barra visual, indica explicitamente `status:"rate-limited"`.
+  const structuredWindows = [];
   for (const spec of specs) {
-    const re = new RegExp(`usage-label">${spec.match} Usage</span><span data-slot="usage-value">\\s*(\\d+)\\s*%`);
-    const m = clean.match(re);
-    if (!m) continue;
-    const usedPercent = Math.max(0, Math.min(100, Number(m[1])));
-    const resetText = resets[resetIdx] || "";
-    resetIdx += 1;
+    const objectRe = new RegExp(`${spec.object}\\s*:\\s*(?:\\$R\\[\\d+\\]\\s*=\\s*)?\\{([^}]+)\\}`, "i");
+    const body = clean.match(objectRe)?.[1] || "";
+    const usedMatch = body.match(/usagePercent\s*:\s*(\d+(?:\.\d+)?)/i);
+    if (!usedMatch) continue;
+    const resetSeconds = Number(body.match(/resetInSec\s*:\s*(\d+)/i)?.[1]);
+    const status = body.match(/status\s*:\s*["']([^"']+)["']/i)?.[1] || "";
+    const usedPercent = Math.max(0, Math.min(100, Number(usedMatch[1])));
+    structuredWindows.push({
+      key: spec.key,
+      label: spec.label,
+      windowType: spec.key === "5h" ? "rolling" : spec.key === "week" ? "weekly" : "monthly",
+      windowMinutes: spec.windowMinutes,
+      status,
+      usedPercent,
+      remainingPercent: Math.max(0, 100 - usedPercent),
+      reset: Number.isFinite(resetSeconds) ? new Date(Date.now() + resetSeconds * 1000) : null,
+      resetText: Number.isFinite(resetSeconds) ? fmtCountdown(new Date(Date.now() + resetSeconds * 1000)) : "",
+      source: "web",
+    });
+  }
+  const windows = [...structuredWindows];
+  for (const spec of specs) {
+    if (windows.some((window) => window.key === spec.key)) continue;
+    const labelRe = new RegExp(`<span[^>]*data-slot=["']usage-label["'][^>]*>\\s*${spec.match}\\s+Usage\\s*</span>`, "i");
+    const labelMatch = labelRe.exec(clean);
+    if (!labelMatch) continue;
+    const afterLabel = clean.slice(labelMatch.index + labelMatch[0].length);
+    const nextLabel = afterLabel.search(/<span[^>]*data-slot=["']usage-label["']/i);
+    const section = nextLabel >= 0 ? afterLabel.slice(0, nextLabel) : afterLabel;
+    const valueMatch = section.match(/data-slot=["']usage-value["'][^>]*>[\s\S]*?(\d+(?:\.\d+)?)\s*%/i);
+    if (!valueMatch) continue;
+    const usedPercent = Math.max(0, Math.min(100, Number(valueMatch[1])));
+    const resetMatch = section.match(/data-slot=["']reset-time["'][^>]*>([\s\S]*?)<\/span>/i);
+    const resetText = String(resetMatch?.[1] || "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/^\s*Resets in\s*/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
     windows.push({
       key: spec.key,
       label: spec.label,
+      windowType: spec.key === "5h" ? "rolling" : spec.key === "week" ? "weekly" : "monthly",
+      windowMinutes: spec.windowMinutes,
       usedPercent,
       remainingPercent: Math.max(0, 100 - usedPercent),
       reset: parseResetDuration(resetText),
@@ -1938,7 +2530,58 @@ function parseOpenCodeServerUsage(html) {
     });
   }
   if (!windows.length) return { ok: false, note: "no pude parsear opencode.ai/go (cambio el HTML o cookie invalida)." };
-  return { ok: true, windows };
+  const missingWindows = specs
+    .filter((spec) => !windows.some((window) => window.key === spec.key))
+    .map((spec) => spec.label);
+  return {
+    ok: true,
+    windows,
+    complete: missingWindows.length === 0,
+    missingWindows,
+    format: structuredWindows.length === specs.length
+      ? "solid-state"
+      : structuredWindows.length
+        ? "solid-state+html"
+        : "html",
+  };
+}
+
+function resolveOpenCodeDbPath() {
+  if (process.env.OPENCODE_DB_PATH) return process.env.OPENCODE_DB_PATH;
+  if (commandExists("opencode")) {
+    try {
+      const value = execFileSync("opencode", ["db", "path"], {
+        encoding: "utf8",
+        timeout: 5000,
+        maxBuffer: 1024 * 1024,
+      }).trim();
+      if (value) return value;
+    } catch {
+      // Older OpenCode versions do not expose `db path`.
+    }
+  }
+  return OPENCODE_DB_FALLBACK_PATH;
+}
+
+async function queryOpenCodeSessions(dbPath, sql) {
+  if (!process.env.OPENCODE_DB_PATH && commandExists("opencode")) {
+    try {
+      const { stdout } = await execFileAsync("opencode", ["db", sql, "--format", "json"], {
+        encoding: "utf8",
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 15000,
+      });
+      return stdout.trim() ? JSON.parse(stdout) : [];
+    } catch {
+      // Fall through to sqlite3 for older or partially upgraded installations.
+    }
+  }
+  const { stdout } = await execFileAsync("sqlite3", [dbPath, "-json", sql], {
+    encoding: "utf8",
+    maxBuffer: 10 * 1024 * 1024,
+    timeout: 15000,
+  });
+  return stdout.trim() ? JSON.parse(stdout) : [];
 }
 
 async function collectOpenCodeServerUsage(config = {}, { ignoreCache = false } = {}) {
@@ -1952,7 +2595,7 @@ async function collectOpenCodeServerUsage(config = {}, { ignoreCache = false } =
   const cacheMinutes = Number(process.env.OPENCODE_USAGE_CACHE_MINUTES ?? config.liveCaptureCacheMinutes ?? 5);
   if (!ignoreCache) {
     const cached = readJsonCache(OPENCODE_SERVER_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
-    if (cached) return { ...cached, cacheHit: true };
+    if (cached?.workspaceId === workspaceId) return { ...cached, cacheHit: true };
   }
   try {
     const controller = new AbortController();
@@ -1968,19 +2611,29 @@ async function collectOpenCodeServerUsage(config = {}, { ignoreCache = false } =
       httpStatus = resp.status;
       if (resp.status >= 300) {
         const hint = resp.status === 302 || resp.status === 401 || resp.status === 403 ? " (cookie expirada? repega la cookie auth)" : "";
-        return staleOpenCodeServer(`opencode.ai HTTP ${resp.status}${hint}.`);
+        return staleOpenCodeServer(`opencode.ai HTTP ${resp.status}${hint}.`, workspaceId);
       }
       html = await resp.text();
     } finally {
       clearTimeout(timer);
     }
     const parsed = parseOpenCodeServerUsage(html);
-    if (!parsed.ok) return staleOpenCodeServer(parsed.note);
-    const output = { source: "opencode", ...parsed, capturedAt: new Date().toISOString(), cacheHit: false };
+    if (!parsed.ok) return staleOpenCodeServer(parsed.note, workspaceId);
+    if (!parsed.complete) {
+      return {
+        source: "opencode",
+        ...parsed,
+        workspaceId,
+        capturedAt: new Date().toISOString(),
+        cacheHit: false,
+        cachePartial: true,
+      };
+    }
+    const output = { source: "opencode", ...parsed, workspaceId, capturedAt: new Date().toISOString(), cacheHit: false };
     writeJsonCache(OPENCODE_SERVER_CACHE_PATH, output);
     return output;
   } catch (error) {
-    return staleOpenCodeServer(`opencode.ai web fallo: ${shortError(error)}`);
+    return staleOpenCodeServer(`opencode.ai web fallo: ${shortError(error)}`, workspaceId);
   }
 }
 
@@ -1989,38 +2642,58 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
   const configEntry = config?.opencode || {};
   const liveDisabled = process.env.AI_USAGE_OPENCODE_LIVE === "0" || configEntry.liveCapture === false;
   const cacheMinutes = Number(process.env.OPENCODE_USAGE_CACHE_MINUTES ?? configEntry.liveCaptureCacheMinutes ?? 5);
+  const usageRangeKey = `${state.view}|${state.since || ""}|${state.until || ""}`;
   const cached = readJsonCache(OPENCODE_USAGE_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
-  if (cached && (!ignoreCache || liveDisabled)) {
+  if (cached?.usageRangeKey === usageRangeKey && (!ignoreCache || liveDisabled)) {
     return { ...cached, cacheHit: true };
   }
   if (liveDisabled) {
     const stale = readJsonSafe(OPENCODE_USAGE_CACHE_PATH);
-    if (stale?.ok) {
+    if (stale?.ok && stale.usageRangeKey === usageRangeKey) {
       return { ...stale, cacheHit: true, cacheStale: true, note: "OpenCode Go DB desactivado; usando cache local." };
     }
     return { source: "opencode", ok: false, disabled: true, note: "OpenCode Go DB desactivado." };
   }
 
-  if (!existsSync(OPENCODE_DB_PATH)) {
+  const dbPath = resolveOpenCodeDbPath();
+  if (!existsSync(dbPath)) {
     return { source: "opencode", ok: false, note: "No encuentro opencode.db; corre opencode al menos una vez." };
   }
 
   try {
-    const { stdout } = await execFileAsync("sqlite3", [OPENCODE_DB_PATH, "-json",
-      "SELECT s.model, s.cost, s.tokens_input, s.tokens_output, s.tokens_cache_read, s.tokens_cache_write, s.time_created " +
-      "FROM session s WHERE json_extract(s.model, '$.providerID') = 'opencode-go' " +
-      "OR json_extract(s.model, '$.providerID') LIKE 'opencode-go:%' " +
-      "ORDER BY s.time_created DESC"], {
-      encoding: "utf8",
-      maxBuffer: 10 * 1024 * 1024,
-      timeout: 15000,
-    });
-
-    const rows = stdout.trim() ? JSON.parse(stdout) : [];
+    let rows;
+    let dbGranularity;
+    try {
+      const messageColumns = await queryOpenCodeSessions(dbPath, "PRAGMA table_info(message)");
+      if (!messageColumns.some((column) => column.name === "data")) throw new Error("message.data no disponible");
+      const messageSql = "SELECT m.session_id, json_extract(m.data, '$.modelID') AS model_id, " +
+        "COALESCE(json_extract(m.data, '$.cost'), 0) AS cost, " +
+        "COALESCE(json_extract(m.data, '$.tokens.input'), 0) AS tokens_input, " +
+        "COALESCE(json_extract(m.data, '$.tokens.output'), 0) AS tokens_output, " +
+        "COALESCE(json_extract(m.data, '$.tokens.reasoning'), 0) AS tokens_reasoning, " +
+        "COALESCE(json_extract(m.data, '$.tokens.cache.read'), 0) AS tokens_cache_read, " +
+        "COALESCE(json_extract(m.data, '$.tokens.cache.write'), 0) AS tokens_cache_write, " +
+        "COALESCE(json_extract(m.data, '$.time.created'), m.time_created) AS time_created " +
+        "FROM message m WHERE json_extract(m.data, '$.role') = 'assistant' " +
+        "AND (json_extract(m.data, '$.providerID') = 'opencode-go' " +
+        "OR json_extract(m.data, '$.providerID') LIKE 'opencode-go:%') " +
+        "ORDER BY time_created DESC";
+      rows = await queryOpenCodeSessions(dbPath, messageSql);
+      dbGranularity = "message";
+    } catch {
+      const columns = await queryOpenCodeSessions(dbPath, "PRAGMA table_info(session)");
+      const hasReasoning = columns.some((column) => column.name === "tokens_reasoning");
+      const reasoningColumn = hasReasoning ? "s.tokens_reasoning" : "0 AS tokens_reasoning";
+      const sessionSql = `SELECT s.id AS session_id, s.model, s.cost, s.tokens_input, s.tokens_output, ${reasoningColumn}, s.tokens_cache_read, s.tokens_cache_write, s.time_created ` +
+        "FROM session s WHERE json_extract(s.model, '$.providerID') = 'opencode-go' " +
+        "OR json_extract(s.model, '$.providerID') LIKE 'opencode-go:%' " +
+        "ORDER BY s.time_created DESC";
+      rows = await queryOpenCodeSessions(dbPath, sessionSql);
+      dbGranularity = "session";
+    }
     const now = Date.now();
     const nowDate = new Date();
     const HOUR = 3600000;
-    const DAY = 86400000;
 
     // 5h = rolling window (last 5h from now)
     const fiveHoursAgo = now - 5 * HOUR;
@@ -2038,21 +2711,49 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
     // The server uses subscription date for the monthly window, but locally
     // we approximate to "this calendar month" which is close enough.
     const monthStartMs = Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth(), 1);
+    const usageStartMs = state.since ? Date.parse(`${state.since}T00:00:00Z`) : NaN;
+    const untilStartMs = state.until ? Date.parse(`${state.until}T00:00:00Z`) : NaN;
+    const usageEndMs = Number.isFinite(untilStartMs) ? untilStartMs + 86400000 : NaN;
 
     let cost5h = 0, costWeek = 0, costMonth = 0, totalCost = 0;
-    let totalTokens = 0, totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0;
+    let totalTokens = 0, totalInput = 0, totalOutput = 0, totalReasoning = 0, totalCacheRead = 0, totalCacheWrite = 0;
+    const reasoningByModel = {};
+    const usageSessions = new Set();
     let earliestIn5h = null;
 
     for (const row of rows) {
-      const ts = Number(row.time_created);
+      const rawTimestamp = Number(row.time_created);
+      const ts = rawTimestamp > 0 && rawTimestamp < 1e12 ? rawTimestamp * 1000 : rawTimestamp;
       const cost = Number(row.cost || 0);
       if (!Number.isFinite(ts)) continue;
-      totalCost += cost;
-      totalTokens += Number(row.tokens_input || 0) + Number(row.tokens_output || 0);
-      totalInput += Number(row.tokens_input || 0);
-      totalOutput += Number(row.tokens_output || 0);
-      totalCacheRead += Number(row.tokens_cache_read || 0);
-      totalCacheWrite += Number(row.tokens_cache_write || 0);
+      const input = Number(row.tokens_input || 0);
+      const outputTokens = Number(row.tokens_output || 0);
+      const reasoning = Number(row.tokens_reasoning || 0);
+      const cacheRead = Number(row.tokens_cache_read || 0);
+      const cacheWrite = Number(row.tokens_cache_write || 0);
+      const inUsageRange = (!Number.isFinite(usageStartMs) || ts >= usageStartMs)
+        && (!Number.isFinite(usageEndMs) || ts < usageEndMs);
+      if (inUsageRange) {
+        totalCost += cost;
+        totalTokens += input + outputTokens + reasoning + cacheWrite;
+        totalInput += input;
+        totalOutput += outputTokens;
+        totalReasoning += reasoning;
+        totalCacheRead += cacheRead;
+        totalCacheWrite += cacheWrite;
+        if (row.session_id) usageSessions.add(String(row.session_id));
+      }
+      if (inUsageRange && reasoning > 0) {
+        try {
+          const model = row.model_id
+            ? { id: row.model_id }
+            : typeof row.model === "string" ? JSON.parse(row.model) : row.model;
+          const modelId = String(model?.id || "").toLowerCase();
+          if (modelId) reasoningByModel[modelId] = Number(reasoningByModel[modelId] || 0) + reasoning;
+        } catch {
+          // Keep the provider total even if an older row has malformed model metadata.
+        }
+      }
 
       if (ts >= fiveHoursAgo) {
         cost5h += cost;
@@ -2085,9 +2786,11 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
         totalTokens: totalTokens,
         totalInput: totalInput,
         totalOutput: totalOutput,
+        totalReasoning: totalReasoning,
+        reasoningByModel: reasoningByModel,
         totalCacheRead: totalCacheRead,
         totalCacheWrite: totalCacheWrite,
-        sessionCount: rows.length,
+        sessionCount: usageSessions.size,
         reset5h: new Date((earliestIn5h !== null ? earliestIn5h : now) + 5 * HOUR).toISOString(),
         resetWeek: nextWeek.toISOString(),
         resetMonth: new Date(nextMonth).toISOString(),
@@ -2099,6 +2802,8 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
         note: "Estimado local (opencode.db). Valores reales del servidor: opencode.ai/auth (pueden diferir).",
       },
       capturedAt: new Date().toISOString(),
+      usageRangeKey,
+      dbGranularity,
       cacheHit: false,
       note: "Estimado local (opencode.db). Para valores exactos ve a opencode.ai/auth.",
     };
@@ -2106,7 +2811,7 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
     return output;
   } catch (error) {
     const stale = readJsonSafe(OPENCODE_USAGE_CACHE_PATH);
-    if (stale?.ok) {
+    if (stale?.ok && stale.usageRangeKey === usageRangeKey) {
       return { ...stale, cacheHit: true, cacheStale: true, note: `OpenCode Go DB fallo; usando cache anterior (${shortError(error)}).` };
     }
     return { source: "opencode", ok: false, note: `OpenCode Go DB fallo: ${shortError(error)}` };
@@ -2177,20 +2882,23 @@ function listTranscriptPaths(brainDir) {
 }
 
 function listAntigravityModels() {
-  if (!commandExists("antigravity")) return [];
-  try {
-    const output = execFileSync("antigravity", ["models"], {
-      encoding: "utf8",
-      timeout: 8000,
-      maxBuffer: 1024 * 1024,
-    });
-    return output
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
-  } catch {
-    return [];
+  for (const command of ["antigravity", "agy"]) {
+    if (!commandExists(command)) continue;
+    try {
+      const output = execFileSync(command, ["models"], {
+        encoding: "utf8",
+        timeout: 8000,
+        maxBuffer: 1024 * 1024,
+      });
+      return output
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+    } catch {
+      // Try the other supported binary name.
+    }
   }
+  return [];
 }
 
 function commandExists(command) {
@@ -2277,6 +2985,7 @@ function handleKey(key) {
   else if (key === "a") setSource("all");
   else if (key === "c") setSource("claude");
   else if (key === "x") setSource("codex");
+  else if (key === "g") setSource("gemini");
   else if (key === "v") setSource("antigravity");
   else if (key === "m") setSource("minimax");
   else if (key === "o") setSource("opencode");
@@ -2731,11 +3440,12 @@ function summaryCards(width, total, snap) {
   const cardWidth = Math.max(18, Math.floor((width - 6) / 5));
   const effectiveTokens = total?.effectiveTokens ?? (total?.totalTokens || 0);
   const cacheReadTokens = total?.cacheReadTokens || 0;
+  const reasoningTokens = total?.reasoningOutputTokens || 0;
   const cards = [
     card("Netos", fmtInt(effectiveTokens), "in+cacheCreate+out", cardWidth, colors.cyan),
     card("Cache leido", fmtInt(cacheReadTokens), cacheReadTokens ? `${((cacheReadTokens / Math.max(1, total?.totalTokens || 1)) * 100).toFixed(0)}% del total` : "sin cache", cardWidth, colors.gray),
     card("Coste est.", fmtMoney(total?.totalCost || 0), "no es factura oficial", cardWidth, colors.green),
-    card("Salida", fmtInt(total?.outputTokens || 0), "tokens output", cardWidth, colors.magenta),
+    card("Salida", fmtInt(total?.outputTokens || 0), reasoningTokens ? `${fmtInt(reasoningTokens)} reasoning reportado` : "tokens output", cardWidth, colors.magenta),
     card("Latencia", `${snap.elapsedMs} ms`, "lectura local", cardWidth, colors.yellow),
   ];
   return zipCards(cards, width);
@@ -2954,7 +3664,7 @@ function modelPanel(width, maxRows) {
     const effective = selected.effectiveTokens ?? selected.totalTokens;
     rows.push(
       fit(
-        `${colors.bold}Detalle:${RESET} ${selected.modelName} | netos ${fmtInt(effective)} | input ${fmtInt(selected.inputTokens)} | cache create ${fmtInt(selected.cacheCreationTokens)} | cache read ${fmtInt(selected.cacheReadTokens)} | output ${fmtInt(selected.outputTokens)} | coste ${fmtMoney(selected.cost)}`,
+        `${colors.bold}Detalle:${RESET} ${selected.modelName} | netos ${fmtInt(effective)} | input ${fmtInt(selected.inputTokens)} | cache create ${fmtInt(selected.cacheCreationTokens)} | cache read ${fmtInt(selected.cacheReadTokens)} | output ${fmtInt(selected.outputTokens)} | reasoning ${fmtInt(selected.reasoningOutputTokens)} | coste ${fmtMoney(selected.cost)}`,
         width,
       ),
     );
@@ -3063,7 +3773,7 @@ function opencodePanel(width, usage, quota) {
   const effective = usage.totals?.effectiveTokens ?? usage.totals?.totalTokens ?? 0;
   const cacheRead = usage.totals?.cacheReadTokens || 0;
   rows.push(`Coste total: ${colors.bold}${fmtMoney(usage.totals.totalCost || 0)}${RESET}`);
-  rows.push(`Tokens netos: ${fmtInt(effective)} (in: ${fmtInt(usage.totals.inputTokens || 0)} out: ${fmtInt(usage.totals.outputTokens || 0)})`);
+  rows.push(`Tokens netos: ${fmtInt(effective)} (in: ${fmtInt(usage.totals.inputTokens || 0)} out: ${fmtInt(usage.totals.outputTokens || 0)} reasoning: ${fmtInt(usage.totals.reasoningOutputTokens || 0)})`);
   rows.push(`Cache read: ${fmtInt(cacheRead)}  cache create: ${fmtInt(usage.totals.cacheCreationTokens || 0)}`);
   rows.push(`${usage.models.length} modelos detectados`);
   rows.push("");
@@ -3119,7 +3829,8 @@ function renderPlainSummary(snap) {
     const effective = usage.totals.effectiveTokens ?? usage.totals.totalTokens;
     const cacheRead = usage.totals.cacheReadTokens || 0;
     const cacheNote = cacheRead ? ` cache_read=${fmtInt(cacheRead)}` : "";
-    lines.push(`${SOURCE_META[source].label.padEnd(8)} effective=${fmtInt(effective)}${cacheNote} total=${fmtInt(usage.totals.totalTokens)} cost=${fmtMoney(usage.totals.totalCost)} models=${usage.models.length}`);
+    const reasoningNote = usage.totals.reasoningOutputTokens ? ` reasoning=${fmtInt(usage.totals.reasoningOutputTokens)}` : "";
+    lines.push(`${SOURCE_META[source].label.padEnd(8)} effective=${fmtInt(effective)}${cacheNote}${reasoningNote} total=${fmtInt(usage.totals.totalTokens)} cost=${fmtMoney(usage.totals.totalCost)} models=${usage.models.length}`);
   }
   const ag = snap.sources.antigravity;
   lines.push(`Antigravity installed=${ag.installed} sessions=${ag.sessions} model_steps=${ag.modelSteps} default="${ag.defaultModel || ""}"`);
@@ -3437,8 +4148,14 @@ function exit(code) {
 }
 
 function agentRound(value) {
+  if (value === null || value === undefined || value === "") return null;
   const n = Number(value);
   return Number.isFinite(n) ? Math.round(n * 10) / 10 : null;
+}
+
+function agentIsoDate(value) {
+  const date = dateFromProviderValue(value);
+  return date ? date.toISOString() : null;
 }
 
 // Resumen estructurado de cuotas para consumo por agentes (MCP / --json).
@@ -3446,13 +4163,21 @@ function agentRound(value) {
 // para que un agente decida que proveedor/modelo usar segun disponibilidad.
 function buildAgentQuotaSummary(snap) {
   const nowMs = Date.now();
-  const out = { capturedAt: new Date().toISOString(), since: snap?.since || null, providers: {} };
+  const out = {
+    schemaVersion: 2,
+    appVersion: APP_VERSION,
+    capturedAt: new Date().toISOString(),
+    since: snap?.since || null,
+    providers: {},
+  };
   const quotas = snap?.quotas || {};
-  for (const provider of ["claude", "codex", "antigravity", "minimax", "opencode"]) {
+  for (const provider of ["claude", "codex", "gemini", "antigravity", "minimax", "opencode"]) {
     const quota = quotas[provider];
     if (!quota) continue;
     const windows = (Array.isArray(quota.windows) ? quota.windows : []).map((w) => {
-      const resetMs = w.reset instanceof Date ? w.reset.getTime() : (w.reset ? Date.parse(w.reset) : NaN);
+      const resetValue = w.reset ?? w.resetAt ?? null;
+      const resetDate = dateFromProviderValue(resetValue);
+      const resetMs = resetDate ? resetDate.getTime() : NaN;
       const entry = {
         label: String(w.label || w.key || ""),
         usedPercent: agentRound(w.usedPercent),
@@ -3460,6 +4185,15 @@ function buildAgentQuotaSummary(snap) {
         resetInSeconds: Number.isFinite(resetMs) ? Math.max(0, Math.round((resetMs - nowMs) / 1000)) : null,
         resetAt: Number.isFinite(resetMs) ? new Date(resetMs).toISOString() : null,
       };
+      for (const key of ["key", "rawLabel", "limitId", "sourceWindow", "windowType", "model", "limitText", "usedText"]) {
+        if (w[key] !== undefined && w[key] !== null && w[key] !== "") entry[key] = w[key];
+      }
+      if (typeof w.status === "string" && w.status) entry.status = w.status;
+      for (const key of ["windowMinutes", "status", "used", "remaining", "limit"]) {
+        if (w[key] === null || w[key] === undefined || w[key] === "") continue;
+        const value = Number(w[key]);
+        if (Number.isFinite(value)) entry[key] = value;
+      }
       if (w.family) entry.family = w.family;
       if (w.source) entry.source = w.source;
       if (w.resetText) entry.resetText = w.resetText;
@@ -3467,15 +4201,80 @@ function buildAgentQuotaSummary(snap) {
       if (w.stale) entry.stale = true;
       return entry;
     });
-    out.providers[provider] = {
+    const inferredAvailable = windows.some((window) => {
+      const remaining = finiteNumberOrNull(window.remainingPercent);
+      return remaining !== null && remaining > 0;
+    }) && !quota.limited;
+    const directRemaining = finiteNumberOrNull(quota.remainingPercent);
+    const directUsed = finiteNumberOrNull(quota.usedPercent);
+    const scalarRemaining = directRemaining !== null
+      ? directRemaining
+      : directUsed !== null
+        ? 100 - directUsed
+        : null;
+    const providerEntry = {
       ok: quota.ok !== false,
+      available: typeof quota.available === "boolean"
+        ? quota.available
+        : quota.ok !== false && !quota.limited && (
+            inferredAvailable
+            || (String(quota.kind || "").startsWith("configured-") && scalarRemaining !== null && scalarRemaining > 0)
+          ),
       kind: quota.kind || "unknown",
-      stale: quota.stale || undefined,
-      limited: quota.limited || undefined,
-      limitedRetry: quota.limitedRetry || undefined,
       windows,
       note: quota.note || "",
     };
+    if (quota.plan) providerEntry.plan = quota.plan;
+    if (quota.dataSource) providerEntry.source = quota.dataSource;
+    if (finiteNumberOrNull(quota.effectiveRemainingPercent) !== null) {
+      providerEntry.effectiveRemainingPercent = agentRound(quota.effectiveRemainingPercent);
+    }
+    if (Array.isArray(quota.limitingWindows) && quota.limitingWindows.length) {
+      providerEntry.limitingWindows = quota.limitingWindows;
+    }
+    if (quota.incomplete) providerEntry.incomplete = true;
+    if (Array.isArray(quota.missingWindows) && quota.missingWindows.length) {
+      providerEntry.missingWindows = quota.missingWindows;
+    }
+    for (const key of ["availableGroups", "limitingGroups"]) {
+      if (Array.isArray(quota[key]) && quota[key].length) providerEntry[key] = quota[key];
+    }
+    if (quota.stale) providerEntry.stale = true;
+    if (quota.needsAuth) providerEntry.needsAuth = true;
+    if (quota.limited) providerEntry.limited = true;
+    if (quota.limitedRetry) providerEntry.limitedRetry = quota.limitedRetry;
+    if (quota.detectedAt) providerEntry.detectedAt = agentIsoDate(quota.detectedAt);
+    const observedAt = agentIsoDate(quota.observedAt || quota.detectedAt);
+    if (observedAt) {
+      providerEntry.observedAt = observedAt;
+      providerEntry.ageSeconds = Math.max(0, Math.round((nowMs - Date.parse(observedAt)) / 1000));
+    }
+    if (Array.isArray(quota.unavailableModels) && quota.unavailableModels.length) {
+      providerEntry.unavailableModels = quota.unavailableModels;
+    }
+    if (Array.isArray(quota.offeredModels) && quota.offeredModels.length) {
+      providerEntry.offeredModels = quota.offeredModels;
+    }
+    if (quota.resetCredits) {
+      providerEntry.resetCredits = {
+        availableCount: Number(quota.resetCredits.availableCount || 0),
+        credits: (quota.resetCredits.credits || []).map((credit) => ({
+          status: credit.status || "",
+          resetType: credit.resetType || "",
+          expiresAt: agentIsoDate(credit.expiresAt),
+        })),
+      };
+    }
+    if (Array.isArray(quota.creditsList) && quota.creditsList.length) {
+      providerEntry.creditBalances = quota.creditsList.map((credit) => ({
+        limitId: credit.limitId || "",
+        planType: credit.planType || "",
+        hasCredits: Boolean(credit.has_credits),
+        unlimited: Boolean(credit.unlimited),
+        balance: credit.balance == null ? null : String(credit.balance),
+      }));
+    }
+    out.providers[provider] = providerEntry;
   }
   return out;
 }
@@ -3490,13 +4289,17 @@ async function runQuotaSnapshot() {
 
 // Exports para pruebas unitarias y el servidor MCP (no se ejecuta main() al importar).
 export {
+  APP_VERSION,
   buildAgentQuotaSummary,
   runQuotaSnapshot,
   normalizeTotals,
   sumRows,
   extractModels,
   mergeModels,
+  enrichUnifiedReasoning,
   buildCodexQuota,
+  normalizeCodexRateLimitEntry,
+  codexWindowLabel,
   parseCodexRetryTime,
   fmtTimeInTz,
   renderQuotaCard,

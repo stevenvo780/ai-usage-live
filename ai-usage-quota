@@ -10,19 +10,23 @@ init_config() {
     umask 077
     cat > "$CONFIG_FILE" <<'JSON'
 {
-  "version": 1,
+  "version": 2,
   "notes": [
     "Put your real plan limits here. Leave null when the provider does not expose a stable local limit.",
     "Token limits are local-dashboard limits, not official billing unless you copy them from the provider UI."
   ],
   "claude": {
     "liveUsage": true,
-    "liveUsageCacheSeconds": 60,
+    "liveUsageCacheSeconds": 300,
     "fiveHourTokens": null,
     "weeklyTokens": null
   },
   "codex": {
+    "liveUsage": true,
+    "liveUsageCacheSeconds": 60,
     "useDetectedRateLimits": true,
+    "probe": false,
+    "probeCacheMinutes": 15,
     "dailyTokens": null
   },
   "gemini": {
@@ -32,22 +36,29 @@ init_config() {
     "dailyRequests": null
   },
   "antigravity": {
+    "liveCapture": true,
+    "liveCaptureCacheMinutes": 3,
+    "usageTimeoutSeconds": 40,
     "monthlyCredits": null,
     "usedCredits": null,
     "resetsAt": null
   },
    "minimax": {
+     "liveCapture": true,
      "liveCaptureCacheMinutes": 0,
      "monthlyCredits": null,
      "resetsAt": null,
      "apiKey": null
    },
    "opencode": {
+     "liveCapture": true,
      "liveCaptureCacheMinutes": 5,
      "fiveHourCost": 12,
      "weeklyCost": 30,
      "monthlyCost": 60,
      "apiKey": null,
+     "cookie": null,
+     "workspaceId": null,
      "serverOverride": {
        "enabled": false,
        "fiveHourUsed": null,
@@ -56,6 +67,7 @@ init_config() {
        "reset5h": null,
        "resetWeek": null,
        "resetMonth": null,
+       "capturedAt": null,
        "note": "Pega aqui los valores reales de opencode.ai/auth (cost en USD y resets ISO). Cuando enabled=true, reemplaza el estimado local."
      }
    }
@@ -66,19 +78,23 @@ JSON
 const fs = require("fs");
 const file = process.argv[2];
 const defaults = {
-  version: 1,
+  version: 2,
   notes: [
     "Put your real plan limits here. Leave null when the provider does not expose a stable local limit.",
     "Token limits are local-dashboard limits, not official billing unless you copy them from the provider UI."
   ],
   claude: {
     liveUsage: true,
-    liveUsageCacheSeconds: 60,
+    liveUsageCacheSeconds: 300,
     fiveHourTokens: null,
     weeklyTokens: null
   },
   codex: {
+    liveUsage: true,
+    liveUsageCacheSeconds: 60,
     useDetectedRateLimits: true,
+    probe: false,
+    probeCacheMinutes: 15,
     dailyTokens: null
   },
   gemini: {
@@ -88,22 +104,29 @@ const defaults = {
     dailyRequests: null
   },
   antigravity: {
+    liveCapture: true,
+    liveCaptureCacheMinutes: 3,
+    usageTimeoutSeconds: 40,
     monthlyCredits: null,
     usedCredits: null,
     resetsAt: null
   },
    minimax: {
+     liveCapture: true,
      liveCaptureCacheMinutes: 0,
      monthlyCredits: null,
      resetsAt: null,
      apiKey: null
    },
    opencode: {
+     liveCapture: true,
      liveCaptureCacheMinutes: 5,
      fiveHourCost: 12,
      weeklyCost: 30,
      monthlyCost: 60,
      apiKey: null,
+     cookie: null,
+     workspaceId: null,
      serverOverride: {
        enabled: false,
        fiveHourUsed: null,
@@ -112,6 +135,7 @@ const defaults = {
        reset5h: null,
        resetWeek: null,
        resetMonth: null,
+       capturedAt: null,
        note: "Pega aqui los valores reales de opencode.ai/auth (cost en USD y resets ISO). Cuando enabled=true, reemplaza el estimado local."
      }
    }
@@ -136,6 +160,7 @@ function merge(base, override) {
 }
 const current = JSON.parse(fs.readFileSync(file, "utf8"));
 const merged = merge(defaults, current);
+merged.version = defaults.version;
 if (JSON.stringify(current) !== JSON.stringify(merged)) {
   fs.writeFileSync(file, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
 }

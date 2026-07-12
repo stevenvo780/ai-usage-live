@@ -6,6 +6,8 @@ import {
   extractModels,
   mergeModels,
   buildCodexQuota,
+  normalizeCodexRateLimitEntry,
+  codexWindowLabel,
   parseCodexRetryTime,
   fmtTimeInTz,
   buildClaudeQuota,
@@ -29,6 +31,7 @@ import {
   fmtCountdown,
   blockBar,
   buildAgentQuotaSummary,
+  enrichUnifiedReasoning,
 } from "./ai-usage-tui.mjs";
 
 const HOUR_MS = 3600000;
@@ -63,6 +66,75 @@ test("buildCodexQuota: limited -> local retry time, countdown, no stale bars", (
   assert.match(q.note, /en ~/); // incluye countdown
 });
 
+test("buildCodexQuota: Codex 0.144 labels a 10080-minute primary window as weekly", () => {
+  const q = buildCodexQuota({}, {}, {
+    ok: true,
+    rateLimits: {
+      limitId: "codex",
+      primary: { usedPercent: 5, windowDurationMins: 10080, resetsAt: 1784487595 },
+      secondary: null,
+      planType: "plus",
+    },
+    rateLimitResetCredits: { availableCount: 3, credits: [] },
+  });
+  assert.strictEqual(q.windows.length, 1);
+  assert.strictEqual(q.windows[0].label, "semana");
+  assert.strictEqual(q.windows[0].windowMinutes, 10080);
+  assert.strictEqual(q.windows[0].usedPercent, 5);
+  assert.strictEqual(q.resetCredits.availableCount, 3);
+  assert.match(q.note, /app-server/);
+});
+
+test("normalizeCodexRateLimitEntry: accepts camelCase app-server fields", () => {
+  const entry = normalizeCodexRateLimitEntry({
+    limitId: "codex",
+    primary: { usedPercent: 20, windowDurationMins: 300, resetsAt: 1780000000 },
+    secondary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: 1780500000 },
+    credits: { hasCredits: true, unlimited: false, balance: "10" },
+    planType: "plus",
+  });
+  assert.strictEqual(entry.primary.window_minutes, 300);
+  assert.strictEqual(entry.secondary.window_minutes, 10080);
+  assert.strictEqual(entry.credits.has_credits, true);
+  assert.strictEqual(entry.plan_type, "plus");
+  assert.strictEqual(codexWindowLabel(300, "primary"), "5h");
+  assert.strictEqual(codexWindowLabel(10080, "secondary"), "semana");
+});
+
+test("buildCodexQuota: includes an app-server individual spend limit", () => {
+  const q = buildCodexQuota({}, {}, {
+    ok: true,
+    rateLimits: {
+      limitId: "codex",
+      primary: { usedPercent: 10, windowDurationMins: 300 },
+      individualLimit: { limit: "100", used: "25", remainingPercent: 75, resetsAt: 1780500000 },
+    },
+  });
+  const individual = q.windows.find((window) => window.sourceWindow === "individual");
+  assert.ok(individual);
+  assert.strictEqual(individual.usedPercent, 25);
+  assert.strictEqual(individual.remainingPercent, 75);
+  assert.strictEqual(individual.limitText, "100");
+});
+
+test("buildCodexQuota: authoritative top-level limit overrides optimistic numeric windows", () => {
+  const q = buildCodexQuota({}, {}, {
+    ok: true,
+    limited: true,
+    retryText: "in 2 hours",
+    rateLimits: {
+      limitId: "codex",
+      primary: { usedPercent: 50, windowDurationMins: 300 },
+      secondary: { usedPercent: 30, windowDurationMins: 10080 },
+    },
+  });
+  assert.strictEqual(q.available, false);
+  assert.strictEqual(q.limited, true);
+  assert.strictEqual(q.effectiveRemainingPercent, 0);
+  assert.deepEqual(q.limitingGroups, ["codex"]);
+  assert(q.windows.every((window) => window.status === "rate-limited"));
+});
+
 test("normalizeTotals: basic inputs with cache tokens", () => {
   const result = normalizeTotals({
     inputTokens: 100,
@@ -77,6 +149,22 @@ test("normalizeTotals: basic inputs with cache tokens", () => {
   assert.strictEqual(result.cacheReadTokens, 5);
   assert.strictEqual(result.totalTokens, 165); // input + output + cache creation + cache read
   assert.strictEqual(result.effectiveTokens, 160); // input + output + cacheCreation
+});
+
+test("normalizeTotals: ccusage v20 reasoning is metadata already included in output", () => {
+  const result = normalizeTotals({
+    inputTokens: 100,
+    outputTokens: 50,
+    reasoningOutputTokens: 20,
+    cacheCreationTokens: 10,
+    cacheReadTokens: 5,
+    totalTokens: 165,
+    costUSD: 0.25,
+  });
+  assert.strictEqual(result.reasoningOutputTokens, 20);
+  assert.strictEqual(result.totalTokens, 165);
+  assert.strictEqual(result.effectiveTokens, 160);
+  assert.strictEqual(result.totalCost, 0.25);
 });
 
 test("normalizeTotals: empty object defaults to zero", () => {
@@ -106,12 +194,14 @@ test("sumRows: aggregates numeric fields across rows", () => {
     {
       inputTokens: 10,
       outputTokens: 5,
+      reasoningOutputTokens: 3,
       totalTokens: 15,
       totalCost: 0.01,
     },
     {
       inputTokens: 20,
       outputTokens: 15,
+      reasoningOutputTokens: 7,
       totalTokens: 35,
       totalCost: 0.02,
     },
@@ -120,6 +210,7 @@ test("sumRows: aggregates numeric fields across rows", () => {
 
   assert.strictEqual(result.inputTokens, 30);
   assert.strictEqual(result.outputTokens, 20);
+  assert.strictEqual(result.reasoningOutputTokens, 10);
   assert.strictEqual(result.totalTokens, 50);
   assert.strictEqual(result.totalCost, 0.03);
 });
@@ -135,6 +226,7 @@ test("extractModels: from row.models object", () => {
       "claude-3-5": {
         inputTokens: 50,
         outputTokens: 25,
+        reasoningOutputTokens: 12,
         totalTokens: 75,
       },
       "gpt-4": { inputTokens: 30, outputTokens: 20, totalTokens: 50 },
@@ -148,6 +240,7 @@ test("extractModels: from row.models object", () => {
   assert.strictEqual(result.length, 2);
   assert(result.some((m) => m.modelName === "claude-3-5"));
   assert(result.some((m) => m.modelName === "gpt-4"));
+  assert.strictEqual(result.find((m) => m.modelName === "claude-3-5").reasoningOutputTokens, 12);
 });
 
 test("extractModels: from row.modelsUsed single entry", () => {
@@ -206,6 +299,39 @@ test("mergeModels: aggregates models by name", () => {
   assert.strictEqual(claude.totalTokens, 125);
 });
 
+test("enrichUnifiedReasoning: fills ccusage all totals and matching Codex models", () => {
+  const sources = {
+    all: {
+      totals: { effectiveTokens: 100, reasoningOutputTokens: 0 },
+      models: [
+        { modelName: "gpt-5", effectiveTokens: 60, reasoningOutputTokens: 0 },
+        { modelName: "MiniMax-M3", effectiveTokens: 40, reasoningOutputTokens: 0 },
+      ],
+    },
+    codex: {
+      totals: { reasoningOutputTokens: 25 },
+      models: [{ modelName: "gpt-5", reasoningOutputTokens: 25 }],
+    },
+    opencode: {
+      totals: { effectiveTokens: 40, reasoningOutputTokens: 0 },
+      models: [{ modelName: "MiniMax-M3", effectiveTokens: 40, reasoningOutputTokens: 0 }],
+    },
+    opencodeLive: {
+      data: { totalReasoning: 10, reasoningByModel: { "minimax-m3": 10 } },
+    },
+  };
+  enrichUnifiedReasoning(sources);
+  assert.strictEqual(sources.all.totals.reasoningOutputTokens, 35);
+  assert.strictEqual(sources.all.totals.effectiveTokens, 110);
+  assert.strictEqual(sources.all.models[0].reasoningOutputTokens, 25);
+  assert.strictEqual(sources.all.models[0].effectiveTokens, 60);
+  assert.strictEqual(sources.all.models[1].reasoningOutputTokens, 10);
+  assert.strictEqual(sources.all.models[1].effectiveTokens, 50);
+  assert.strictEqual(sources.opencode.totals.reasoningOutputTokens, 10);
+  assert.strictEqual(sources.opencode.totals.effectiveTokens, 50);
+  assert.strictEqual(sources.opencode.models[0].reasoningOutputTokens, 10);
+});
+
 test("buildTokenQuota: creates quota with configured-tokens kind", () => {
   const result = buildTokenQuota(
     "test-source",
@@ -243,6 +369,29 @@ test("parseClaudeUsageOutput: empty text returns no windows", () => {
 
   assert(Array.isArray(result.windows));
   assert.strictEqual(result.windows.length, 0);
+});
+
+test("parseClaudeUsageOutput: preserves a model-specific Fable weekly quota", () => {
+  const result = parseClaudeUsageOutput([
+    "Current session: 10% used · resets Jul 12, 8:49pm (UTC)",
+    "Current week (all models): 94% used · resets Jul 13, 9:59am (UTC)",
+    "Current week (Fable): 15% used · resets Jul 13, 9:59am (UTC)",
+  ].join("\n"));
+  assert.deepEqual(result.windows.map((window) => window.key), ["session", "week_all", "week_fable"]);
+  assert.deepEqual(result.windows.map((window) => window.label), ["sesion", "semana", "Fable"]);
+});
+
+test("buildClaudeQuota: migrates cached Fable entries that were mislabeled as global", () => {
+  const q = buildClaudeQuota({}, {}, {}, {
+    ok: true,
+    windows: [
+      { key: "week_all", label: "semana", rawLabel: "week (all models)", usedPercent: 10, remainingPercent: 90 },
+      { key: "week_all", label: "semana", rawLabel: "week (Fable)", usedPercent: 100, remainingPercent: 0 },
+    ],
+  });
+  assert.deepEqual(q.windows.map((window) => window.key), ["week_all", "week_fable"]);
+  assert.deepEqual(q.windows.map((window) => window.label), ["semana", "Fable"]);
+  assert.strictEqual(q.available, true);
 });
 
 test("claudeWindowKey: returns string key from label", () => {
@@ -399,6 +548,112 @@ test("buildMiniMaxQuota: model_remains -> per-model 5h/sem windows with used = 1
   assert.strictEqual(week.usedPercent, 70);
 });
 
+test("buildMiniMaxQuota: status 3 models are unavailable, not 100% free", () => {
+  const q = buildMiniMaxQuota({
+    ok: true,
+    model_remains: [
+      {
+        model_name: "general",
+        current_interval_status: 1,
+        current_interval_remaining_percent: 74,
+        current_weekly_status: 1,
+        current_weekly_remaining_percent: 38,
+      },
+      {
+        model_name: "video",
+        current_interval_status: 3,
+        current_interval_remaining_percent: 100,
+        current_weekly_status: 3,
+        current_weekly_remaining_percent: 100,
+      },
+    ],
+  });
+  assert.deepEqual(q.windows.map((window) => window.model), ["general", "general"]);
+  assert.deepEqual(q.unavailableModels, ["video"]);
+});
+
+test("buildMiniMaxQuota: active non-text interval is labeled daily", () => {
+  const q = buildMiniMaxQuota({
+    ok: true,
+    model_remains: [{
+      model_name: "video",
+      current_interval_status: 1,
+      current_interval_remaining_percent: 75,
+      current_weekly_status: 3,
+    }],
+  });
+  assert.strictEqual(q.windows[0].label, "video dia");
+  assert.strictEqual(q.windows[0].windowType, "daily");
+  assert.strictEqual(q.windows[0].windowMinutes, 1440);
+});
+
+test("buildMiniMaxQuota: null status and remaining fields stay unknown", () => {
+  const q = buildMiniMaxQuota({
+    ok: true,
+    model_remains: [{
+      model_name: "general",
+      current_interval_status: null,
+      current_interval_remaining_percent: null,
+      current_weekly_status: null,
+      current_weekly_remaining_percent: null,
+    }],
+  });
+  assert.deepEqual(q.windows, []);
+  assert(!Array.isArray(q.unavailableModels) || !q.unavailableModels.includes("general"));
+  assert.strictEqual(q.available, false);
+});
+
+test("buildGeminiQuota: provider stays available when one model bucket has quota", () => {
+  const q = buildGeminiQuota({}, {}, {
+    ok: true,
+    usedPercent: 40,
+    remainingPercent: 60,
+    modelQuotas: [
+      { model: "Pro", usedPercent: 100, remainingPercent: 0 },
+      { model: "Flash", usedPercent: 20, remainingPercent: 80 },
+    ],
+  });
+  assert.strictEqual(q.available, true);
+  assert.strictEqual(q.limited, false);
+  assert.deepEqual(q.unavailableModels, ["Pro"]);
+  assert.deepEqual(q.availableGroups, ["Flash"]);
+});
+
+test("buildGeminiQuota: all model buckets exhausted blocks the provider", () => {
+  const q = buildGeminiQuota({}, {}, {
+    ok: true,
+    usedPercent: 40,
+    remainingPercent: 60,
+    modelQuotas: [
+      { model: "Pro", usedPercent: 100, remainingPercent: 0 },
+      { model: "Flash", usedPercent: 100, remainingPercent: 0 },
+    ],
+  });
+  assert.strictEqual(q.available, false);
+  assert.strictEqual(q.limited, true);
+  assert.strictEqual(q.effectiveRemainingPercent, 0);
+});
+
+test("buildGeminiQuota: model-only captures remain usable without a fake global window", () => {
+  const q = buildGeminiQuota({}, {}, {
+    ok: true,
+    usedPercent: null,
+    remainingPercent: null,
+    modelQuotas: [
+      { model: "Pro", usedPercent: 100, remainingPercent: 0 },
+      { model: "Flash", usedPercent: null, remainingPercent: 75 },
+    ],
+  });
+  assert.strictEqual(q.ok, true);
+  assert.strictEqual(q.available, true);
+  assert.strictEqual(q.usedPercent, null);
+  assert.strictEqual(q.remainingPercent, null);
+  assert.deepEqual(q.windows.map((window) => window.model), ["Pro", "Flash"]);
+  assert.deepEqual(q.windows.map((window) => window.usedPercent), [100, 25]);
+  assert.deepEqual(q.availableGroups, ["Flash"]);
+  assert.deepEqual(q.unavailableModels, ["Pro"]);
+});
+
 test("buildOpenCodeQuota: serverOverride uses override values (source=server), not local data", () => {
   const q = buildOpenCodeQuota(
     { ok: true, data: { cost5h: 99, costWeek: 99, costMonth: 99 } },
@@ -426,6 +681,70 @@ test("buildOpenCodeQuota: local path computes windows from db costs (source=loca
   assert(w5);
   assert.strictEqual(w5.source, "local");
   assert.strictEqual(w5.usedPercent, 50);
+});
+
+test("buildOpenCodeQuota: an exhausted monthly window blocks the provider", () => {
+  const q = buildOpenCodeQuota(
+    { ok: true, data: { cost5h: 0, costWeek: 1, costMonth: 60 } },
+    {},
+    {
+      ok: true,
+      windows: [
+        { key: "5h", label: "5 horas", usedPercent: 0, remainingPercent: 100 },
+        { key: "week", label: "semanal", usedPercent: 15, remainingPercent: 85 },
+        { key: "month", label: "mensual", usedPercent: 100, remainingPercent: 0 },
+      ],
+    },
+  );
+  assert.strictEqual(q.limited, true);
+  assert.strictEqual(q.available, false);
+  assert.strictEqual(q.effectiveRemainingPercent, 0);
+  assert.deepEqual(q.limitingWindows, ["mensual"]);
+  assert.match(q.note, /LIMITE ALCANZADO \(mensual\)/);
+});
+
+test("buildOpenCodeQuota: an incomplete server capture never claims availability", () => {
+  const q = buildOpenCodeQuota({ ok: true, data: {} }, {}, {
+    ok: true,
+    windows: [{ key: "5h", label: "5 horas", usedPercent: 10, remainingPercent: 90 }],
+  });
+  assert.strictEqual(q.ok, true);
+  assert.strictEqual(q.available, false);
+  assert.strictEqual(q.incomplete, true);
+  assert.deepEqual(q.missingWindows, ["semanal", "mensual"]);
+  assert.match(q.note, /Cuota incompleta/);
+});
+
+test("buildOpenCodeQuota: old manual override is marked stale", () => {
+  const q = buildOpenCodeQuota(
+    { ok: true, data: {} },
+    {
+      fiveHourCost: 12,
+      weeklyCost: 30,
+      monthlyCost: 60,
+      serverOverride: {
+        enabled: true,
+        fiveHourUsed: 1,
+        weeklyUsed: 2,
+        monthlyUsed: 3,
+        capturedAt: new Date(Date.now() - 13 * HOUR_MS).toISOString(),
+      },
+    },
+  );
+  assert.strictEqual(q.stale, true);
+});
+
+test("buildOpenCodeQuota: manual override without capturedAt has unknown freshness", () => {
+  const q = buildOpenCodeQuota(
+    { ok: true, data: {} },
+    {
+      fiveHourCost: 12,
+      serverOverride: { enabled: true, fiveHourUsed: 1, capturedAt: null },
+    },
+  );
+  assert.strictEqual(q.stale, true);
+  assert.strictEqual(q.observedAt, null);
+  assert.match(q.note, /capturedAt desconocido/);
 });
 
 test("buildCodexQuota: configured-tokens path when rate limits disabled", () => {
@@ -483,6 +802,37 @@ test("buildAntigravityQuota: live buckets -> detected-percent with used = (1-rem
   assert(!w.label.includes("-preview"), `label should not include "-preview", got: ${w.label}`);
 });
 
+test("buildAntigravityQuota: API buckets are alternative models and offered models do not imply quota", () => {
+  const q = buildAntigravityQuota(
+    { installed: true, models: ["gemini-3-pro-preview", "claude-sonnet-4-5"] },
+    {},
+    {
+      ok: true,
+      buckets: [
+        { modelId: "gemini-3-pro-preview", remainingFraction: 0, tokenType: "REQUESTS" },
+        { modelId: "gemini-2.5-flash", remainingFraction: 0.7, tokenType: "REQUESTS" },
+      ],
+    },
+  );
+  assert.strictEqual(q.available, true);
+  assert.strictEqual(q.limited, false);
+  assert.strictEqual(q.windows.length, 2);
+  assert.deepEqual(q.availableGroups, ["gemini-2.5-flash"]);
+  assert.deepEqual(q.unavailableModels, ["gemini-3-pro-preview"]);
+  assert.deepEqual(q.offeredModels, ["claude-sonnet-4-5"]);
+  assert(!q.windows.some((window) => window.model === "claude-sonnet-4-5"));
+});
+
+test("buildAntigravityQuota: null API fractions stay unknown instead of exhausted", () => {
+  const q = buildAntigravityQuota({ installed: true }, {}, {
+    ok: true,
+    buckets: [{ modelId: "gemini-unknown", remainingFraction: null, tokenType: "REQUESTS" }],
+  });
+  assert.deepEqual(q.windows, []);
+  assert.strictEqual(q.available, false);
+  assert.strictEqual(q.limited, false);
+});
+
 test("buildAntigravityQuota: live preferred over config manual", () => {
   const live = {
     ok: true,
@@ -534,6 +884,37 @@ test("parseOpenCodeServerUsage: extrae rolling/weekly/monthly", () => {
 test("parseOpenCodeServerUsage: HTML vacío -> ok false", () => {
   const result = parseOpenCodeServerUsage("<html></html>");
   assert.strictEqual(result.ok, false);
+});
+
+test("parseOpenCodeServerUsage: reset stays paired when Rolling is absent", () => {
+  const html = '<span data-slot="usage-label">Weekly Usage</span><span data-slot="usage-value">52%</span><span data-slot="reset-time">Resets in 2 days 6 hours</span><span data-slot="usage-label">Monthly Usage</span><span data-slot="usage-value">26%</span><span data-slot="reset-time">Resets in 5 days</span>';
+  const result = parseOpenCodeServerUsage(html);
+  assert.deepEqual(result.windows.map((window) => window.key), ["week", "month"]);
+  assert.strictEqual(result.windows[0].resetText, "2 days 6 hours");
+  assert.strictEqual(result.windows[1].resetText, "5 days");
+});
+
+test("parseOpenCodeServerUsage: prefers SolidStart rate-limited state", () => {
+  const html = 'rollingUsage:$R[1]={status:"ok",resetInSec:18000,usagePercent:0},weeklyUsage:$R[2]={status:"ok",resetInSec:10720,usagePercent:15},monthlyUsage:$R[3]={status:"rate-limited",resetInSec:429857,usagePercent:100}';
+  const result = parseOpenCodeServerUsage(html);
+  assert.strictEqual(result.format, "solid-state");
+  assert.strictEqual(result.windows.length, 3);
+  const monthly = result.windows.find((window) => window.key === "month");
+  assert.strictEqual(monthly.status, "rate-limited");
+  assert.strictEqual(monthly.remainingPercent, 0);
+});
+
+test("parseOpenCodeServerUsage: merges partial SolidStart data with HTML windows", () => {
+  const html = [
+    'rollingUsage:$R[1]={status:"ok",resetInSec:18000,usagePercent:0}',
+    '<span data-slot="usage-label">Weekly Usage</span><span data-slot="usage-value">15%</span>',
+    '<span data-slot="usage-label">Monthly Usage</span><span data-slot="usage-value">100%</span>',
+  ].join("");
+  const result = parseOpenCodeServerUsage(html);
+  assert.strictEqual(result.complete, true);
+  assert.strictEqual(result.format, "solid-state+html");
+  assert.deepEqual(result.windows.map((window) => window.key), ["5h", "week", "month"]);
+  assert.strictEqual(result.windows.find((window) => window.key === "month").remainingPercent, 0);
 });
 
 test("parseResetDuration: '2 days 6 hours' -> Date ~ +54h", () => {
@@ -623,6 +1004,8 @@ test("buildAgentQuotaSummary: aplana windows con resetInSeconds", () => {
   const future = new Date(Date.now() + 3600*1000);
   const snap = { since:"2026-06-19", quotas: { codex: { ok:true, kind:"detected-percent", windows:[{ label:"5h", usedPercent:80, remainingPercent:20, reset: future }], note:"n" } } };
   const out = buildAgentQuotaSummary(snap);
+  assert.strictEqual(out.schemaVersion, 2);
+  assert.match(out.appVersion, /^0\.11\./);
   assert(typeof out.capturedAt === "string");
   assert.strictEqual(out.providers.codex.ok, true);
   assert.strictEqual(out.providers.codex.windows[0].usedPercent, 80);
@@ -633,10 +1016,42 @@ test("buildAgentQuotaSummary: aplana windows con resetInSeconds", () => {
 });
 
 test("buildAgentQuotaSummary: window sin reset -> resetInSeconds null", () => {
-  const snap = { quotas: { minimax: { ok:true, kind:"detected-percent", windows:[{ label:"5h", usedPercent:0, remainingPercent:100 }], note:"" } } };
+  const snap = { quotas: { minimax: { ok:true, kind:"detected-percent", windows:[{ label:"5h", usedPercent:0, remainingPercent:100, windowMinutes:null, status:null, used:null, remaining:null, limit:null }], note:"" } } };
   const out = buildAgentQuotaSummary(snap);
   assert.strictEqual(out.providers.minimax.windows[0].resetInSeconds, null);
   assert.strictEqual(out.providers.minimax.windows[0].resetAt, null);
+  for (const key of ["windowMinutes", "status", "used", "remaining", "limit"]) {
+    assert(!(key in out.providers.minimax.windows[0]), `${key} should stay absent when unknown`);
+  }
+});
+
+test("buildAgentQuotaSummary: unknown percentages stay null and configured counts do not imply availability", () => {
+  const out = buildAgentQuotaSummary({ quotas: {
+    gemini: {
+      ok: true,
+      kind: "configured-requests",
+      windows: [{ label: "modelo", usedPercent: null, remainingPercent: null }],
+      effectiveRemainingPercent: null,
+      note: "",
+    },
+  } });
+  assert.strictEqual(out.providers.gemini.windows[0].usedPercent, null);
+  assert.strictEqual(out.providers.gemini.windows[0].remainingPercent, null);
+  assert.strictEqual(out.providers.gemini.available, false);
+  assert(!("effectiveRemainingPercent" in out.providers.gemini));
+});
+
+test("buildAgentQuotaSummary: preserves Codex credit balances", () => {
+  const out = buildAgentQuotaSummary({ quotas: { codex: {
+    ok: true,
+    kind: "detected-credits",
+    windows: [],
+    creditsList: [{ limitId: "codex", planType: "plus", has_credits: true, unlimited: false, balance: "12.5" }],
+    note: "",
+  } } });
+  assert.deepEqual(out.providers.codex.creditBalances, [{
+    limitId: "codex", planType: "plus", hasCredits: true, unlimited: false, balance: "12.5",
+  }]);
 });
 
 test("buildAgentQuotaSummary: snapshot vacío -> providers {}", () => {

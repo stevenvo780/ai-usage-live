@@ -25,7 +25,8 @@ Filtros opcionales:
 
 Notas:
   - Lee datos locales de Claude Code, Codex CLI, Gemini CLI y OpenCode con ccusage.
-  - ai-usage-live ademas lee cuota restante con Claude /usage, Gemini /stats model, MiniMax API y OpenCode Go DB.
+  - ai-usage-live ademas lee cuotas con Claude /usage, Codex app-server, Gemini /stats model,
+    Antigravity /usage, MiniMax Token Plan y el estado web/DB de OpenCode Go.
   - Los costos son estimaciones locales, no facturacion oficial.
   - Las cuotas reales de plan/API pueden requerir mirar el panel oficial de cada proveedor.
 EOF

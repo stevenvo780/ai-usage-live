@@ -110,11 +110,17 @@ def capture(keys, wait_after_keys=2, total_timeout=20, env_overrides=None):
     if pid == 0:
         ensure_fake_ccusage()
         env = os.environ.copy()
+        env["HOME"] = str(TEST_CONFIG_HOME)
         env["XDG_CONFIG_HOME"] = str(TEST_CONFIG_HOME)
         env["PATH"] = f"{FAKE_BIN}:{env.get('PATH', '')}"
         env.setdefault("AI_USAGE_CLAUDE_LIVE", "0")
+        env.setdefault("AI_USAGE_CODEX_LIVE", "0")
+        env.setdefault("AI_USAGE_CODEX_PROBE", "0")
         env.setdefault("AI_USAGE_GEMINI_LIVE", "0")
+        env.setdefault("AI_USAGE_ANTIGRAVITY_LIVE", "0")
         env.setdefault("AI_USAGE_MINIMAX_LIVE", "0")
+        env.setdefault("AI_USAGE_OPENCODE_LIVE", "0")
+        env.setdefault("AI_USAGE_OPENCODE_WEB", "0")
         env.setdefault("MINIMAX_USAGE_CACHE_MINUTES", "999")
         if env_overrides:
             env.update({key: str(value) for key, value in env_overrides.items()})
@@ -204,7 +210,7 @@ def run_live_refresh_test():
     write_mock(80, 80)
     with SequencedMiniMaxServer([(80, 80), (30, 30)]) as server:
         frame = capture(
-            [(3.0, "r")],
+            [(1.0, "m"), (1.2, "\r"), (3.0, "r")],
             wait_after_keys=5,
             total_timeout=25,
             env_overrides={
@@ -223,7 +229,7 @@ def run_live_refresh_test():
 
     print("\n--- verificaciones ---")
     checks = [
-        ("30% queda", "30% queda" in frame),
+        ("70% usado", "70% usado" in frame),
         ("API llamada al menos 2 veces", request_count >= 2),
     ]
     for label, found in checks:
@@ -240,15 +246,15 @@ def main():
         results.append(run_test(
             "Cuotas tab con 50% MiniMax",
             (50, 50),
-            [],
+            [(1.0, "m"), (1.2, "\r")],
             [
                 "MiniMax",
                 "general 5h",
                 "general sem",
-                "video 5h",
+                "video dia",
                 "video sem",
-                "50% queda",
-                "reset",  # que aparezca el reset
+                "50% usado",
+                "↻",  # que aparezca el reset
             ]
         ))
     
@@ -275,7 +281,7 @@ def main():
         results.append(run_test(
             "Cuotas tab no muestra modelos de ccusage mezclados",
             (50, 50),
-            [],
+            [(1.0, "m"), (1.2, "\r")],
             [
                 "MiniMax",
                 "general 5h",
