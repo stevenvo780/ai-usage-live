@@ -32,6 +32,10 @@ import {
   blockBar,
   buildAgentQuotaSummary,
   enrichUnifiedReasoning,
+  classifyProviderAvailability,
+  isProviderVisible,
+  windowModelKey,
+  isModelVisible,
 } from "./ai-usage-tui.mjs";
 
 const HOUR_MS = 3600000;
@@ -1005,7 +1009,7 @@ test("buildAgentQuotaSummary: aplana windows con resetInSeconds", () => {
   const snap = { since:"2026-06-19", quotas: { codex: { ok:true, kind:"detected-percent", windows:[{ label:"5h", usedPercent:80, remainingPercent:20, reset: future }], note:"n" } } };
   const out = buildAgentQuotaSummary(snap);
   assert.strictEqual(out.schemaVersion, 2);
-  assert.match(out.appVersion, /^0\.11\./);
+  assert.match(out.appVersion, /^\d+\.\d+\.\d+/);
   assert(typeof out.capturedAt === "string");
   assert.strictEqual(out.providers.codex.ok, true);
   assert.strictEqual(out.providers.codex.windows[0].usedPercent, 80);
@@ -1057,4 +1061,138 @@ test("buildAgentQuotaSummary: preserves Codex credit balances", () => {
 test("buildAgentQuotaSummary: snapshot vacío -> providers {}", () => {
   const out = buildAgentQuotaSummary({});
   assert.deepEqual(out.providers, {});
+});
+
+// ---------------------------------------------------------------------------
+// Visibilidad de proveedores/modelos (v0.12.0)
+// ---------------------------------------------------------------------------
+
+test("classifyProviderAvailability: needsAuth -> unauthenticated", () => {
+  assert.equal(classifyProviderAvailability({ needsAuth: true, ok: false, windows: [] }), "unauthenticated");
+});
+
+test("classifyProviderAvailability: limited (autenticado) -> exhausted aunque no haya ventanas", () => {
+  assert.equal(classifyProviderAvailability({ ok: true, limited: true, windows: [] }), "exhausted");
+});
+
+test("classifyProviderAvailability: ventanas todas al 0% -> exhausted (visible)", () => {
+  assert.equal(classifyProviderAvailability({ ok: true, windows: [
+    { label: "mensual", remainingPercent: 0 },
+    { label: "semana", remainingPercent: 0 },
+  ] }), "exhausted");
+});
+
+test("classifyProviderAvailability: ventana con capacidad -> available", () => {
+  assert.equal(classifyProviderAvailability({ ok: true, windows: [
+    { label: "5h", remainingPercent: 46 },
+  ] }), "available");
+});
+
+test("classifyProviderAvailability: unusable+reason (sin datos) devuelve la razón", () => {
+  assert.equal(classifyProviderAvailability({ ok: false, unusable: true, reason: "not-installed", windows: [] }), "not-installed");
+  assert.equal(classifyProviderAvailability({ ok: false, unusable: true, reason: "not-configured", windows: [] }), "not-configured");
+});
+
+test("classifyProviderAvailability: disabled sin datos -> disabled", () => {
+  assert.equal(classifyProviderAvailability({ ok: false, disabled: true, windows: [] }), "disabled");
+});
+
+test("classifyProviderAvailability: ok:false sin razón (error transitorio) -> no-data (se mantiene visible)", () => {
+  assert.equal(classifyProviderAvailability({ ok: false, windows: [], note: "MiniMax API fallo: timeout" }), "no-data");
+  assert.equal(classifyProviderAvailability(null), "no-data");
+});
+
+test("isProviderVisible: auto-oculta no-usables pero mantiene agotados", () => {
+  const display = { hideUnusable: true, hiddenProviders: [], hiddenModels: [] };
+  assert.equal(isProviderVisible("gemini", { needsAuth: true, windows: [] }, display), false);
+  assert.equal(isProviderVisible("minimax", { unusable: true, reason: "not-configured", windows: [] }, display), false);
+  assert.equal(isProviderVisible("antigravity", { unusable: true, reason: "not-installed", windows: [] }, display), false);
+  // Agotado (autenticado, al límite) SIGUE visible:
+  assert.equal(isProviderVisible("codex", { ok: true, limited: true, windows: [] }, display), true);
+  assert.equal(isProviderVisible("opencode", { ok: true, windows: [{ label: "mes", remainingPercent: 0 }] }, display), true);
+  // Con capacidad, visible:
+  assert.equal(isProviderVisible("claude", { ok: true, windows: [{ label: "5h", remainingPercent: 54 }] }, display), true);
+});
+
+test("isProviderVisible: hideUnusable=false no oculta nada por disponibilidad", () => {
+  const display = { hideUnusable: false, hiddenProviders: [], hiddenModels: [] };
+  assert.equal(isProviderVisible("gemini", { needsAuth: true, windows: [] }, display), true);
+});
+
+test("isProviderVisible: hiddenProviders oculta aunque tenga cuota; revealHidden lo fuerza visible", () => {
+  const display = { hideUnusable: true, hiddenProviders: ["minimax"], hiddenModels: [] };
+  const withData = { ok: true, windows: [{ label: "5h", remainingPercent: 80 }] };
+  assert.equal(isProviderVisible("minimax", withData, display), false);
+  assert.equal(isProviderVisible("minimax", withData, display, true), true); // modo "ver ocultos"
+  assert.equal(isProviderVisible("claude", withData, display), true);
+});
+
+test("windowModelKey: normaliza a 'provider:modelkey' desde model/family/key/label", () => {
+  assert.equal(windowModelKey("claude", { model: "Claude Sonnet" }), "claude:claude-sonnet");
+  assert.equal(windowModelKey("antigravity", { family: "gpt" }), "antigravity:gpt");
+  assert.equal(windowModelKey("minimax", { key: "weekly_MiniMax-M3" }), "minimax:weekly_minimax-m3");
+  assert.equal(windowModelKey("codex", { label: "5h" }), "codex:5h");
+  assert.equal(windowModelKey("x", {}), null);
+  assert.equal(windowModelKey("x", null), null);
+});
+
+test("isModelVisible: oculta la ventana cuyo token está en hiddenModels", () => {
+  const display = { hiddenModels: ["claude:claude-sonnet"] };
+  assert.equal(isModelVisible("claude", { model: "Claude Sonnet" }, display), false);
+  assert.equal(isModelVisible("claude", { model: "Claude Opus" }, display), true);
+  assert.equal(isModelVisible("claude", { model: "Claude Sonnet" }, display, true), true); // revealHidden
+});
+
+test("buildAgentQuotaSummary: filtra proveedores no-usables y ocultos según display", () => {
+  const snap = {
+    quotaConfig: { display: { hideUnusable: true, hiddenProviders: ["minimax"], hiddenModels: [] } },
+    quotas: {
+      claude: { ok: true, windows: [{ label: "5h", remainingPercent: 54 }] },
+      gemini: { ok: false, needsAuth: true, windows: [] },
+      minimax: { ok: true, windows: [{ label: "5h", remainingPercent: 80 }] },
+      codex: { ok: true, limited: true, windows: [] },
+    },
+  };
+  const out = buildAgentQuotaSummary(snap);
+  assert.ok(out.providers.claude, "claude visible");
+  assert.ok(out.providers.codex, "codex agotado sigue visible");
+  assert.ok(!out.providers.gemini, "gemini needsAuth oculto");
+  assert.ok(!out.providers.minimax, "minimax oculto por hiddenProviders");
+});
+
+test("buildAgentQuotaSummary: AI_USAGE_SHOW_ALL=1 desactiva el filtro", () => {
+  const prev = process.env.AI_USAGE_SHOW_ALL;
+  process.env.AI_USAGE_SHOW_ALL = "1";
+  try {
+    const snap = {
+      quotaConfig: { display: { hideUnusable: true, hiddenProviders: ["minimax"], hiddenModels: [] } },
+      quotas: {
+        gemini: { ok: false, needsAuth: true, windows: [] },
+        minimax: { ok: true, windows: [{ label: "5h", remainingPercent: 80 }] },
+      },
+    };
+    const out = buildAgentQuotaSummary(snap);
+    assert.ok(out.providers.gemini, "con SHOW_ALL, gemini aparece");
+    assert.ok(out.providers.minimax, "con SHOW_ALL, minimax aparece");
+  } finally {
+    if (prev === undefined) delete process.env.AI_USAGE_SHOW_ALL;
+    else process.env.AI_USAGE_SHOW_ALL = prev;
+  }
+});
+
+test("buildAgentQuotaSummary: hiddenModels quita esa ventana del proveedor visible", () => {
+  const snap = {
+    quotaConfig: { display: { hideUnusable: true, hiddenProviders: [], hiddenModels: ["claude:sonnet"] } },
+    quotas: {
+      claude: { ok: true, windows: [
+        { label: "5h", key: "session", remainingPercent: 54 },
+        { label: "Sonnet", model: "sonnet", remainingPercent: 30 },
+      ] },
+    },
+  };
+  const out = buildAgentQuotaSummary(snap);
+  assert.ok(out.providers.claude, "claude visible");
+  const labels = out.providers.claude.windows.map((w) => w.label);
+  assert.ok(labels.includes("5h"), "ventana global permanece");
+  assert.ok(!labels.some((l) => /sonnet/i.test(l)), "ventana Sonnet oculta");
 });

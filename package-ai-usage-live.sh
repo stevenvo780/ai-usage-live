@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="${VERSION:-$(node -p "require(process.argv[1]).version" "$ROOT/package.json" 2>/dev/null || echo 0.11.0)}"
+VERSION="${VERSION:-$(node -p "require(process.argv[1]).version" "$ROOT/package.json" 2>/dev/null || echo 0.12.0)}"
 PKG_NAME="ai-usage-live"
 BUILD_DIR="$ROOT/build/${PKG_NAME}_${VERSION}_all"
 DIST_DIR="$ROOT/dist"

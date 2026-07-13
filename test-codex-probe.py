@@ -166,7 +166,7 @@ class RpcParsingTests(unittest.TestCase):
             "initialize", "initialized", "account/rateLimits/read",
         ])
         self.assertEqual(messages[0]["params"]["capabilities"], {})
-        self.assertEqual(messages[0]["params"]["clientInfo"]["version"], "0.11.0")
+        self.assertEqual(messages[0]["params"]["clientInfo"]["version"], PROBE._app_version())
         self.assertNotIn("id", messages[1])
         self.assertEqual(popen.call_args.args[0], [
             "codex", "app-server", "--listen", "stdio://",

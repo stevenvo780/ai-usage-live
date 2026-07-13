@@ -6,16 +6,23 @@
 // Uso en un cliente MCP (Claude Code, etc.):
 //   { "mcpServers": { "ai-usage": { "command": "ai-usage-mcp" } } }
 // o bien: { "command": "node", "args": ["/opt/ai-usage-live/ai-usage-mcp.mjs"] }
+//
+// El output respeta el filtro de visibilidad de quotas.json `display` (oculta
+// proveedores no-usables o elegidos por el usuario). `AI_USAGE_SHOW_ALL=1` lo desactiva.
 import process from "node:process";
 import { APP_VERSION, runQuotaSnapshot } from "./ai-usage-tui.mjs";
 
+// Defensa: cualquier console.log accidental en el codigo de coleccion iria a stdout y
+// corromperia el stream JSON-RPC. Lo redirigimos a stderr por si acaso.
+console.log = (...args) => process.stderr.write(`${args.join(" ")}\n`);
+
 const SERVER = { name: "ai-usage-live", version: APP_VERSION };
 const LATEST_PROTOCOL_VERSION = "2025-11-25";
+// Solo versiones sin batch y con outputSchema/structuredContent/annotations, para no
+// prometer soporte de batch (removido en 2025-06-18) ni emitir campos fuera de version.
 const SUPPORTED_PROTOCOL_VERSIONS = new Set([
   LATEST_PROTOCOL_VERSION,
   "2025-06-18",
-  "2025-03-26",
-  "2024-11-05",
 ]);
 const QUOTA_OUTPUT_SCHEMA = {
   type: "object",
@@ -109,7 +116,8 @@ const TOOLS = [
       "Antigravity [Gemini + Claude/GPT], MiniMax, OpenCode Go). Por cada proveedor da una " +
       "lista de ventanas con usedPercent, remainingPercent y resetInSeconds, para que un " +
       "agente elija un proveedor/modelo con cuota disponible. No recibe argumentos. La " +
-      "primera llamada puede tardar (consulta los CLIs en vivo); luego usa cache.",
+      "primera llamada puede tardar (consulta los CLIs en vivo); luego usa cache. Oculta " +
+      "proveedores no-usables/elegidos en quotas.json display; AI_USAGE_SHOW_ALL=1 los incluye.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     outputSchema: QUOTA_OUTPUT_SCHEMA,
     annotations: {
@@ -135,6 +143,16 @@ function replyError(id, code, message) {
   send({ jsonrpc: "2.0", id: id ?? null, error: { code, message } });
 }
 
+// Single-flight: una unica captura en vuelo; los tools/call concurrentes se agrupan sobre
+// ella en vez de estampidar los CLIs. Se libera al terminar para que el proximo refresque.
+let snapshotInFlight = null;
+function getSnapshot() {
+  if (!snapshotInFlight) {
+    snapshotInFlight = runQuotaSnapshot().finally(() => { snapshotInFlight = null; });
+  }
+  return snapshotInFlight;
+}
+
 async function handle(msg) {
   const { id, method, params } = msg || {};
   switch (method) {
@@ -156,10 +174,10 @@ async function handle(msg) {
         replyError(id, -32602, `Unknown tool: ${params?.name}`);
         return;
       }
+      // get_ai_quotas no acepta argumentos; null/ausente/{} son equivalentes a "sin args".
       const callArguments = params?.arguments;
-      if (callArguments !== undefined && (
-        !callArguments
-        || typeof callArguments !== "object"
+      if (callArguments !== undefined && callArguments !== null && (
+        typeof callArguments !== "object"
         || Array.isArray(callArguments)
         || Object.keys(callArguments).length > 0
       )) {
@@ -167,7 +185,7 @@ async function handle(msg) {
         return;
       }
       try {
-        const data = await runQuotaSnapshot();
+        const data = await getSnapshot();
         reply(id, {
           content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
           structuredContent: data,
@@ -183,20 +201,26 @@ async function handle(msg) {
     case "ping":
       reply(id, {});
       return;
+    case "notifications/cancelled":
+    case "notifications/initialized":
+      // Notificaciones sin id: no requieren respuesta. La captura es idempotente y con
+      // cache, asi que una cancelacion no necesita abortar CLIs a mitad de camino.
+      return;
     default:
-      // Las notificaciones (sin id) se ignoran; metodos desconocidos con id -> error.
+      // Notificaciones (sin id) se ignoran; metodos desconocidos con id -> error.
       if (id !== undefined && id !== null) replyError(id, -32601, `Method not found: ${method}`);
   }
 }
 
-let buffer = "";
-let pending = Promise.resolve();
-
-function enqueue(message) {
-  pending = pending.then(() => handle(message)).catch((error) => {
+// Cada mensaje se despacha de forma independiente (no en una cola serial): asi un ping,
+// initialize o tools/list se responde de inmediato aunque haya un tools/call lento en vuelo.
+function dispatch(message) {
+  Promise.resolve().then(() => handle(message)).catch((error) => {
     process.stderr.write(`ai-usage-mcp: ${error?.message || String(error)}\n`);
   });
 }
+
+let buffer = "";
 
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -213,15 +237,32 @@ process.stdin.on("data", (chunk) => {
       replyError(null, -32700, "Parse error");
       continue;
     }
-    if (!msg || typeof msg !== "object" || Array.isArray(msg) || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
+    if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
+      // Arrays (batch) no se soportan en las versiones negociadas; primitivos son invalidos.
+      replyError(null, -32600, "Invalid Request");
+      continue;
+    }
+    if (msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
+      // Un mensaje sin method que trae result/error es una RESPUESTA: se ignora en silencio
+      // (este server nunca inicia requests, no debe existir, y no se responde a una respuesta).
+      if (msg.method === undefined && ("result" in msg || "error" in msg)) continue;
       replyError(msg && typeof msg === "object" ? (msg.id ?? null) : null, -32600, "Invalid Request");
       continue;
     }
-    enqueue(msg);
+    dispatch(msg);
   }
 });
-process.stdin.on("end", () => {
-  pending.finally(() => process.exit(0));
-});
+
+// Cierre limpio: al terminar stdin dejamos de leer y permitimos que el event loop drene la
+// escritura pendiente (evita truncar la ultima respuesta). Un snapshot en vuelo mantiene vivo
+// el proceso hasta responder; luego sale solo.
+function softShutdown() {
+  process.exitCode = 0;
+  try { process.stdin.pause(); } catch { /* noop */ }
+}
+process.stdin.on("end", softShutdown);
+// EPIPE al cerrar el cliente el pipe es un cierre normal, no un crash.
+process.stdout.on("error", () => process.exit(0));
+process.stdin.on("error", () => process.exit(0));
 process.on("SIGINT", () => process.exit(0));
 process.on("SIGTERM", () => process.exit(0));

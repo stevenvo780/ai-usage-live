@@ -1,12 +1,13 @@
 # ai-usage-live
 
-Dashboard de terminal para consultar consumo y cuotas de Claude Code, Codex CLI, Gemini CLI, Antigravity, MiniMax y OpenCode Go desde una sola TUI. La version actual es **0.11.0**.
+Dashboard de terminal para consultar consumo y cuotas de Claude Code, Codex CLI, Gemini CLI, Antigravity, MiniMax y OpenCode Go desde una sola TUI. La version actual es **0.12.0**.
 
 ## Funciones
 
 - Panel interactivo tipo btop con una tarjeta y una vista detallada por proveedor.
 - Consulta en vivo de las cuotas que expone cada CLI o servicio, con cache local y marca de frescura.
 - Semantica de disponibilidad adaptada a cada empresa: ventanas obligatorias, familias o modelos alternativos y estados explicitos de limite.
+- Auto-oculta los proveedores no-usables (sin autenticar, no instalados o no configurados) y permite ocultar/mostrar proveedores y modelos a mano; el filtro se aplica igual a la TUI, `--json` y el MCP.
 - Consumo local por modelo y tokens efectivos mediante `ccusage`, con `reasoningOutputTokens` visible sin duplicarlo dentro de la salida de Codex.
 - Salida `--json` y servidor MCP para que otros agentes puedan elegir un proveedor con capacidad real.
 - Fallbacks locales o manuales cuando un proveedor no expone la cuota en vivo.
@@ -20,11 +21,11 @@ Dashboard de terminal para consultar consumo y cuotas de Claude Code, Codex CLI,
 
 ## Instalacion
 
-### Paquete Debian 0.11.0
+### Paquete Debian 0.12.0
 
 ```bash
 bash package-ai-usage-live.sh
-sudo dpkg -i dist/ai-usage-live_0.11.0_all.deb
+sudo dpkg -i dist/ai-usage-live_0.12.0_all.deb
 ```
 
 El paquete instala `ai-usage-live`, `ai-usage`, `ai-usage-quota` y `ai-usage-mcp` en el `PATH`.
@@ -57,11 +58,35 @@ ai-usage-quota edit                 # Editar limites y credenciales
 q salir
 r refrescar y forzar consultas en vivo
 tab cambiar de pestana
-flechas navegar por la cuadricula
+flechas navegar por la cuadricula (en el detalle, arriba/abajo mueven el cursor de modelo)
 enter abrir el detalle del proveedor
 esc volver a la cuadricula
 c Claude, x Codex, g Gemini, v Antigravity, m MiniMax, o OpenCode
+h ocultar/mostrar el proveedor (grid) o el modelo (detalle) seleccionado
+H ver/gestionar los ocultos (revela con marca [oculto] para des-ocultarlos)
 ```
+
+## Visibilidad de proveedores y modelos
+
+`ai-usage-live` no lista lo que no podes usar. Un proveedor se **auto-oculta** cuando no tiene una cuenta usable: no autenticado (`needsAuth`), CLI/helper no instalado, o no configurado/suscrito. En cambio, un proveedor **agotado** (autenticado pero al limite) permanece visible, porque saber que esta sin cuota es informacion util. Un `disabled` (probe en vivo apagado por env/config) tampoco se oculta: no es "sin cuenta".
+
+Ademas podes ocultar/mostrar a mano proveedores enteros o modelos concretos con la tecla `h`, y revisar los ocultos con `H`. La seleccion se guarda en `quotas.json` bajo `display` y persiste entre reinicios:
+
+```json
+{
+  "display": {
+    "hideUnusable": true,
+    "hiddenProviders": ["minimax"],
+    "hiddenModels": ["claude:week_opus", "antigravity:claude/gpt"]
+  }
+}
+```
+
+- `hideUnusable` (default `true`) activa el auto-ocultamiento de no-usables. Ponelo en `false` para ver siempre todos.
+- `hiddenProviders` son ids de proveedor (`claude`, `codex`, `gemini`, `antigravity`, `minimax`, `opencode`).
+- `hiddenModels` usa el token `"<proveedor>:<modelKey>"`, donde `modelKey` se deriva del modelo/familia/clave de la ventana (minusculas). La forma mas simple de agregarlo es pararte en la fila en el detalle y pulsar `h`.
+
+El filtro se aplica de forma **uniforme** a la cuadricula, `--json` y el MCP `get_ai_quotas`. Para que un agente reciba el set completo sin filtrar, exporta `AI_USAGE_SHOW_ALL=1`.
 
 ## Disponibilidad por proveedor
 
@@ -197,15 +222,22 @@ La ruta de la base se resuelve con `opencode db path`; `OPENCODE_DB_PATH` permit
       "resetMonth": null,
       "capturedAt": null
     }
+  },
+  "display": {
+    "hideUnusable": true,
+    "hiddenProviders": [],
+    "hiddenModels": []
   }
 }
 ```
 
-Los campos manuales son fallbacks. No sustituyen una lectura en vivo valida salvo `opencode.serverOverride.enabled: true`.
+Los campos manuales son fallbacks. No sustituyen una lectura en vivo valida salvo `opencode.serverOverride.enabled: true`. El bloque `display` controla la visibilidad (ver "Visibilidad de proveedores y modelos"); la TUI lo reescribe al usar `h`/`H` sin tocar el resto del archivo.
 
 ## Servidor MCP
 
-`ai-usage-mcp` es un servidor Model Context Protocol sin dependencias externas que usa JSON-RPC 2.0 por stdio. Negocia MCP `2025-11-25` y mantiene compatibilidad con `2025-06-18`, `2025-03-26` y `2024-11-05`.
+`ai-usage-mcp` es un servidor Model Context Protocol sin dependencias externas que usa JSON-RPC 2.0 por stdio. Negocia MCP `2025-11-25` y `2025-06-18` (ambas versiones incluyen `outputSchema`/`structuredContent` y no usan batch). Los mensajes de protocolo (`initialize`, `tools/list`, `ping`) se responden de inmediato aunque un `get_ai_quotas` lento este consultando los CLIs; las llamadas concurrentes comparten una unica captura en vuelo.
+
+El output respeta el filtro de visibilidad de `quotas.json` `display` (oculta proveedores no-usables o elegidos por el usuario). Exporta `AI_USAGE_SHOW_ALL=1` para recibir el set completo sin filtrar.
 
 ### Registro
 
@@ -244,7 +276,7 @@ Ejemplo abreviado de `structuredContent`:
 ```json
 {
   "schemaVersion": 2,
-  "appVersion": "0.11.0",
+  "appVersion": "0.12.0",
   "capturedAt": "2026-07-12T12:00:00.000Z",
   "providers": {
     "opencode": {
@@ -287,6 +319,7 @@ La primera llamada puede tardar porque consulta los CLI; las siguientes aprovech
 |---|---|---|
 | `REFRESH_SEC` | `10` | Intervalo de refresco de la TUI |
 | `AI_USAGE_TZ` | zona del sistema | Zona IANA usada para mostrar reinicios |
+| `AI_USAGE_SHOW_ALL` | sin valor | `1` desactiva el filtro de visibilidad en `--json` y el MCP (devuelve todos los proveedores) |
 | `AI_USAGE_CLAUDE_LIVE` | `1` | `0` desactiva `claude /usage` |
 | `AI_USAGE_CODEX_LIVE` | `1` | `0` desactiva la lectura oficial de Codex app-server |
 | `CODEX_USAGE_CACHE_SECONDS` | `60` | Cache de cuotas de Codex app-server |

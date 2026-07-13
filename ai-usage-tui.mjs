@@ -97,6 +97,8 @@ const state = {
   error: "",
   selectedModel: 0,
   cardIndex: 0,
+  detailModelIndex: 0, // cursor de modelo dentro del detalle (indexa la lista aplanada de ventanas)
+  revealHidden: false, // modo "ver ocultos" (H): muestra tarjetas/modelos ocultos sin desocultarlos
   detail: false,
   once: args.once,
   json: args.json,
@@ -105,6 +107,9 @@ const state = {
 let ccusageCommand = null;
 let refreshTimer = null;
 let pendingRefresh = null;
+// Copia en memoria del bloque `display` de quotas.json; las teclas h/H la mutan y
+// saveDisplayConfig() la vuelca a disco. hiddenModels usa el token "provider:modelKey".
+let displayConfig = { hideUnusable: true, hiddenProviders: [], hiddenModels: [] };
 
 const INVOKED_DIRECTLY =
   Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
@@ -129,6 +134,8 @@ async function main() {
     else console.log(renderPlainSummary(state.lastSnapshot));
     return;
   }
+
+  loadDisplayConfig(state.lastSnapshot?.quotaConfig?.display);
 
   process.stdout.write(ALT_ON + HIDE_CURSOR);
   process.stdin.setRawMode(true);
@@ -188,6 +195,7 @@ Opciones:
 Teclas:
   q salir, r refrescar, 1 daily, 2 weekly, 3 monthly, 4 session, 5 blocks
   a todos, c Claude, x Codex, g Gemini, v Antigravity, m MiniMax, o OpenCode, flechas mover modelo
+  h ocultar proveedor/modelo seleccionado, H ver/gestionar ocultos (cuotas)
 `);
 }
 
@@ -703,6 +711,14 @@ function defaultQuotaConfig() {
         note: "Pega aqui los valores reales de opencode.ai/auth (cost en USD y resets ISO). Pon capturedAt (ISO) al pegar para ver la frescura. Cuando enabled=true, reemplaza el estimado local.",
       },
     },
+    display: {
+      // Visibilidad de la TUI/--json/MCP. hideUnusable auto-oculta proveedores sin cuenta
+      // usable (no-auth/no-instalado/no-configurado). hiddenProviders/hiddenModels son la
+      // seleccion manual (tecla h en la TUI). Los modelos usan el token "provider:modelKey".
+      hideUnusable: true,
+      hiddenProviders: [],
+      hiddenModels: [],
+    },
   };
 }
 
@@ -720,6 +736,38 @@ function loadQuotaConfig() {
     return merged;
   } catch {
     return { ...defaults, configPath: QUOTA_CONFIG_PATH, created: false, error: "No pude leer quotas.json" };
+  }
+}
+
+// Semilla el `displayConfig` global desde el bloque `display` ya fusionado de quotas.json.
+function loadDisplayConfig(display) {
+  const defaults = { hideUnusable: true, hiddenProviders: [], hiddenModels: [] };
+  if (!display || typeof display !== "object") { displayConfig = defaults; return; }
+  displayConfig = {
+    hideUnusable: display.hideUnusable !== false,
+    hiddenProviders: Array.isArray(display.hiddenProviders) ? [...display.hiddenProviders] : [],
+    hiddenModels: Array.isArray(display.hiddenModels) ? [...display.hiddenModels] : [],
+  };
+}
+
+// Persiste SOLO el bloque `display` en quotas.json. Re-lee el archivo crudo para nunca
+// pisar credenciales ni otros bloques (ni los campos runtime configPath/created/error).
+function saveDisplayConfig() {
+  try {
+    if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+    let parsed = {};
+    if (existsSync(QUOTA_CONFIG_PATH)) {
+      try { parsed = JSON.parse(readFileSync(QUOTA_CONFIG_PATH, "utf8")) || {}; } catch { parsed = {}; }
+    }
+    parsed.display = {
+      hideUnusable: displayConfig.hideUnusable !== false,
+      hiddenProviders: [...displayConfig.hiddenProviders],
+      hiddenModels: [...displayConfig.hiddenModels],
+    };
+    writeFileSync(QUOTA_CONFIG_PATH, `${JSON.stringify(parsed, null, 2)}\n`, { mode: 0o600 });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -779,8 +827,91 @@ function groupedQuotaAvailability(windows, groupField) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Visibilidad de proveedores/modelos (v0.12.0)
+//
+// Regla: un proveedor se auto-oculta SOLO si no tiene datos usables (ni ventanas,
+// ni escalares, ni bloque activo) Y su razon es "sin cuenta" (no autenticado / no
+// instalado / no configurado). Un proveedor AGOTADO (autenticado, al limite) o con
+// un error transitorio permanece visible. `disabled` (live-probe apagado) tampoco
+// se auto-oculta: no es "sin cuenta" y ocultarlo seria un footgun (p.ej. Claude).
+// El filtro se aplica de forma uniforme a la TUI, --json y el MCP; `AI_USAGE_SHOW_ALL=1`
+// lo desactiva para agentes que quieran el set completo.
+// ---------------------------------------------------------------------------
+
+const AUTO_HIDE_REASONS = new Set(["unauthenticated", "not-installed", "not-configured"]);
+
+function quotaHasData(quota) {
+  if (!quota) return false;
+  const windows = Array.isArray(quota.windows) ? quota.windows : [];
+  if (windows.length > 0) return true;
+  if (finiteNumberOrNull(quota.remainingPercent) !== null) return true;
+  if (finiteNumberOrNull(quota.usedPercent) !== null) return true;
+  if (Array.isArray(quota.creditsList) && quota.creditsList.length > 0) return true;
+  if (quota.activeBlock) return true;
+  return false;
+}
+
+function classifyProviderAvailability(quota) {
+  if (!quota) return "no-data";
+  if (quota.needsAuth) return "unauthenticated";
+  if (quota.limited) return "exhausted"; // autenticado pero al limite -> visible
+  if (quotaHasData(quota)) {
+    const windows = Array.isArray(quota.windows) ? quota.windows : [];
+    const numeric = windows
+      .map((w) => finiteNumberOrNull(w.remainingPercent))
+      .filter((v) => v !== null);
+    const scalar = finiteNumberOrNull(quota.remainingPercent);
+    const allWindowsExhausted = numeric.length > 0 && numeric.every((v) => v <= 0);
+    if (quota.available === false || allWindowsExhausted || (numeric.length === 0 && scalar !== null && scalar <= 0)) {
+      return "exhausted";
+    }
+    return "available";
+  }
+  if (quota.unusable && typeof quota.reason === "string" && quota.reason) return quota.reason;
+  if (quota.disabled) return "disabled";
+  return "no-data";
+}
+
+function isProviderVisible(provider, quota, display = {}, revealHidden = false) {
+  if (revealHidden) return true;
+  const hiddenProviders = Array.isArray(display.hiddenProviders) ? display.hiddenProviders : [];
+  if (hiddenProviders.includes(provider)) return false;
+  if (display.hideUnusable !== false && AUTO_HIDE_REASONS.has(classifyProviderAvailability(quota))) return false;
+  return true;
+}
+
+function windowModelKey(provider, window) {
+  if (!window) return null;
+  const raw = window.model || window.family || window.key || window.label;
+  if (!raw) return null;
+  const norm = String(raw).toLowerCase().trim().replace(/\s+/g, "-");
+  return norm ? `${provider}:${norm}` : null;
+}
+
+function isModelVisible(provider, window, display = {}, revealHidden = false) {
+  if (revealHidden) return true;
+  const hiddenModels = Array.isArray(display.hiddenModels) ? display.hiddenModels : [];
+  if (!hiddenModels.length) return true;
+  const key = windowModelKey(provider, window);
+  return !(key && hiddenModels.includes(key));
+}
+
+// Propaga la razon de "cuenta no usable" desde el resultado de captura (collect) al
+// quota final, SOLO cuando el quota no tiene datos utiles. Asi un agotado (con barras)
+// o un error transitorio nunca se marca no-usable por accidente.
+function annotateUnusable(quota, source) {
+  if (!quota || quotaHasData(quota)) return quota;
+  if (source?.needsAuth && !quota.needsAuth) quota.needsAuth = true;
+  if (source?.unusable && typeof source.reason === "string" && !quota.unusable) {
+    quota.unusable = true;
+    quota.reason = source.reason;
+  }
+  return quota;
+}
+
 function buildQuotaState(sources, config) {
-  return {
+  const quotas = {
     configPath: config.configPath,
     codex: buildCodexQuota(sources.codex, config.codex, sources.codexLive),
     claude: buildClaudeQuota(sources.claude, sources.claudeBlocks, config.claude, sources.claudeLive),
@@ -789,6 +920,14 @@ function buildQuotaState(sources, config) {
     opencode: buildOpenCodeQuota(sources.opencodeLive, config.opencode, sources.opencodeServer),
     antigravity: buildAntigravityQuota(sources.antigravity, config.antigravity, sources.antigravityLive),
   };
+  // Propaga la razon de no-usable desde cada captura en vivo al quota final.
+  annotateUnusable(quotas.claude, sources.claudeLive);
+  annotateUnusable(quotas.codex, sources.codexLive);
+  annotateUnusable(quotas.gemini, sources.geminiLive);
+  annotateUnusable(quotas.antigravity, sources.antigravityLive);
+  annotateUnusable(quotas.minimax, sources.minimax);
+  annotateUnusable(quotas.opencode, sources.opencodeLive);
+  return quotas;
 }
 
 function fmtTimeInTz(date, tz) {
@@ -1459,6 +1598,8 @@ function buildMiniMaxQuota(usage, config = {}) {
         kind: "unknown",
         ok: false,
         available: false,
+        unusable: true,
+        reason: "not-configured",
         windows: [],
         unavailableModels,
         observedAt: usage.capturedAt || null,
@@ -1537,12 +1678,12 @@ function pickAntigravityProject(projects) {
   return values[0] || null;
 }
 
-function staleAntigravityQuota(note) {
+function staleAntigravityQuota(note, reason = null) {
   const stale = readJsonSafe(ANTIGRAVITY_QUOTA_CACHE_PATH);
   if (stale?.ok) {
     return { ...stale, cacheHit: true, cacheStale: true, note: `${note} Usando cache.` };
   }
-  return { source: "antigravity", ok: false, note };
+  return { source: "antigravity", ok: false, note, ...(reason ? { unusable: true, reason } : {}) };
 }
 
 function parseRefreshShort(text) {
@@ -1611,7 +1752,7 @@ async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false } 
   const tokenRaw = readJsonSafe(ANTIGRAVITY_TOKEN_PATH);
   const accessToken = tokenRaw?.token?.access_token || tokenRaw?.access_token;
   if (!accessToken) {
-    return staleAntigravityQuota("No encuentro token de Antigravity (~/.gemini/antigravity-cli/antigravity-oauth-token).");
+    return staleAntigravityQuota("No encuentro token de Antigravity (~/.gemini/antigravity-cli/antigravity-oauth-token).", "not-configured");
   }
 
   const project = pickAntigravityProject(readJsonSafe(ANTIGRAVITY_PROJECTS_PATH));
@@ -1756,7 +1897,7 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
   }
 
   if (!installed && !(live && live.ok === false && live.note)) {
-    return { source: "antigravity", kind: "unknown", ok: false, note: "Antigravity no instalado (no encuentro antigravity/agy)." };
+    return { source: "antigravity", kind: "unknown", ok: false, unusable: true, reason: "not-installed", note: "Antigravity no instalado (no encuentro antigravity/agy)." };
   }
 
   // 2) Fallback: limites manuales en quotas.json.
@@ -2023,7 +2164,7 @@ async function collectCodexLive(config = {}, { ignoreCache = false } = {}) {
   if (process.env.AI_USAGE_CODEX_LIVE === "0" || config?.liveUsage === false) {
     return { ok: false, disabled: true, note: "Codex app-server desactivado." };
   }
-  if (!commandExists("codex")) return { ok: false, note: "codex no instalado." };
+  if (!commandExists("codex")) return { ok: false, unusable: true, reason: "not-installed", note: "codex no instalado." };
   const legacyCacheMinutes = Number(process.env.CODEX_PROBE_CACHE_MINUTES ?? config.probeCacheMinutes ?? 1);
   const cacheSeconds = Number(process.env.CODEX_USAGE_CACHE_SECONDS ?? config.liveUsageCacheSeconds ?? legacyCacheMinutes * 60);
   if (!ignoreCache) {
@@ -2031,7 +2172,7 @@ async function collectCodexLive(config = {}, { ignoreCache = false } = {}) {
     if (cached) return { ...cached, cacheHit: true };
   }
   const helper = path.join(SCRIPT_DIR, "codex-probe.py");
-  if (!existsSync(helper)) return { ok: false, note: "falta codex-probe.py." };
+  if (!existsSync(helper)) return { ok: false, unusable: true, reason: "not-installed", note: "falta codex-probe.py." };
   try {
     const { stdout } = await execFileAsync("python3", [helper], {
       encoding: "utf8",
@@ -2119,7 +2260,7 @@ async function collectClaudeUsageLive(config = {}, { ignoreCache = false } = {})
   }
 
   if (!commandExists("claude")) {
-    return { source: "claude", ok: false, note: "No encuentro el comando claude." };
+    return { source: "claude", ok: false, unusable: true, reason: "not-installed", note: "No encuentro el comando claude." };
   }
 
   try {
@@ -2257,12 +2398,12 @@ async function collectGeminiQuotaLive(config = {}, { ignoreCache = false } = {})
   }
 
   if (!commandExists("gemini")) {
-    return { source: "gemini", ok: false, note: "No encuentro el comando gemini." };
+    return { source: "gemini", ok: false, unusable: true, reason: "not-installed", note: "No encuentro el comando gemini." };
   }
 
   const helper = path.join(SCRIPT_DIR, "gemini-quota-capture.py");
   if (!existsSync(helper)) {
-    return { source: "gemini", ok: false, note: "Falta gemini-quota-capture.py." };
+    return { source: "gemini", ok: false, unusable: true, reason: "not-installed", note: "Falta gemini-quota-capture.py." };
   }
 
   const timeoutSeconds = Math.max(10, Number(config.liveCaptureTimeoutSeconds || 45));
@@ -2343,6 +2484,8 @@ async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false } =
     return {
       source: "minimax",
       ok: false,
+      unusable: true,
+      reason: "not-configured",
       note: "MINIMAX_API_KEY no definida. Define la env var o agrega minimax.apiKey en quotas.json (ai-usage-quota edit).",
     };
   }
@@ -2657,7 +2800,7 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
 
   const dbPath = resolveOpenCodeDbPath();
   if (!existsSync(dbPath)) {
-    return { source: "opencode", ok: false, note: "No encuentro opencode.db; corre opencode al menos una vez." };
+    return { source: "opencode", ok: false, unusable: true, reason: "not-installed", note: "No encuentro opencode.db; corre opencode al menos una vez." };
   }
 
   try {
@@ -2989,6 +3132,8 @@ function handleKey(key) {
   else if (key === "v") setSource("antigravity");
   else if (key === "m") setSource("minimax");
   else if (key === "o") setSource("opencode");
+  else if (key === "h") onHideToggle();
+  else if (key === "H") onRevealToggle();
   else if (key === "\x1b[A") onArrow("up");
   else if (key === "\x1b[B") onArrow("down");
   else if (key === "\x1b[C") onArrow("right");
@@ -3003,21 +3148,70 @@ function onArrow(dir) {
     else if (dir === "down") moveModel(1);
     return;
   }
-  // Cuotas: grid o detalle — flechas mueven la tarjeta seleccionada.
+  // Cuotas: en detalle, arriba/abajo mueven el cursor de modelo; izq/der cambian de tarjeta.
+  if (state.detail) {
+    if (dir === "up") moveDetailModel(-1);
+    else if (dir === "down") moveDetailModel(1);
+    else moveCard(dir === "left" ? -1 : 1);
+    return;
+  }
+  // Grid: flechas mueven la tarjeta seleccionada (dentro del set VISIBLE).
   if (dir === "up" || dir === "left") moveCard(-1);
   else moveCard(1);
 }
 
+// Proveedores mostrados en el grid: en modo "ver ocultos" (H) van todos; si no, se aplica
+// el filtro (auto-oculta no-usables + hiddenProviders del usuario).
+function visibleProviders() {
+  if (state.revealHidden) return PROVIDER_ORDER.slice();
+  const quotas = state.lastSnapshot?.quotas || {};
+  return PROVIDER_ORDER.filter((p) => isProviderVisible(p, quotas[p], displayConfig, false));
+}
+
+function reconcileCardIndex() {
+  const n = visibleProviders().length;
+  if (n === 0) { state.cardIndex = 0; return; }
+  if (state.cardIndex > n - 1) state.cardIndex = n - 1;
+  if (state.cardIndex < 0) state.cardIndex = 0;
+}
+
+// Lista aplanada de ventanas del detalle en el MISMO orden que las pinta drawQuotaDetail
+// (familias por orden de insercion en Map), tras aplicar el filtro de modelos ocultos.
+function detailWindowList(quota, provider) {
+  const ws = (Array.isArray(quota?.windows) ? quota.windows : [])
+    .filter((w) => isModelVisible(provider, w, displayConfig, state.revealHidden));
+  if (!ws.some((w) => w.family)) return ws;
+  const groups = new Map();
+  for (const w of ws) {
+    const fam = w.family || "default";
+    if (!groups.has(fam)) groups.set(fam, []);
+    groups.get(fam).push(w);
+  }
+  return [...groups.values()].flat();
+}
+
 function moveCard(delta) {
-  const n = PROVIDER_ORDER.length;
+  const order = visibleProviders();
+  const n = order.length;
   if (!n) return;
   state.cardIndex = (((state.cardIndex + delta) % n) + n) % n;
+  state.detailModelIndex = 0; // cambiar de proveedor resetea el cursor de modelo
+  render();
+}
+
+function moveDetailModel(delta) {
+  const order = visibleProviders();
+  const provider = order[state.cardIndex];
+  const list = detailWindowList(state.lastSnapshot?.quotas?.[provider], provider);
+  if (!list.length) { state.detailModelIndex = 0; return; }
+  state.detailModelIndex = Math.max(0, Math.min(list.length - 1, state.detailModelIndex + delta));
   render();
 }
 
 function onEnter() {
   if (state.tab !== "cuotas") return;
   state.detail = !state.detail;
+  state.detailModelIndex = 0;
   render();
 }
 
@@ -3032,6 +3226,42 @@ function toggleTab() {
   const idx = TAB_KEYS.indexOf(state.tab);
   state.tab = TAB_KEYS[(idx + 1) % TAB_KEYS.length];
   state.detail = false;
+  state.detailModelIndex = 0;
+  render();
+}
+
+// h: oculta/muestra el proveedor seleccionado (grid) o el modelo seleccionado (detalle).
+function onHideToggle() {
+  if (state.tab !== "cuotas") return;
+  const provider = visibleProviders()[state.cardIndex];
+  if (!provider) return;
+  if (state.detail) {
+    const list = detailWindowList(state.lastSnapshot?.quotas?.[provider], provider);
+    const key = windowModelKey(provider, list[state.detailModelIndex]);
+    if (!key) return;
+    const i = displayConfig.hiddenModels.indexOf(key);
+    if (i >= 0) displayConfig.hiddenModels.splice(i, 1);
+    else displayConfig.hiddenModels.push(key);
+    saveDisplayConfig();
+    const newLen = detailWindowList(state.lastSnapshot?.quotas?.[provider], provider).length;
+    if (state.detailModelIndex > newLen - 1) state.detailModelIndex = Math.max(0, newLen - 1);
+  } else {
+    const i = displayConfig.hiddenProviders.indexOf(provider);
+    if (i >= 0) displayConfig.hiddenProviders.splice(i, 1);
+    else displayConfig.hiddenProviders.push(provider);
+    saveDisplayConfig();
+    reconcileCardIndex();
+    // No dejar el grid completamente vacio: si todo queda oculto, entra en modo "ver ocultos".
+    if (!state.revealHidden && visibleProviders().length === 0) state.revealHidden = true;
+  }
+  render();
+}
+
+// H: alterna el modo "ver ocultos" (revela tarjetas/modelos ocultos con marca, sin desocultarlos).
+function onRevealToggle() {
+  if (state.tab !== "cuotas") return;
+  state.revealHidden = !state.revealHidden;
+  reconcileCardIndex();
   render();
 }
 
@@ -3044,7 +3274,7 @@ function setView(view) {
 function setSource(source) {
   state.source = source;
   state.selectedModel = 0;
-  const idx = PROVIDER_ORDER.indexOf(source);
+  const idx = visibleProviders().indexOf(source);
   if (idx >= 0) state.cardIndex = idx;
   render();
 }
@@ -3096,8 +3326,8 @@ function draw(width, height) {
   lines.push(hr(width));
   const helpText = state.tab === "cuotas"
     ? (state.detail
-        ? `${colors.gray}\u2191\u2193\u2190\u2192 navegar \u00B7 esc volver \u00B7 tab consumo \u00B7 r refrescar \u00B7 q salir${RESET}`
-        : `${colors.gray}\u2191\u2193\u2190\u2192 navegar \u00B7 enter detalle \u00B7 tab consumo \u00B7 r refrescar \u00B7 q salir${RESET}`)
+        ? `${colors.gray}\u2191\u2193 modelo \u00B7 \u2190\u2192 proveedor \u00B7 h ocultar \u00B7 H ver ocultos \u00B7 esc volver \u00B7 tab consumo \u00B7 q salir${RESET}`
+        : `${colors.gray}\u2191\u2193\u2190\u2192 navegar \u00B7 enter detalle \u00B7 h ocultar \u00B7 H ver ocultos \u00B7 tab consumo \u00B7 r refrescar \u00B7 q salir${RESET}`)
     : `${colors.gray}\u2191\u2193\u2190\u2192 modelos \u00B7 1-5 vista \u00B7 a/c/x/v/m/o fuente \u00B7 tab cuotas \u00B7 r refrescar \u00B7 q salir${RESET}`;
   lines.push(fit(helpText, width));
   return lines.slice(0, height);
@@ -3105,30 +3335,41 @@ function draw(width, height) {
 
 function drawQuotaTab(width, maxHeight, snap) {
   const quotas = (snap && snap.quotas) || {};
-  const selected = PROVIDER_ORDER[state.cardIndex] || PROVIDER_ORDER[0];
+  const order = visibleProviders();
+  const selected = order[state.cardIndex] || order[0];
 
   let lines;
   if (state.detail) {
-    lines = drawQuotaDetail(width, selected, quotas[selected]);
+    lines = selected ? drawQuotaDetail(width, selected, quotas[selected]) : [];
   } else {
-    lines = drawQuotaGrid(width, maxHeight, quotas, selected);
+    lines = drawQuotaGrid(width, maxHeight, quotas, order, selected);
   }
   const cap = Math.max(1, Number(maxHeight) || 1);
   return lines.slice(0, cap);
 }
 
-function drawQuotaGrid(width, maxHeight, quotas, selected) {
+function drawQuotaGrid(width, maxHeight, quotas, order, selected) {
   const gap = 2;
   const targetW = 52; // tarjetas ~el doble de anchas; las columnas se adaptan al ancho
   const cols = Math.max(1, Math.floor((width + gap) / (targetW + gap)));
   const cardW = Math.max(30, Math.floor((width - (cols - 1) * gap) / cols));
 
-  const cardList = PROVIDER_ORDER.map((provider) =>
-    renderQuotaCard(cardW, provider, quotas[provider], provider === selected),
+  const hiddenCount = displayConfig.hiddenProviders.length;
+  const footer = hiddenCount > 0
+    ? `${colors.gray}oculto: ${hiddenCount} · h gestiona · H ${state.revealHidden ? "vuelve a ocultar" : "revela"}${RESET}`
+    : null;
+  const rowCap = Math.max(1, (Number(maxHeight) || order.length * 6) - (footer ? 1 : 0));
+
+  const out = [];
+  if (!order.length) {
+    out.push(fit(`${colors.gray} Todo oculto o no-usable. Pulsa H para revelar los proveedores ocultos.${RESET}`, width));
+    return out;
+  }
+
+  const cardList = order.map((provider) =>
+    renderQuotaCard(cardW, provider, quotas[provider], provider === selected, displayConfig.hiddenProviders.includes(provider)),
   );
 
-  const rowCap = Math.max(1, Number(maxHeight) || cardList.length * 6);
-  const out = [];
   for (let i = 0; i < cardList.length; i += cols) {
     if (out.length >= rowCap) break;
     const rowCards = cardList.slice(i, i + cols);
@@ -3146,10 +3387,11 @@ function drawQuotaGrid(width, maxHeight, quotas, selected) {
       out.push(fit(parts.join(" ".repeat(gap)), width));
     }
   }
+  if (footer) out.push(fit(footer, width));
   return out;
 }
 
-function renderQuotaCard(cardW, provider, quota, selected) {
+function renderQuotaCard(cardW, provider, quota, selected, hidden = false) {
   const meta = PROVIDER_META[provider] || { label: provider, color: colors.gray, icon: "?" };
   const inner = Math.max(4, cardW - 2);
   const lines = [];
@@ -3158,11 +3400,13 @@ function renderQuotaCard(cardW, provider, quota, selected) {
   // (Sin inverse: antes pintaba TODA la tarjeta seleccionada y se veia horrible.)
   const borderColor = selected ? `${colors.bold}${meta.color}` : colors.gray;
 
-  const headPrefix = ` ${meta.icon} ${meta.label} `;
+  const headPrefix = ` ${meta.icon} ${meta.label}${hidden ? " [oculto]" : ""} `;
   const headFill = Math.max(1, inner - visibleLength(headPrefix));
   lines.push(`${borderColor}\u250C${RESET}${meta.color}${headPrefix}${RESET}${borderColor}${"\u2500".repeat(headFill)}\u2510${RESET}`);
 
-  const windows = quota && quota.ok !== false && Array.isArray(quota.windows) ? quota.windows : [];
+  const windows = quota && quota.ok !== false && Array.isArray(quota.windows)
+    ? quota.windows.filter((w) => isModelVisible(provider, w, displayConfig, state.revealHidden))
+    : [];
   const bodyLine = (content) =>
     `${borderColor}\u2502${RESET}${fit(content, inner)}${borderColor}\u2502${RESET}`;
 
@@ -3234,7 +3478,9 @@ function drawQuotaDetail(width, provider, quota) {
     return lines;
   }
 
-  const windows = Array.isArray(quota.windows) ? quota.windows : [];
+  // Filtra modelos ocultos (en modo "ver ocultos" se muestran todos con marca).
+  const allWindows = Array.isArray(quota.windows) ? quota.windows : [];
+  const windows = allWindows.filter((w) => isModelVisible(provider, w, displayConfig, state.revealHidden));
   if (!windows.length) {
     lines.push(fit(` ${colors.gray}${truncate(String(quota.note || "sin datos"), Math.max(0, width - 2))}${RESET}`, width));
     return lines;
@@ -3243,6 +3489,14 @@ function drawQuotaDetail(width, provider, quota) {
   const barW = Math.max(8, Math.floor(width * 0.4));
   const hasFamily = windows.some((w) => w.family);
   const labelW = 28;
+  // El cursor de modelo indexa la lista APLANADA en el mismo orden que se pinta (ver detailWindowList).
+  let flatIdx = 0;
+  const emit = (w) => {
+    const selected = flatIdx === state.detailModelIndex;
+    const hidden = state.revealHidden && displayConfig.hiddenModels.includes(windowModelKey(provider, w));
+    flatIdx += 1;
+    lines.push(fit(detailQuotaLine(w, barW, labelW, selected, hidden), width));
+  };
 
   if (hasFamily) {
     const groups = new Map();
@@ -3251,33 +3505,29 @@ function drawQuotaDetail(width, provider, quota) {
       if (!groups.has(fam)) groups.set(fam, []);
       groups.get(fam).push(w);
     }
-    const order = [...groups.keys()]; // Map: preserva orden de insercion (Gemini primero)
-    for (const fam of order) {
-      const ws = groups.get(fam);
+    for (const fam of groups.keys()) { // Map: preserva orden de insercion (Gemini primero)
       const famLabel = fam === "gemini" ? "Gemini" : fam === "otros" ? "Otros" : fam;
       lines.push(fit(`${colors.bold}${colors.yellow} ${famLabel}${RESET}`, width));
-      for (const w of ws) {
-        lines.push(fit(detailQuotaLine(w, barW, labelW), width));
-      }
+      for (const w of groups.get(fam)) emit(w);
     }
   } else {
-    for (const w of windows) {
-      lines.push(fit(detailQuotaLine(w, barW, labelW), width));
-    }
+    for (const w of windows) emit(w);
   }
 
   return lines;
 }
 
-function detailQuotaLine(w, barW, labelW) {
+function detailQuotaLine(w, barW, labelW, selected = false, hidden = false) {
+  const cur = selected ? `${colors.cyan}\u276F${RESET}` : " ";
+  const tag = hidden ? ` ${colors.gray}[oculto]${RESET}` : "";
   const label = truncate(String(w.label || w.key || ""), labelW).padEnd(labelW);
   if (w.available) {
-    return ` ${label} ${colors.gray}\u2014 disponible (sin cuota expuesta por la API)${RESET}`;
+    return `${cur} ${label} ${colors.gray}\u2014 disponible (sin cuota expuesta por la API)${RESET}${tag}`;
   }
   const pct = fmtPct(w.usedPercent);
   const cd = w.reset ? fmtCountdown(w.reset) : (w.resetText ? shortText(w.resetText, 24) : "--");
   const bar = blockBar(w.usedPercent, barW, quotaColor(Number(w.remainingPercent)));
-  return ` ${label} ${bar} ${pct} usado  \u21BB ${cd}`;
+  return `${cur} ${label} ${bar} ${pct} usado  \u21BB ${cd}${tag}`;
 }
 
 function quotaSection(label, color, quota, barWidth, totalWidth) {
@@ -4171,10 +4421,17 @@ function buildAgentQuotaSummary(snap) {
     providers: {},
   };
   const quotas = snap?.quotas || {};
+  // Filtro de visibilidad (mismo que la TUI): oculta no-usables y los elegidos por el
+  // usuario en quotas.json `display`. `AI_USAGE_SHOW_ALL=1` lo desactiva para agentes.
+  const display = snap?.quotaConfig?.display || {};
+  const showAll = /^(1|true|yes|on)$/i.test(String(process.env.AI_USAGE_SHOW_ALL || ""));
   for (const provider of ["claude", "codex", "gemini", "antigravity", "minimax", "opencode"]) {
     const quota = quotas[provider];
     if (!quota) continue;
-    const windows = (Array.isArray(quota.windows) ? quota.windows : []).map((w) => {
+    if (!showAll && !isProviderVisible(provider, quota, display)) continue;
+    const windows = (Array.isArray(quota.windows) ? quota.windows : [])
+      .filter((w) => showAll || isModelVisible(provider, w, display))
+      .map((w) => {
       const resetValue = w.reset ?? w.resetAt ?? null;
       const resetDate = dateFromProviderValue(resetValue);
       const resetMs = resetDate ? resetDate.getTime() : NaN;
@@ -4292,6 +4549,11 @@ export {
   APP_VERSION,
   buildAgentQuotaSummary,
   runQuotaSnapshot,
+  classifyProviderAvailability,
+  isProviderVisible,
+  windowModelKey,
+  isModelVisible,
+  quotaHasData,
   normalizeTotals,
   sumRows,
   extractModels,
