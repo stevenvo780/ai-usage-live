@@ -247,6 +247,13 @@ async function refresh(options = {}) {
     state.error = error?.message || String(error);
   } finally {
     state.loading = false;
+    // El set visible pudo encogerse (un proveedor paso a needsAuth/not-installed) o el
+    // proveedor en detalle pudo perder ventanas: re-alinea los indices para que h/flechas
+    // no queden apuntando fuera de rango tras la captura.
+    reconcileCardIndex();
+    const selected = visibleProviders()[state.cardIndex];
+    const listLen = detailWindowList(state.lastSnapshot?.quotas?.[selected], selected).length;
+    if (state.detailModelIndex > listLen - 1) state.detailModelIndex = Math.max(0, listLen - 1);
     render();
     if (pendingRefresh) {
       const nextRefresh = pendingRefresh;
@@ -885,8 +892,17 @@ function isProviderVisible(provider, quota, display = {}, revealHidden = false) 
 
 function windowModelKey(provider, window) {
   if (!window) return null;
-  const raw = window.model || window.family || window.key || window.label;
-  if (!raw) return null;
+  // `key` es el identificador UNICO por ventana (MiniMax "weekly_general", Antigravity
+  // "Gemini-sem", Claude "week_opus"): usarlo primero evita que ocultar una fila arrastre a
+  // su hermana (misma familia/modelo, distinta ventana) y que se le quite al agente la
+  // ventana semanal por ocultar la diaria. Fallback: modelo/familia (+ tipo de ventana).
+  let raw = window.key;
+  if (!raw) {
+    const base = window.model || window.family || window.label;
+    if (!base) return null;
+    const disc = window.windowType || (window.windowMinutes != null ? `${window.windowMinutes}m` : "");
+    raw = disc ? `${base}-${disc}` : base;
+  }
   const norm = String(raw).toLowerCase().trim().replace(/\s+/g, "-");
   return norm ? `${provider}:${norm}` : null;
 }
@@ -904,6 +920,9 @@ function isModelVisible(provider, window, display = {}, revealHidden = false) {
 // o un error transitorio nunca se marca no-usable por accidente.
 function annotateUnusable(quota, source) {
   if (!quota || quotaHasData(quota)) return quota;
+  // Un limite configurado a mano por el usuario (kind "configured-*") es intencionalmente
+  // usable aunque el CLI en vivo falte: no lo marques no-usable ni lo auto-ocultes.
+  if (typeof quota.kind === "string" && quota.kind.startsWith("configured-")) return quota;
   if (source?.needsAuth && !quota.needsAuth) quota.needsAuth = true;
   if (source?.unusable && typeof source.reason === "string" && !quota.unusable) {
     quota.unusable = true;
@@ -3277,7 +3296,10 @@ function setSource(source) {
   state.source = source;
   state.selectedModel = 0;
   const idx = visibleProviders().indexOf(source);
-  if (idx >= 0) state.cardIndex = idx;
+  if (idx >= 0) {
+    state.cardIndex = idx;
+    state.detailModelIndex = 0; // cambiar de proveedor resetea el cursor de modelo del detalle
+  }
   render();
 }
 
@@ -4556,6 +4578,7 @@ export {
   windowModelKey,
   isModelVisible,
   quotaHasData,
+  annotateUnusable,
   normalizeTotals,
   sumRows,
   extractModels,

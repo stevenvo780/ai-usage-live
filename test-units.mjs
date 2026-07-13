@@ -36,6 +36,7 @@ import {
   isProviderVisible,
   windowModelKey,
   isModelVisible,
+  annotateUnusable,
 } from "./ai-usage-tui.mjs";
 
 const HOUR_MS = 3600000;
@@ -1195,4 +1196,46 @@ test("buildAgentQuotaSummary: hiddenModels quita esa ventana del proveedor visib
   const labels = out.providers.claude.windows.map((w) => w.label);
   assert.ok(labels.includes("5h"), "ventana global permanece");
   assert.ok(!labels.some((l) => /sonnet/i.test(l)), "ventana Sonnet oculta");
+});
+
+// --- Regresiones de la revision adversarial (v0.12.0) ---
+
+test("windowModelKey: ventanas hermanas del mismo modelo/familia NO colisionan", () => {
+  // MiniMax emite ventana diaria y semanal por modelo, ambas con model=<modelo>: el token
+  // debe diferenciarlas por su key unica (si no, ocultar una ocultaba la otra en TUI y MCP).
+  assert.notEqual(
+    windowModelKey("minimax", { key: "daily_general", model: "general" }),
+    windowModelKey("minimax", { key: "weekly_general", model: "general" }),
+  );
+  assert.strictEqual(windowModelKey("minimax", { key: "daily_general", model: "general" }), "minimax:daily_general");
+  // Antigravity: 5h y semanal comparten family, distinta key.
+  assert.notEqual(
+    windowModelKey("antigravity", { key: "Gemini-5h", family: "Gemini" }),
+    windowModelKey("antigravity", { key: "Gemini-sem", family: "Gemini" }),
+  );
+  // Sin key pero con windowType distinto, tampoco colisionan.
+  assert.notEqual(
+    windowModelKey("x", { model: "m", windowType: "daily" }),
+    windowModelKey("x", { model: "m", windowType: "weekly" }),
+  );
+});
+
+test("annotateUnusable: no marca un limite configurado por el usuario (configured-*)", () => {
+  const q = { source: "gemini", kind: "configured-requests", ok: true, windows: [] };
+  annotateUnusable(q, { unusable: true, reason: "not-installed" });
+  assert.ok(!q.unusable, "un configured-* no debe heredar unusable (el usuario lo configuro a mano)");
+  assert.strictEqual(isProviderVisible("gemini", q, { hideUnusable: true }), true);
+});
+
+test("annotateUnusable: propaga unusable a un quota roto sin datos", () => {
+  const q = { source: "gemini", kind: "unknown", ok: false, windows: [] };
+  annotateUnusable(q, { unusable: true, reason: "not-installed" });
+  assert.strictEqual(q.unusable, true);
+  assert.strictEqual(q.reason, "not-installed");
+});
+
+test("annotateUnusable: no toca un quota con datos ni uno needsAuth ya presente", () => {
+  const withData = { kind: "detected-percent", ok: true, windows: [{ label: "5h", remainingPercent: 50 }] };
+  annotateUnusable(withData, { needsAuth: true });
+  assert.ok(!withData.needsAuth, "no debe estampar needsAuth sobre un quota con datos");
 });
