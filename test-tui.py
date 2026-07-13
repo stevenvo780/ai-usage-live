@@ -237,6 +237,44 @@ def run_live_refresh_test():
         print(f"  {status} '{label}'")
     return all(found for _, found in checks)
 
+def run_hide_toggle_test():
+    """Verifica el loop interactivo de ocultar: seleccionar MiniMax + 'h' lo oculta del
+    grid, muestra el pie 'oculto: 1', y persiste hiddenProviders en quotas.json."""
+    print(f"\n{'='*70}")
+    print("TEST: Ocultar proveedor con 'h' (toggle + persistencia)")
+    print(f"{'='*70}")
+
+    quotas_path = TEST_CONFIG_HOME / "ai-usage-live" / "quotas.json"
+    if quotas_path.exists():
+        quotas_path.unlink()  # arrancar con display por defecto (nada oculto)
+    write_mock(50, 50)
+    # m: selecciona la tarjeta MiniMax · h: la oculta
+    frame = capture([(1.0, "m"), (2.2, "h")], wait_after_keys=2)
+
+    print("\n--- último frame ---")
+    for line in frame.split("\n"):
+        if line.strip():
+            print(f"  {line}")
+
+    persisted = []
+    if quotas_path.exists():
+        try:
+            persisted = json.loads(quotas_path.read_text()).get("display", {}).get("hiddenProviders", [])
+        except Exception:
+            persisted = []
+
+    print("\n--- verificaciones ---")
+    checks = [
+        ("MiniMax ya no aparece en el grid", "MiniMax" not in frame),
+        ("pie 'oculto: 1' visible", "oculto: 1" in frame),
+        ("persistido hiddenProviders=['minimax']", persisted == ["minimax"]),
+    ]
+    for label, ok in checks:
+        print(f"  {'✓' if ok else '✗ FALTA'} {label}")
+    if quotas_path.exists():
+        quotas_path.unlink()  # limpiar para no afectar otras corridas
+    return all(ok for _, ok in checks)
+
 def main():
     scenario = sys.argv[1] if len(sys.argv) > 1 else "all"
     
@@ -275,6 +313,9 @@ def main():
     
     if scenario in ("all", "refresh"):
         results.append(run_live_refresh_test())
+
+    if scenario in ("all", "hide"):
+        results.append(run_hide_toggle_test())
     
     if scenario in ("all", "no-confusion"):
         # Test: el modelo "MiniMax-M3" de ccusage NO debe aparecer en la seccion de cuotas de MiniMax

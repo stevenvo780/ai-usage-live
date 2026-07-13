@@ -757,7 +757,9 @@ function saveDisplayConfig() {
     if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
     let parsed = {};
     if (existsSync(QUOTA_CONFIG_PATH)) {
-      try { parsed = JSON.parse(readFileSync(QUOTA_CONFIG_PATH, "utf8")) || {}; } catch { parsed = {}; }
+      // Si el archivo existe pero no parsea, ABORTAR: reescribir solo `display` borraria
+      // credenciales y el resto de la config del usuario. Mejor no guardar la preferencia.
+      try { parsed = JSON.parse(readFileSync(QUOTA_CONFIG_PATH, "utf8")) || {}; } catch { return false; }
     }
     parsed.display = {
       hideUnusable: displayConfig.hideUnusable !== false,
