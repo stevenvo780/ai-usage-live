@@ -6,21 +6,159 @@
 // Uso en un cliente MCP (Claude Code, etc.):
 //   { "mcpServers": { "ai-usage": { "command": "ai-usage-mcp" } } }
 // o bien: { "command": "node", "args": ["/opt/ai-usage-live/ai-usage-mcp.mjs"] }
+//
+// El output respeta el filtro de visibilidad de quotas.json `display` (oculta
+// proveedores no-usables o elegidos por el usuario). `AI_USAGE_SHOW_ALL=1` lo desactiva.
 import process from "node:process";
-import { runQuotaSnapshot } from "./ai-usage-tui.mjs";
+import { APP_VERSION, runQuotaSnapshot } from "./ai-usage-tui.mjs";
 
-const SERVER = { name: "ai-usage-live", version: "0.9.0" };
+// Defensa: cualquier console.log accidental en el codigo de coleccion iria a stdout y
+// corromperia el stream JSON-RPC. Lo redirigimos a stderr por si acaso.
+console.log = (...args) => process.stderr.write(`${args.join(" ")}\n`);
+
+const SERVER = { name: "ai-usage-live", version: APP_VERSION };
+const LATEST_PROTOCOL_VERSION = "2025-11-25";
+// Solo versiones sin batch y con outputSchema/structuredContent/annotations, para no
+// prometer soporte de batch (removido en 2025-06-18) ni emitir campos fuera de version.
+const SUPPORTED_PROTOCOL_VERSIONS = new Set([
+  LATEST_PROTOCOL_VERSION,
+  "2025-06-18",
+]);
+const QUOTA_OUTPUT_SCHEMA = {
+  type: "object",
+  required: ["schemaVersion", "appVersion", "capturedAt", "providers"],
+  properties: {
+    schemaVersion: { type: "number" },
+    appVersion: { type: "string" },
+    capturedAt: { type: "string" },
+    since: { type: ["string", "null"] },
+    providers: {
+      type: "object",
+      additionalProperties: {
+        type: "object",
+        required: ["ok", "available", "kind", "windows", "note"],
+        properties: {
+          ok: { type: "boolean" },
+          available: { type: "boolean" },
+          kind: { type: "string" },
+          stale: { type: "boolean" },
+          needsAuth: { type: "boolean" },
+          limited: { type: "boolean" },
+          limitedRetry: { type: "string" },
+          plan: { type: "string" },
+          source: { type: "string" },
+          detectedAt: { type: ["string", "null"] },
+          observedAt: { type: "string" },
+          ageSeconds: { type: "number" },
+          effectiveRemainingPercent: { type: "number" },
+          limitingWindows: { type: "array", items: { type: "string" } },
+          incomplete: { type: "boolean" },
+          missingWindows: { type: "array", items: { type: "string" } },
+          availableGroups: { type: "array", items: { type: "string" } },
+          limitingGroups: { type: "array", items: { type: "string" } },
+          // Multi-cuenta (opt-in via quotas.json <provider>.accounts[]): SOLO presentes
+          // cuando el proveedor resolvio mas de una cuenta. `windows`/`effectiveRemainingPercent`
+          // arriba siguen reflejando el AGREGADO (MAX entre cuentas sanas) con `windows` proyectado
+          // de la cuenta seleccionada (selectedAccountId) — nunca la union de todas las cuentas.
+          // Para precision por cuenta o para elegir una cuenta especifica, usar accounts[].
+          accountCount: { type: "number" },
+          selectedAccountId: { type: "string" },
+          accounts: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["id", "label", "blocked", "ok", "available"],
+              properties: {
+                id: { type: "string" },
+                label: { type: "string" },
+                blocked: { type: "boolean" },
+                healthStatus: { type: ["string", "null"] },
+                ok: { type: "boolean" },
+                available: { type: "boolean" },
+                effectiveRemainingPercent: { type: "number" },
+                availableGroups: { type: "array", items: { type: "string" } },
+                limitingGroups: { type: "array", items: { type: "string" } },
+              },
+              additionalProperties: false,
+            },
+          },
+          // Errores de configuracion no fatales de quotas.json <provider>.accounts[] (id
+          // duplicado, credencial invalida, proveedor sin soporte multi-cuenta, etc.).
+          // Nunca incluye valores de credenciales.
+          configErrors: { type: "array", items: { type: "string" } },
+          unavailableModels: { type: "array", items: { type: "string" } },
+          offeredModels: { type: "array", items: { type: "string" } },
+          resetCredits: { type: "object" },
+          creditBalances: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["limitId", "planType", "hasCredits", "unlimited", "balance"],
+              properties: {
+                limitId: { type: "string" },
+                planType: { type: "string" },
+                hasCredits: { type: "boolean" },
+                unlimited: { type: "boolean" },
+                balance: { type: ["string", "null"] },
+              },
+              additionalProperties: false,
+            },
+          },
+          windows: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["label", "usedPercent", "remainingPercent", "resetInSeconds", "resetAt"],
+              properties: {
+                key: { type: "string" },
+                label: { type: "string" },
+                usedPercent: { type: ["number", "null"] },
+                remainingPercent: { type: ["number", "null"] },
+                resetInSeconds: { type: ["number", "null"] },
+                resetAt: { type: ["string", "null"] },
+                windowMinutes: { type: "number" },
+                windowType: { type: "string" },
+                model: { type: "string" },
+                limitText: { type: "string" },
+                usedText: { type: "string" },
+                family: { type: "string" },
+                source: { type: "string" },
+                status: { type: ["string", "number"] },
+                // Presente solo en proveedores multi-cuenta: id de la cuenta seleccionada
+                // (providers.<p>.selectedAccountId) de la que proviene esta ventana.
+                accountId: { type: "string" },
+              },
+              additionalProperties: true,
+            },
+          },
+          note: { type: "string" },
+        },
+        additionalProperties: true,
+      },
+    },
+  },
+  additionalProperties: false,
+};
 
 const TOOLS = [
   {
     name: "get_ai_quotas",
+    title: "Read AI quotas",
     description:
-      "Devuelve el uso/cuota actual de las suscripciones de IA locales (Claude, Codex, " +
+      "Devuelve el uso/cuota actual de las suscripciones de IA locales (Claude, Codex, Gemini, " +
       "Antigravity [Gemini + Claude/GPT], MiniMax, OpenCode Go). Por cada proveedor da una " +
       "lista de ventanas con usedPercent, remainingPercent y resetInSeconds, para que un " +
       "agente elija un proveedor/modelo con cuota disponible. No recibe argumentos. La " +
-      "primera llamada puede tardar (consulta los CLIs en vivo); luego usa cache.",
+      "primera llamada puede tardar (consulta los CLIs en vivo); luego usa cache. Oculta " +
+      "proveedores no-usables/elegidos en quotas.json display; AI_USAGE_SHOW_ALL=1 los incluye.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    outputSchema: QUOTA_OUTPUT_SCHEMA,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
   },
 ];
 
@@ -34,8 +172,18 @@ function reply(id, result) {
 }
 
 function replyError(id, code, message) {
-  if (id === undefined || id === null) return;
-  send({ jsonrpc: "2.0", id, error: { code, message } });
+  if (id === undefined) return;
+  send({ jsonrpc: "2.0", id: id ?? null, error: { code, message } });
+}
+
+// Single-flight: una unica captura en vuelo; los tools/call concurrentes se agrupan sobre
+// ella en vez de estampidar los CLIs. Se libera al terminar para que el proximo refresque.
+let snapshotInFlight = null;
+function getSnapshot() {
+  if (!snapshotInFlight) {
+    snapshotInFlight = runQuotaSnapshot().finally(() => { snapshotInFlight = null; });
+  }
+  return snapshotInFlight;
 }
 
 async function handle(msg) {
@@ -43,9 +191,12 @@ async function handle(msg) {
   switch (method) {
     case "initialize":
       reply(id, {
-        protocolVersion: params?.protocolVersion || "2024-11-05",
+        protocolVersion: SUPPORTED_PROTOCOL_VERSIONS.has(params?.protocolVersion)
+          ? params.protocolVersion
+          : LATEST_PROTOCOL_VERSION,
         capabilities: { tools: {} },
         serverInfo: SERVER,
+        instructions: "Usa get_ai_quotas para leer ventanas de cuota actuales. remainingPercent es capacidad disponible.",
       });
       return;
     case "tools/list":
@@ -53,12 +204,25 @@ async function handle(msg) {
       return;
     case "tools/call": {
       if (params?.name !== "get_ai_quotas") {
-        replyError(id, -32602, `Unknown tool: ${params?.name}`);
+        replyError(id, -32602, "Unknown tool");
+        return;
+      }
+      // get_ai_quotas no acepta argumentos; null/ausente/{} son equivalentes a "sin args".
+      const callArguments = params?.arguments;
+      if (callArguments !== undefined && callArguments !== null && (
+        typeof callArguments !== "object"
+        || Array.isArray(callArguments)
+        || Object.keys(callArguments).length > 0
+      )) {
+        replyError(id, -32602, "get_ai_quotas does not accept arguments");
         return;
       }
       try {
-        const data = await runQuotaSnapshot();
-        reply(id, { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] });
+        const data = await getSnapshot();
+        reply(id, {
+          content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+          structuredContent: data,
+        });
       } catch (error) {
         reply(id, {
           content: [{ type: "text", text: `error: ${error?.message || String(error)}` }],
@@ -70,13 +234,27 @@ async function handle(msg) {
     case "ping":
       reply(id, {});
       return;
+    case "notifications/cancelled":
+    case "notifications/initialized":
+      // Notificaciones sin id: no requieren respuesta. La captura es idempotente y con
+      // cache, asi que una cancelacion no necesita abortar CLIs a mitad de camino.
+      return;
     default:
-      // Las notificaciones (sin id) se ignoran; metodos desconocidos con id -> error.
-      if (id !== undefined && id !== null) replyError(id, -32601, `Method not found: ${method}`);
+      // Notificaciones (sin id) se ignoran; metodos desconocidos con id -> error.
+      if (id !== undefined && id !== null) replyError(id, -32601, "Method not found");
   }
 }
 
+// Cada mensaje se despacha de forma independiente (no en una cola serial): asi un ping,
+// initialize o tools/list se responde de inmediato aunque haya un tools/call lento en vuelo.
+function dispatch(message) {
+  Promise.resolve().then(() => handle(message)).catch((error) => {
+    process.stderr.write(`ai-usage-mcp: ${error?.message || String(error)}\n`);
+  });
+}
+
 let buffer = "";
+
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
@@ -89,11 +267,35 @@ process.stdin.on("data", (chunk) => {
     try {
       msg = JSON.parse(line);
     } catch {
+      replyError(null, -32700, "Parse error");
       continue;
     }
-    handle(msg);
+    if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
+      // Arrays (batch) no se soportan en las versiones negociadas; primitivos son invalidos.
+      replyError(null, -32600, "Invalid Request");
+      continue;
+    }
+    if (msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
+      // Un mensaje sin method que trae result/error es una RESPUESTA: se ignora en silencio
+      // (este server nunca inicia requests, no debe existir, y no se responde a una respuesta).
+      if (msg.method === undefined && ("result" in msg || "error" in msg)) continue;
+      replyError(msg && typeof msg === "object" ? (msg.id ?? null) : null, -32600, "Invalid Request");
+      continue;
+    }
+    dispatch(msg);
   }
 });
-process.stdin.on("end", () => process.exit(0));
+
+// Cierre limpio: al terminar stdin dejamos de leer y permitimos que el event loop drene la
+// escritura pendiente (evita truncar la ultima respuesta). Un snapshot en vuelo mantiene vivo
+// el proceso hasta responder; luego sale solo.
+function softShutdown() {
+  process.exitCode = 0;
+  try { process.stdin.pause(); } catch { /* noop */ }
+}
+process.stdin.on("end", softShutdown);
+// EPIPE al cerrar el cliente el pipe es un cierre normal, no un crash.
+process.stdout.on("error", () => process.exit(0));
+process.stdin.on("error", () => process.exit(0));
 process.on("SIGINT", () => process.exit(0));
 process.on("SIGTERM", () => process.exit(0));

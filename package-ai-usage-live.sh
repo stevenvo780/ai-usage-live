@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="${VERSION:-$(node -p "require('./package.json').version" 2>/dev/null || echo 0.5.5)}"
+VERSION="${VERSION:-$(node -p "require(process.argv[1]).version" "$ROOT/package.json" 2>/dev/null || echo 0.12.0)}"
 PKG_NAME="ai-usage-live"
 BUILD_DIR="$ROOT/build/${PKG_NAME}_${VERSION}_all"
 DIST_DIR="$ROOT/dist"
@@ -20,6 +20,7 @@ install -m 0755 "$ROOT/ai-usage-mcp.mjs" "$BUILD_DIR/opt/ai-usage-live/ai-usage-
 install -m 0755 "$ROOT/gemini-quota-capture.py" "$BUILD_DIR/opt/ai-usage-live/gemini-quota-capture.py"
 install -m 0755 "$ROOT/antigravity-usage-capture.py" "$BUILD_DIR/opt/ai-usage-live/antigravity-usage-capture.py"
 install -m 0755 "$ROOT/codex-probe.py" "$BUILD_DIR/opt/ai-usage-live/codex-probe.py"
+install -m 0644 "$ROOT/package.json" "$BUILD_DIR/opt/ai-usage-live/package.json"
 install -m 0755 "$ROOT/ai-usage.sh" "$BUILD_DIR/opt/ai-usage-live/ai-usage.sh"
 install -m 0755 "$ROOT/ai-usage-quota" "$BUILD_DIR/opt/ai-usage-live/ai-usage-quota"
 install -m 0644 "$ROOT/LICENSE" "$BUILD_DIR/usr/share/doc/ai-usage-live/LICENSE"
@@ -57,8 +58,8 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: all
-Depends: nodejs, npm, python3
-Maintainer: Local Codex <local@example.invalid>
+Depends: nodejs (>= 18), npm, python3, sqlite3
+Maintainer: Steven Vallejo <stevenvo780@users.noreply.github.com>
 Description: Terminal dashboard for local AI CLI usage
  Provides a btop-style terminal dashboard for Claude Code, Codex CLI,
  Gemini CLI, Antigravity, MiniMax, and OpenCode Go. Usage is read from local files
@@ -66,5 +67,5 @@ Description: Terminal dashboard for local AI CLI usage
 CONTROL
 
 mkdir -p "$DIST_DIR"
-dpkg-deb --build "$BUILD_DIR" "$DIST_DIR/${PKG_NAME}_${VERSION}_all.deb"
+dpkg-deb --root-owner-group --build "$BUILD_DIR" "$DIST_DIR/${PKG_NAME}_${VERSION}_all.deb"
 echo "$DIST_DIR/${PKG_NAME}_${VERSION}_all.deb"

@@ -110,11 +110,17 @@ def capture(keys, wait_after_keys=2, total_timeout=20, env_overrides=None):
     if pid == 0:
         ensure_fake_ccusage()
         env = os.environ.copy()
+        env["HOME"] = str(TEST_CONFIG_HOME)
         env["XDG_CONFIG_HOME"] = str(TEST_CONFIG_HOME)
         env["PATH"] = f"{FAKE_BIN}:{env.get('PATH', '')}"
         env.setdefault("AI_USAGE_CLAUDE_LIVE", "0")
+        env.setdefault("AI_USAGE_CODEX_LIVE", "0")
+        env.setdefault("AI_USAGE_CODEX_PROBE", "0")
         env.setdefault("AI_USAGE_GEMINI_LIVE", "0")
+        env.setdefault("AI_USAGE_ANTIGRAVITY_LIVE", "0")
         env.setdefault("AI_USAGE_MINIMAX_LIVE", "0")
+        env.setdefault("AI_USAGE_OPENCODE_LIVE", "0")
+        env.setdefault("AI_USAGE_OPENCODE_WEB", "0")
         env.setdefault("MINIMAX_USAGE_CACHE_MINUTES", "999")
         if env_overrides:
             env.update({key: str(value) for key, value in env_overrides.items()})
@@ -124,6 +130,7 @@ def capture(keys, wait_after_keys=2, total_timeout=20, env_overrides=None):
     start = time.time()
     key_idx = 0
     first_frame_seen = False
+    first_frame_at = None
     
     while time.time() - start < total_timeout:
         r, _, _ = select.select([fd], [], [], 0.2)
@@ -134,19 +141,25 @@ def capture(keys, wait_after_keys=2, total_timeout=20, env_overrides=None):
                     out += chunk
                     if not first_frame_seen and b"\x1b[2J" in out:
                         first_frame_seen = True
+                        first_frame_at = time.time()
             except OSError:
                 break
         
         elapsed = time.time() - start
         if first_frame_seen and key_idx < len(keys):
             key_time, key_value = keys[key_idx]
-            if elapsed >= key_time:
+            # Los tiempos declarados por cada escenario son relativos al primer frame
+            # interactivo, no al arranque del proceso. En una maquina ocupada el snapshot
+            # inicial puede tardar varios segundos; medir desde `start` juntaba dos teclas
+            # casi simultaneas y volvia intermitente el test de ocultar tarjetas.
+            key_elapsed = time.time() - first_frame_at
+            if key_elapsed >= key_time:
                 os.write(fd, key_value.encode() if isinstance(key_value, str) else key_value)
                 key_idx += 1
         
         if key_idx >= len(keys) and first_frame_seen:
-            wait_start = next((t for t, _ in keys), 0) + wait_after_keys
-            if elapsed >= wait_start:
+            wait_start = max((t for t, _ in keys), default=0) + wait_after_keys
+            if time.time() - first_frame_at >= wait_start:
                 time.sleep(1.0)  # dar tiempo extra para que se renderice
                 # leer lo que quede en el buffer
                 while True:
@@ -204,7 +217,7 @@ def run_live_refresh_test():
     write_mock(80, 80)
     with SequencedMiniMaxServer([(80, 80), (30, 30)]) as server:
         frame = capture(
-            [(3.0, "r")],
+            [(1.0, "m"), (1.2, "\r"), (3.0, "r")],
             wait_after_keys=5,
             total_timeout=25,
             env_overrides={
@@ -223,13 +236,51 @@ def run_live_refresh_test():
 
     print("\n--- verificaciones ---")
     checks = [
-        ("30% queda", "30% queda" in frame),
+        ("70% usado", "70% usado" in frame),
         ("API llamada al menos 2 veces", request_count >= 2),
     ]
     for label, found in checks:
         status = "✓" if found else "✗ FALTA"
         print(f"  {status} '{label}'")
     return all(found for _, found in checks)
+
+def run_hide_toggle_test():
+    """Verifica el loop interactivo de ocultar: seleccionar MiniMax + 'h' lo oculta del
+    grid, muestra el pie 'oculto: 1', y persiste hiddenProviders en quotas.json."""
+    print(f"\n{'='*70}")
+    print("TEST: Ocultar proveedor con 'h' (toggle + persistencia)")
+    print(f"{'='*70}")
+
+    quotas_path = TEST_CONFIG_HOME / "ai-usage-live" / "quotas.json"
+    if quotas_path.exists():
+        quotas_path.unlink()  # arrancar con display por defecto (nada oculto)
+    write_mock(50, 50)
+    # m: selecciona la tarjeta MiniMax · h: la oculta
+    frame = capture([(1.0, "m"), (2.2, "h")], wait_after_keys=2)
+
+    print("\n--- último frame ---")
+    for line in frame.split("\n"):
+        if line.strip():
+            print(f"  {line}")
+
+    persisted = []
+    if quotas_path.exists():
+        try:
+            persisted = json.loads(quotas_path.read_text()).get("display", {}).get("hiddenProviders", [])
+        except Exception:
+            persisted = []
+
+    print("\n--- verificaciones ---")
+    checks = [
+        ("MiniMax ya no aparece en el grid", "MiniMax" not in frame),
+        ("pie 'oculto: 1' visible", "oculto: 1" in frame),
+        ("persistido hiddenProviders=['minimax']", persisted == ["minimax"]),
+    ]
+    for label, ok in checks:
+        print(f"  {'✓' if ok else '✗ FALTA'} {label}")
+    if quotas_path.exists():
+        quotas_path.unlink()  # limpiar para no afectar otras corridas
+    return all(ok for _, ok in checks)
 
 def main():
     scenario = sys.argv[1] if len(sys.argv) > 1 else "all"
@@ -240,15 +291,15 @@ def main():
         results.append(run_test(
             "Cuotas tab con 50% MiniMax",
             (50, 50),
-            [],
+            [(1.0, "m"), (1.2, "\r")],
             [
                 "MiniMax",
                 "general 5h",
                 "general sem",
-                "video 5h",
+                "video dia",
                 "video sem",
-                "50% queda",
-                "reset",  # que aparezca el reset
+                "50% usado",
+                "↻",  # que aparezca el reset
             ]
         ))
     
@@ -269,13 +320,16 @@ def main():
     
     if scenario in ("all", "refresh"):
         results.append(run_live_refresh_test())
+
+    if scenario in ("all", "hide"):
+        results.append(run_hide_toggle_test())
     
     if scenario in ("all", "no-confusion"):
         # Test: el modelo "MiniMax-M3" de ccusage NO debe aparecer en la seccion de cuotas de MiniMax
         results.append(run_test(
             "Cuotas tab no muestra modelos de ccusage mezclados",
             (50, 50),
-            [],
+            [(1.0, "m"), (1.2, "\r")],
             [
                 "MiniMax",
                 "general 5h",

@@ -1,70 +1,276 @@
 # ai-usage-live
 
-Terminal dashboard for local AI CLI usage — monitors Claude Code, Codex CLI, Antigravity, MiniMax, and OpenCode Go in a single btop-style TUI. (Note: Gemini CLI has been removed as Google revoked its OAuth).
+Dashboard de terminal para consultar consumo y cuotas de Claude Code, Codex CLI, Gemini CLI, Antigravity, MiniMax y OpenCode Go desde una sola TUI. La version actual es **0.12.0**.
 
-## Features
+## Funciones
 
-- **Interactive card grid dashboard** with drill-down detailed view per provider (v0.8.0)
-  - One card per provider (Claude, Codex, Antigravity, MiniMax, OpenCode) featuring provider icon, block mini-bars (% used) per window, and compact reset countdowns (e.g., `↻ 1h27m`, `↻ 23h54m`)
-  - Detailed drill-down view with Antigravity grouping models by family (Gemini / Claude/GPT)
-- **Real-time quota monitoring** for Claude, Codex, Antigravity, and MiniMax
-- **Effective token counting** — separates cache-read tokens from real consumption so Claude usage isn't inflated by prompt caching (cache reads can be 97%+ of reported totalTokens)
-- **Live quota detection** from `claude /usage` and real quota for Antigravity via CLI capture / Google's consumer API
-- **Codex rate-limit detection** from local session events
-- **Model-by-model breakdown** with sorting by effective tokens
-- **Auto-refresh** with configurable interval
+- Panel interactivo tipo btop con una tarjeta y una vista detallada por proveedor.
+- Consulta en vivo de las cuotas que expone cada CLI o servicio, con cache local y marca de frescura.
+- Semantica de disponibilidad adaptada a cada empresa: ventanas obligatorias, familias o modelos alternativos y estados explicitos de limite.
+- Auto-oculta los proveedores no-usables (sin autenticar, no instalados o no configurados) y permite ocultar/mostrar proveedores y modelos a mano; el filtro se aplica igual a la TUI, `--json` y el MCP.
+- Consumo local por modelo y tokens efectivos mediante `ccusage`, con `reasoningOutputTokens` visible sin duplicarlo dentro de la salida de Codex.
+- Salida `--json` y servidor MCP para que otros agentes puedan elegir un proveedor con capacidad real.
+- Fallbacks locales o manuales cuando un proveedor no expone la cuota en vivo.
 
-## Installation
+## Requisitos
 
-### From .deb package
+- Node.js 18 o posterior.
+- Python 3 para los capturadores interactivos de Codex, Gemini y Antigravity.
+- `npm` y `sqlite3` para las fuentes locales y el paquete `.deb`.
+- Los CLI de los proveedores que se quieran consultar, autenticados en la cuenta correspondiente.
+
+## Instalacion
+
+### Paquete Debian 0.12.0
 
 ```bash
 bash package-ai-usage-live.sh
-sudo dpkg -i dist/ai-usage-live_0.10.0_all.deb
+sudo dpkg -i dist/ai-usage-live_0.12.0_all.deb
 ```
 
-### Manual
+El paquete instala `ai-usage-live`, `ai-usage`, `ai-usage-quota` y `ai-usage-mcp` en el `PATH`.
+
+### Ejecucion desde el repositorio
 
 ```bash
-# Requires Node.js 18+
 chmod +x ai-usage-live ai-usage.sh ai-usage-quota
 ./ai-usage-live
 ```
 
-## Commands
+## Comandos
 
 ```bash
-ai-usage-live                          # Interactive TUI
-ai-usage-live --once                   # One-shot plain text summary
-ai-usage-live --json                   # JSON output for scripts/agents
-ai-usage-live daily all --refresh 5    # Auto-refresh every 5s
-ai-usage-live daily antigravity        # Focus on Antigravity
-ai-usage daily                         # ccusage daily summary
-ai-usage claude blocks                 # Claude blocks view
-ai-usage-quota show                    # Show quota config with secrets redacted
-ai-usage-quota show-raw                # Show raw quota config
-ai-usage-quota edit                    # Edit quota limits
+ai-usage-live                       # TUI interactiva
+ai-usage-live --once                # Resumen de texto una sola vez
+ai-usage-live --json                # Cuotas JSON para scripts y agentes
+ai-usage-live daily all --refresh 5 # Refresco cada 5 segundos
+ai-usage-live daily antigravity     # Vista centrada en Antigravity
+ai-usage daily                      # Resumen diario de ccusage
+ai-usage claude blocks              # Bloques de Claude
+ai-usage-quota show                 # Configuracion con secretos redactados
+ai-usage-quota show-raw             # Configuracion completa
+ai-usage-quota edit                 # Editar limites y credenciales
 ```
 
-## TUI keys
+## Teclas de la TUI
 
 ```text
-q exit
-r refresh (forces live provider refresh)
-tab change tab
-up/down/left/right navigate cards in the grid
-enter open detailed view of selected provider
-esc return to grid
-c Claude, x Codex, v Antigravity, m MiniMax, o OpenCode (directly select provider card)
+q salir
+r refrescar y forzar consultas en vivo
+tab cambiar de pestana
+flechas navegar por la cuadricula (en el detalle, arriba/abajo mueven el cursor de modelo)
+enter abrir el detalle del proveedor
+esc volver a la cuadricula
+c Claude, x Codex, g Gemini, v Antigravity, m MiniMax, o OpenCode
+h ocultar/mostrar el proveedor (grid) o el modelo (detalle) seleccionado
+H ver/gestionar los ocultos (revela con marca [oculto] para des-ocultarlos)
 ```
 
-## MCP server
+## Visibilidad de proveedores y modelos
 
-El proyecto incluye un servidor Model Context Protocol (MCP) llamado `ai-usage-mcp` (implementado en `ai-usage-mcp.mjs`). Es un servidor zero-dependency que funciona mediante stdio con JSON-RPC 2.0. Permite a agentes y modelos de IA consultar dinámicamente el estado y uso de las cuotas locales para decidir qué proveedor o modelo utilizar.
+`ai-usage-live` no lista lo que no podes usar. Un proveedor se **auto-oculta** cuando no tiene una cuenta usable: no autenticado (`needsAuth`), CLI/helper no instalado, o no configurado/suscrito. En cambio, un proveedor **agotado** (autenticado pero al limite) permanece visible, porque saber que esta sin cuota es informacion util. Un `disabled` (probe en vivo apagado por env/config) tampoco se oculta: no es "sin cuenta".
 
-### Registro en el cliente
+Ademas podes ocultar/mostrar a mano proveedores enteros o modelos concretos con la tecla `h`, y revisar los ocultos con `H`. La seleccion se guarda en `quotas.json` bajo `display` y persiste entre reinicios:
 
-Para registrar el servidor MCP en clientes compatibles (como Claude Desktop o Claude Code), añade la configuración a tu archivo de settings correspondiente:
+```json
+{
+  "display": {
+    "hideUnusable": true,
+    "hiddenProviders": ["minimax"],
+    "hiddenModels": ["claude:week_opus", "antigravity:claude/gpt"]
+  }
+}
+```
+
+- `hideUnusable` (default `true`) activa el auto-ocultamiento de no-usables. Ponelo en `false` para ver siempre todos.
+- `hiddenProviders` son ids de proveedor (`claude`, `codex`, `gemini`, `antigravity`, `minimax`, `opencode`).
+- `hiddenModels` usa el token `"<proveedor>:<modelKey>"`, donde `modelKey` se deriva del modelo/familia/clave de la ventana (minusculas). La forma mas simple de agregarlo es pararte en la fila en el detalle y pulsar `h`.
+
+El filtro se aplica de forma **uniforme** a la cuadricula, `--json` y el MCP `get_ai_quotas`. Para que un agente reciba el set completo sin filtrar, exporta `AI_USAGE_SHOW_ALL=1`.
+
+## Disponibilidad por proveedor
+
+`ai-usage-live` no aplica una sola regla de porcentajes a todos los servicios. Una ventana con `remainingPercent: 0` o un estado explicito de bloqueo puede hacer que el proveedor no este disponible aunque la captura haya terminado correctamente.
+
+| Proveedor | Regla de disponibilidad |
+|---|---|
+| Claude | Las ventanas globales de sesion y semana para todos los modelos son conjuntivas: ambas deben conservar capacidad. Las ventanas especificas, como Sonnet o Fable, se muestran por separado y no sustituyen los limites globales. |
+| Codex | Dentro de cada `limitId`, sus ventanas de 5 horas, semana y limite individual son conjuntivas. Los distintos `limitId` son rutas alternativas: basta uno disponible. Un `rateLimitReached` explicito invalida su grupo; los saldos o reinicios de credito se informan aparte. |
+| Gemini | La cuota global diaria, si el CLI la publica, debe conservar capacidad y al menos un modelo debe estar disponible. Si solo se reciben cuotas por modelo, basta un modelo disponible. La falta de autenticacion produce `needsAuth`, no un falso 100% libre. |
+| Antigravity | Cada familia, por ejemplo Gemini o Claude/GPT, combina de forma conjuntiva sus ventanas de 5 horas y semana. Las familias son alternativas: el proveedor sigue utilizable mientras al menos una familia lo este. |
+| MiniMax | Las ventanas activas se agrupan por modelo. Los limites de un mismo modelo son conjuntivos y los modelos son alternativas. Los estados de plan no suscrito se excluyen y se publican en `unavailableModels`; los modelos de texto usan 5h/semana y los no textuales pueden usar ventana diaria. |
+| OpenCode Go | `rollingUsage`, `weeklyUsage` y `monthlyUsage` son limites conjuntivos. Si cualquiera llega a 0% restante o el dashboard devuelve `rate-limited`, `blocked` o `exhausted`, OpenCode queda `available: false`. Esto evita marcarlo disponible solo porque la ventana rolling aun tenga cuota. |
+
+`effectiveRemainingPercent` representa el cuello de botella dentro de una ruta conjuntiva o la mejor capacidad efectiva entre grupos alternativos. `limitingWindows`, `availableGroups`, `limitingGroups` y `unavailableModels` explican la decision cuando existen.
+
+## Fuentes de datos
+
+| Proveedor | Fuente principal | Fallback o datos adicionales |
+|---|---|---|
+| Claude Code | Captura interactiva de `claude /usage` | Logs locales de `ccusage`; tokens efectivos = input + cache creation + output, sin cache reads |
+| Codex CLI | RPC `account/rateLimits/read` de `codex app-server` | Eventos `rate_limits` de sesiones locales; el antiguo `codex exec` solo queda como fallback opt-in |
+| Gemini CLI | Captura de `/stats model` y `/model` mediante `gemini-quota-capture.py` | Limites diarios locales opcionales cuando el CLI no publica una cuota |
+| Antigravity | Captura de `/usage` mediante `agy` o `antigravity` | API `cloudcode-pa retrieveUserQuota`, limites manuales y estadisticas de transcripts locales |
+| MiniMax | `GET https://www.minimax.io/v1/token_plan/remains` | Ultimo cache valido o limite manual de creditos |
+| OpenCode Go | Estado autenticado de `opencode.ai/workspace/<workspaceId>/go` | Override manual y estimacion local consultada con `opencode db`; `sqlite3` para CLI antiguos |
+
+Las respuestas conservadas fuera de su periodo de cache se marcan con `stale: true` y mantienen `observedAt`/`ageSeconds`, en lugar de presentarse como una observacion nueva.
+
+## Codex app-server
+
+Codex moderno permite leer la cuenta y las cuotas sin iniciar una inferencia:
+
+```text
+codex app-server --listen stdio://
+initialize
+account/rateLimits/read
+```
+
+`codex-probe.py` realiza ese intercambio JSON-RPC y normaliza `rateLimitsByLimitId`, ventanas primarias/secundarias, limites individuales, balances y creditos de reinicio. La consulta oficial esta activa por defecto con cache de 60 segundos.
+
+El probe antiguo basado en `codex exec` puede consumir tokens y esta desactivado. Solo se habilita al establecer `codex.probe: true` en `quotas.json`; `AI_USAGE_CODEX_PROBE=0` permite bloquearlo incluso en ese caso.
+
+## Gemini CLI
+
+Gemini vuelve a ser un proveedor activo. El capturador abre el CLI en modo accesible, consulta `/stats model` y `/model`, y publica cuota global y por modelo cuando estan presentes. Si la sesion requiere autenticacion, ejecuta `gemini`, completa el inicio de sesion y vuelve a refrescar el dashboard.
+
+Gemini CLI y los modelos Gemini de Antigravity se consideran proveedores independientes porque corresponden a sesiones y conjuntos de cuota distintos.
+
+## OpenCode Go
+
+OpenCode no ofrece un endpoint publico estable para la cuota Go, por lo que el dashboard lee el estado autenticado que usa su pagina de workspace. El parser prioriza los datos estructurados `rollingUsage`, `weeklyUsage` y `monthlyUsage`, incluido su campo `status`, y conserva un parser HTML como compatibilidad.
+
+Configura en `~/.config/ai-usage-live/quotas.json`:
+
+```json
+{
+  "opencode": {
+    "cookie": "valor_de_la_cookie_auth",
+    "workspaceId": "wrk_xxx"
+  }
+}
+```
+
+La cookie `auth` se obtiene desde el almacenamiento del sitio `opencode.ai` en las herramientas de desarrollo del navegador. Es un secreto de sesion: `ai-usage-quota show` lo redacta y el archivo de configuracion se crea con permisos privados; no debe incluirse en Git.
+
+Precedencia de fuentes:
+
+1. Cuota web autenticada, con rolling + semana + mes.
+2. `serverOverride` manual cuando esta habilitado.
+3. Estimacion de coste de las sesiones locales de `opencode-go`.
+
+La ruta de la base se resuelve con `opencode db path`; `OPENCODE_DB_PATH` permite forzar otra ubicacion.
+
+## Configuracion de cuotas v2
+
+`ai-usage-quota edit` abre `~/.config/ai-usage-live/quotas.json`. La configuracion se fusiona con estos valores v2; los limites `null` no inventan capacidad:
+
+```json
+{
+  "version": 2,
+  "claude": {
+    "liveUsage": true,
+    "liveUsageCacheSeconds": 300,
+    "fiveHourTokens": null,
+    "weeklyTokens": null
+  },
+  "codex": {
+    "liveUsage": true,
+    "liveUsageCacheSeconds": 60,
+    "useDetectedRateLimits": true,
+    "probe": false,
+    "probeCacheMinutes": 15,
+    "dailyTokens": null
+  },
+  "gemini": {
+    "liveCapture": true,
+    "liveCaptureCacheMinutes": 15,
+    "dailyTokens": null,
+    "dailyRequests": null
+  },
+  "antigravity": {
+    "liveCapture": true,
+    "liveCaptureCacheMinutes": 3,
+    "usageTimeoutSeconds": 40,
+    "monthlyCredits": null,
+    "usedCredits": null,
+    "resetsAt": null
+  },
+  "minimax": {
+    "liveCapture": true,
+    "liveCaptureCacheMinutes": 0,
+    "monthlyCredits": null,
+    "resetsAt": null,
+    "apiKey": null
+  },
+  "opencode": {
+    "liveCapture": true,
+    "liveCaptureCacheMinutes": 5,
+    "fiveHourCost": 12,
+    "weeklyCost": 30,
+    "monthlyCost": 60,
+    "apiKey": null,
+    "cookie": null,
+    "workspaceId": null,
+    "serverOverride": {
+      "enabled": false,
+      "fiveHourUsed": null,
+      "weeklyUsed": null,
+      "monthlyUsed": null,
+      "reset5h": null,
+      "resetWeek": null,
+      "resetMonth": null,
+      "capturedAt": null
+    }
+  },
+  "display": {
+    "hideUnusable": true,
+    "hiddenProviders": [],
+    "hiddenModels": []
+  }
+}
+```
+
+Los campos manuales son fallbacks. No sustituyen una lectura en vivo valida salvo `opencode.serverOverride.enabled: true`. El bloque `display` controla la visibilidad (ver "Visibilidad de proveedores y modelos"); la TUI lo reescribe al usar `h`/`H` sin tocar el resto del archivo.
+
+## Multi-cuenta (opt-in)
+
+Cada proveedor admite un array `accounts` opcional. **Sin `accounts` declarado, el comportamiento es exactamente el de siempre** (una cuenta implicita `"default"` con las credenciales ambientes de tu `$HOME`): esto no rompe ninguna instalacion existente.
+
+```json
+{
+  "claude": {
+    "liveUsage": true,
+    "accounts": [
+      { "id": "principal", "label": "Cuenta A", "credential": { "kind": "configDir", "path": "/home/tu-usuario/.claude" } },
+      { "id": "secundaria", "label": "Cuenta B", "credential": { "kind": "configDir", "path": "/home/tu-usuario/.claude-cuenta-b" } }
+    ]
+  }
+}
+```
+
+- `id`: `^[a-z0-9][a-z0-9._-]{0,31}$` (es componente de nombre de archivo de cache: `claude-<id>-usage-cache.json`, etc.). No puede repetirse.
+- `credential.kind`:
+  - `"configDir"` — aisla la raiz de credenciales del CLI hijo via variable de entorno (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME` segun el proveedor). Es la unica forma real de tener 2+ cuentas Claude/Codex/Gemini en la misma maquina. **Antigravity no lo admite** (su CLI fija la raiz en `~/.gemini/antigravity-cli` sin variable de entorno de aislamiento); declarar `accounts` ahi cae a modo legacy con un error explicito en vez de reportar la misma suscripcion dos veces.
+  - `"env"` — lee la credencial de una variable de entorno por cuenta (`{"kind":"env","var":"MINIMAX_API_KEY_CUENTA_B"}`), para proveedores sin CLI aislable (MiniMax, OpenCode Go).
+  - `"legacy"` (default si se omite `credential`) — usa las credenciales ambientes; solo tiene sentido en una de las cuentas declaradas.
+- Cualquier campo del bloque del proveedor (`fiveHourTokens`, `liveUsageCacheSeconds`, etc.) puede sobreescribirse por cuenta poniendolo junto a `id`/`credential` en la entrada — hereda del bloque del proveedor si se omite.
+- `priority` (numero, default 0) desempata cuando dos cuentas quedan con el mismo `remainingPercent`: gana la de menor `priority`.
+- `enabled: false` deshabilita una cuenta sin borrarla.
+
+**Salud de la credencial, sin gastar CLI**: antes de lanzar el proceso de 30-45s, cada cuenta se preflight-chequea leyendo su archivo de credenciales en disco. Estados posibles: `ok`, `unauthenticated` (no hay credencial), `credential-broken` (token vacio o un marcador como `"[REDACTED]"`), `credential-expired` (access y refresh token vencidos). Las tres ultimas BLOQUEAN la cuenta (nunca se gasta un CLI en una credencial muerta) y quedan expuestas en `get_ai_quotas` como `accounts[].healthStatus`.
+
+**Dedupe**: si dos raices resuelven a la MISMA suscripcion (mismo `accountUuid`/`account_id`), la segunda se marca `duplicateOf` y se excluye del agregado — evita reportar el doble de capacidad por error de configuracion.
+
+**Agregacion**: con 2+ cuentas sanas, el proveedor reporta el AGREGADO (`available`/`effectiveRemainingPercent` = la mejor cuenta; una cuenta agotada nunca tapa a otra con cupo) y el detalle completo en `accounts[]`. Con 0 o 1 cuenta, la salida es identica a no tener `accounts` declarado.
+
+## Servidor MCP
+
+`ai-usage-mcp` es un servidor Model Context Protocol sin dependencias externas que usa JSON-RPC 2.0 por stdio. Negocia MCP `2025-11-25` y `2025-06-18` (ambas versiones incluyen `outputSchema`/`structuredContent` y no usan batch). Los mensajes de protocolo (`initialize`, `tools/list`, `ping`) se responden de inmediato aunque un `get_ai_quotas` lento este consultando los CLIs; las llamadas concurrentes comparten una unica captura en vuelo.
+
+El output respeta el filtro de visibilidad de `quotas.json` `display` (oculta proveedores no-usables o elegidos por el usuario). Exporta `AI_USAGE_SHOW_ALL=1` para recibir el set completo sin filtrar.
+
+### Registro
 
 ```json
 {
@@ -76,284 +282,103 @@ Para registrar el servidor MCP en clientes compatibles (como Claude Desktop o Cl
 }
 ```
 
-O bien, usando la ruta absoluta al script en sistemas donde no esté el binario en el PATH global:
+Desde el repositorio tambien se puede usar:
 
 ```json
 {
   "mcpServers": {
     "ai-usage": {
       "command": "node",
-      "args": ["/absolute/path/to/ai-usage-mcp.mjs"]
+      "args": ["/ruta/absoluta/ai-usage-mcp.mjs"]
     }
   }
 }
 ```
 
-### Herramientas expuestas (Tools)
+### Tool `get_ai_quotas`
 
-* **`get_ai_quotas`**: Retorna el uso y cuotas estructuradas de todos los proveedores configurados.
-  - **Argumentos**: Sin argumentos (`{}`).
-  - **Nota**: La primera llamada puede tardar unos segundos ya que realiza consultas en vivo a los CLIs/APIs de los proveedores (Claude, Codex, Antigravity, MiniMax, OpenCode Go). Las llamadas subsecuentes utilizan la caché local rápida.
+No recibe argumentos. Su resultado MCP contiene simultaneamente:
 
-### Ejemplo de respuesta JSON
+- `structuredContent`: objeto validable con `schemaVersion: 2`.
+- `content`: representacion JSON de texto para clientes MCP antiguos.
+
+Ejemplo abreviado de `structuredContent`:
 
 ```json
 {
-  "capturedAt": "2026-06-19T18:16:36.527Z",
-  "since": "2026-06-19",
+  "schemaVersion": 2,
+  "appVersion": "0.12.0",
+  "capturedAt": "2026-07-12T12:00:00.000Z",
   "providers": {
-    "claude": {
-      "ok": true,
-      "kind": "detected-percent",
-      "windows": [
-        {
-          "label": "sesion",
-          "usedPercent": 72,
-          "remainingPercent": 28,
-          "resetInSeconds": 3143,
-          "resetAt": "2026-06-19T19:09:00.000Z",
-          "resetText": "Jun 19, 7:09pm (UTC)"
-        }
-      ],
-      "note": "Claude /usage desde cache local."
-    },
-    "codex": {
-      "ok": true,
-      "kind": "detected-percent",
-      "windows": [
-        {
-          "label": "5h",
-          "usedPercent": 100,
-          "remainingPercent": 0,
-          "resetInSeconds": 2820,
-          "resetAt": "2026-06-19T19:03:37.000Z"
-        }
-      ],
-      "note": "Rate limit detectado desde sesiones Codex."
-    },
-    "antigravity": {
-      "ok": true,
-      "kind": "detected-percent",
-      "windows": [
-        {
-          "label": "5 horas",
-          "usedPercent": 41,
-          "remainingPercent": 59,
-          "resetInSeconds": 3120,
-          "resetAt": "2026-06-19T19:08:36.527Z",
-          "family": "Gemini",
-          "resetText": "52m"
-        },
-        {
-          "label": "semanal",
-          "usedPercent": 35,
-          "remainingPercent": 65,
-          "resetInSeconds": 299700,
-          "resetAt": "2026-06-23T05:31:36.527Z",
-          "family": "Claude/GPT",
-          "resetText": "83h 15m"
-        }
-      ],
-      "note": "Antigravity /usage (CLI, 2 grupos: Gemini + Claude/GPT)."
-    },
-    "minimax": {
-      "ok": true,
-      "kind": "detected-percent",
-      "windows": [
-        {
-          "label": "general 5h",
-          "usedPercent": 13,
-          "remainingPercent": 87,
-          "resetInSeconds": 6203,
-          "resetAt": "2026-06-19T20:00:00.000Z"
-        }
-      ],
-      "note": "MiniMax Coding Plan."
-    },
     "opencode": {
       "ok": true,
+      "available": false,
+      "limited": true,
       "kind": "detected-percent",
+      "source": "opencode-web",
+      "effectiveRemainingPercent": 0,
+      "limitingWindows": ["mensual"],
       "windows": [
         {
-          "label": "5 horas",
-          "usedPercent": 0,
-          "remainingPercent": 100,
-          "resetInSeconds": 18000,
-          "resetAt": "2026-06-19T23:16:36.238Z",
-          "source": "web",
-          "resetText": "5 hours"
+          "label": "mensual",
+          "status": "rate-limited",
+          "usedPercent": 100,
+          "remainingPercent": 0,
+          "resetInSeconds": 86400,
+          "resetAt": "2026-07-13T12:00:00.000Z"
         }
       ],
-      "note": "Cuota real (opencode.ai/auth)."
+      "note": "LIMITE ALCANZADO (mensual)."
     }
   }
 }
 ```
 
-## Data sources
+En el schema v2:
 
-| Source | Method | Notes |
+- `ok` indica que la fuente se pudo leer y normalizar.
+- `available` indica que existe al menos una ruta utilizable segun las reglas del proveedor.
+- `ok: true` y `available: false` es una respuesta valida cuando la cuenta esta agotada.
+- `stale`, `observedAt` y `ageSeconds` indican la frescura de la observacion.
+- `needsAuth` indica que el CLI requiere volver a autenticarse.
+- Con `accounts[]` declaradas para un proveedor (ver "Multi-cuenta"), `windows[]`/`effectiveRemainingPercent`/`available` reflejan el AGREGADO entre cuentas (nunca la union de ventanas: cada `window` trae `accountId` de la cuenta seleccionada). El detalle por cuenta va en `accountCount`, `selectedAccountId` y `accounts[]` (`{id, label, blocked, healthStatus, ok, available, effectiveRemainingPercent, availableGroups, limitingGroups}`, sin credenciales) — estos tres campos SOLO aparecen cuando el proveedor resolvio mas de una cuenta; con 0 o 1 cuenta el output es identico al de antes de esta funcionalidad.
+
+La primera llamada puede tardar porque consulta los CLI; las siguientes aprovechan los caches de cada proveedor.
+
+## Variables de entorno
+
+| Variable | Predeterminado | Descripcion |
 |---|---|---|
-| Claude Code | `ccusage` local logs | Effective tokens = input + cacheCreate + output (excludes cache reads) |
-| Claude quota | `claude -p /usage` | Reports session, weekly (all), weekly (Sonnet) percentages |
-| Codex CLI | `ccusage` local logs + rate_limits from sessions | Rate limit detection (passive from sessions) + live probe (`codex-probe.py`, opt-in via `quotas.json`). Probe free when rate-limited; costs ~13K tokens when sounding. |
-| Gemini CLI | (Removido) | Proveedor removido. Google revocó el OAuth de gemini-cli (`invalid_grant`). Antigravity es ahora la vía de acceso a los modelos Gemini. |
-| Antigravity | Local transcript analysis + Cuota real automática (CLI + API fallback) | Es la vía de acceso a los modelos Gemini, Claude y GPT-OSS. Muestra cuota real de todos los modelos (Gemini Flash/Pro, Claude Opus, Claude Sonnet y GPT-OSS). Captura la cuota como fuente principal ejecutando el comando interactivo `/usage` del CLI `agy`/`antigravity` mediante el script `antigravity-usage-capture.py` (que automatiza el TUI vía pty y parsea su salida). Como fallback para Gemini, usa la API de Google Cloud Code (`cloudcode-pa retrieveUserQuota`). Consumo local derivado de transcripts locales. |
-| MiniMax | Coding Plan API + local cache | Requires `MINIMAX_API_KEY` or `minimax.apiKey` in quota config |
-| OpenCode Go | Cuota real vía scrape web autenticado + fallback override/local | Requires `opencode` installed with `opencode-go` provider. Soporta scrape web (cookie + workspaceId), override manual o estimado local. |
+| `REFRESH_SEC` | `10` | Intervalo de refresco de la TUI |
+| `AI_USAGE_TZ` | zona del sistema | Zona IANA usada para mostrar reinicios |
+| `AI_USAGE_SHOW_ALL` | sin valor | `1` desactiva el filtro de visibilidad en `--json` y el MCP (devuelve todos los proveedores) |
+| `AI_USAGE_CLAUDE_LIVE` | `1` | `0` desactiva `claude /usage` |
+| `AI_USAGE_CODEX_LIVE` | `1` | `0` desactiva la lectura oficial de Codex app-server |
+| `CODEX_USAGE_CACHE_SECONDS` | `60` | Cache de cuotas de Codex app-server |
+| `AI_USAGE_CODEX_PROBE` | `1` | `0` prohibe el fallback antiguo aunque `codex.probe` sea `true` |
+| `CODEX_PROBE_TIMEOUT` | `16` | Timeout del helper de Codex en segundos |
+| `AI_USAGE_GEMINI_LIVE` | `1` | `0` desactiva la captura de Gemini CLI |
+| `AI_USAGE_GEMINI_TIMEOUT` | `45` | Timeout al ejecutar directamente el capturador de Gemini |
+| `AI_USAGE_GEMINI_COMMAND` | `gemini --screen-reader` | Comando usado por el capturador de Gemini |
+| `AI_USAGE_GEMINI_DEBUG_FILE` | sin valor | Guarda la salida cruda del capturador para diagnostico |
+| `AI_USAGE_ANTIGRAVITY_LIVE` | `1` | `0` desactiva toda consulta de cuota Antigravity |
+| `AI_USAGE_ANTIGRAVITY_USAGE` | `1` | `0` omite `/usage` y usa el fallback API |
+| `ANTIGRAVITY_USAGE_CACHE_MINUTES` | `3` | Cache de la cuota Antigravity |
+| `MINIMAX_API_KEY` | sin valor | Clave del MiniMax Token Plan; tambien admite `minimax.apiKey` |
+| `AI_USAGE_MINIMAX_LIVE` | `1` | `0` desactiva la consulta MiniMax |
+| `MINIMAX_USAGE_CACHE_MINUTES` | `0` | Cache de la consulta MiniMax |
+| `MINIMAX_USAGE_URL` | `https://www.minimax.io/v1/token_plan/remains` | Override del endpoint MiniMax |
+| `AI_USAGE_OPENCODE_LIVE` | `1` | `0` desactiva la lectura de sesiones OpenCode locales |
+| `AI_USAGE_OPENCODE_WEB` | `1` | `0` desactiva la cuota web autenticada |
+| `OPENCODE_USAGE_CACHE_MINUTES` | `5` | Cache de la cuota OpenCode |
+| `OPENCODE_DB_PATH` | detectada por CLI | Fuerza la ruta de `opencode.db` |
+| `XDG_CONFIG_HOME` | `~/.config` | Base de `ai-usage-live/quotas.json` y caches de configuracion |
+| `XDG_DATA_HOME` | `~/.local/share` | Base alternativa para datos de los CLI |
 
-## Why "effective tokens"?
+## Por que "tokens efectivos"
 
-Claude Code uses prompt caching aggressively. A typical session may show 918M `totalTokens`, but ~893M of those are **cache reads** — previously cached context being re-read at 90% discount. The actual new token consumption is only ~25M.
+Los cache reads pueden dominar `totalTokens`, aunque no representen contexto nuevo al mismo precio. El dashboard usa input + cache creation + output como consumo efectivo y muestra los cache reads por separado. En Codex, ccusage v20 publica reasoning como subconjunto de output, por lo que solo se muestra como metadato. OpenCode lo guarda fuera de output: en ese proveedor se agrega una vez desde la base local y se propaga al reporte unificado.
 
-This dashboard shows **effective tokens** (input + cache creation + output) as the primary metric, with cache reads shown separately, so you get an accurate picture of your real consumption.
-
-## Quota configuration
-
-```bash
-ai-usage-quota edit
-```
-
-Useful fields:
-
-```json
-{
-  "version": 1,
-  "notes": [],
-  "claude": {
-    "liveUsage": true,
-    "liveUsageCacheSeconds": 300,
-    "fiveHourTokens": null,
-    "weeklyTokens": null
-  },
-  "codex": {
-    "useDetectedRateLimits": true,
-    "probe": false,
-    "probeCacheMinutes": 15,
-    "dailyTokens": null
-  },
-  "antigravity": {
-    "monthlyCredits": null,
-    "usedCredits": null,
-    "resetsAt": null
-  },
-  "minimax": {
-    "liveCaptureCacheMinutes": 0,
-    "monthlyCredits": null,
-    "resetsAt": null,
-    "apiKey": null
-  },
-  "opencode": {
-    "liveCaptureCacheMinutes": 5,
-    "fiveHourCost": 12,
-    "weeklyCost": 30,
-    "monthlyCost": 60,
-    "apiKey": null,
-    "serverOverride": {
-      "enabled": false,
-      "fiveHourUsed": null,
-      "weeklyUsed": null,
-      "monthlyUsed": null,
-      "reset5h": null,
-      "resetWeek": null,
-      "resetMonth": null,
-      "note": "Pega aqui los valores reales de opencode.ai/auth..."
-    }
-  }
-}
-```
-
-Para **Antigravity**, la cuota real se obtiene automáticamente y no requiere configuración manual. Sin embargo, los campos `monthlyCredits`, `usedCredits` y `resetsAt` (con valores numéricos y formato ISO respectivamente) se pueden configurar opcionalmente en `quotas.json` como fallback si la captura de cuota real falla.
-
-Set `AI_USAGE_ANTIGRAVITY_LIVE=0` to disable Antigravity live quota capture, and `AI_USAGE_ANTIGRAVITY_USAGE=0` to disable CLI capture (using API SDK only).
-
-### Antigravity
-
-Antigravity es la vía de acceso principal a los modelos Gemini, Claude (Opus, Sonnet) y GPT-OSS. Se renderiza en el dashboard y en la vista `--once` bajo la tarjeta/sección de Antigravity.
-
-- **Cuota real de todos los modelos**: Muestra la cuota real de todos los modelos disponibles en Antigravity (no solo Gemini).
-  - **Captura por CLI (Fuente Principal)**: Ejecuta de forma automática el comando interactivo `/usage` de la herramienta CLI `agy` o `antigravity`. Utiliza para ello el script `antigravity-usage-capture.py` (requiere que el CLI esté instalado y la sesión iniciada), el cual inicializa un pseudo-terminal (pty) para automatizar la interacción y parsear la salida.
-  - **API SDK de Google (Fallback)**: Si la captura por CLI falla o está desactivada (`AI_USAGE_ANTIGRAVITY_USAGE=0`), se realiza un fallback a la API de Google Cloud Code (`cloudcode-pa retrieveUserQuota`), la cual solo reporta cuota para los modelos Gemini (URL: `POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`).
-  - **Cuota manual**: Si ambas opciones fallan, se recurre a los valores de fallback manuales configurados en `antigravity.monthlyCredits`, `usedCredits` y `resetsAt` de `quotas.json`.
-- **Agrupación de límites**: Las cuotas se consolidan en 2 grupos:
-  - **Gemini**: Incluye Gemini Flash, Gemini Pro, etc.
-  - **Claude/GPT**: Incluye Claude Opus, Claude Sonnet y GPT-OSS.
-  - Cada uno de estos dos grupos dispone de límites específicos para ventanas de 5 horas y semanales, mostrando el porcentaje de uso actual y el tiempo restante de refresco.
-- **Detalle en el Dashboard**: Al pulsar `Enter` sobre la tarjeta de Antigravity en la interfaz TUI, se abre la vista detallada agrupando por Gemini y Claude/GPT, listando los límites con barras de progreso y temporizadores de cuenta regresiva (countdown).
-- **Consumo local**: El consumo interno de la sesión (sesiones individuales, pasos del modelo y timestamps de actividad) se sigue deduciendo del análisis de transcripts locales de Antigravity.
-
-### Gemini CLI (Removido)
-
-El soporte para Gemini CLI ha sido removido debido a que Google revocó el OAuth de gemini-cli (`invalid_grant`), inhabilitando la consulta directa de cuota. Antigravity es ahora la vía exclusiva para acceder y monitorear el consumo de los modelos Gemini.
-
-### OpenCode Go — server-override
-
-OpenCode Go no expone una API pública para leer la cuota real del servidor. Sin embargo, ahora es posible consultar la cuota real automáticamente mediante un scrape web autenticado del dashboard.
-
-#### Cómo funciona el scrape web
-- **Fetch**: Realiza peticiones HTTP GET a `https://opencode.ai/workspace/<workspaceId>/go` enviando la cookie de sesión `auth`.
-- **User-Agent**: Se utiliza un User-Agent de navegador Chrome para evitar que Cloudflare bloquee la petición al detectarla como bot.
-- **Parsing**: Parsea el HTML SSR del dashboard buscando los bloques de consumo (*Rolling/Weekly/Monthly Usage*) para extraer el porcentaje usado real y los tiempos de reset de cada período.
-- **Caché**: Los datos obtenidos se almacenan en caché por 5 minutos.
-
-#### Configuración en `quotas.json`
-Edita la sección `opencode` en tu archivo `quotas.json` y agrega las siguientes claves:
-
-```json
-"opencode": {
-  "cookie": "tu_valor_de_cookie_auth",
-  "workspaceId": "wrk_xxx"
-}
-```
-
-- **`cookie`**: El valor de la cookie `auth` de sesión de `opencode.ai`.
-- **`workspaceId`**: El identificador de tu workspace (por ejemplo, `wrk_xxx`).
-
-#### Cómo obtener la cookie
-1. Inicia sesión en tu cuenta en [opencode.ai](https://opencode.ai) en el navegador.
-2. Abre las herramientas de desarrollo (**F12** o clic derecho -> Inspeccionar).
-3. Dirígete a la pestaña **Application** (Chrome/Edge) o **Almacenamiento** (Firefox) y expande la sección **Cookies** seleccionando `https://opencode.ai`.
-4. Copia el valor del campo `auth`.
-
-#### Precedencia de datos
-El dashboard procesará las fuentes de datos según la siguiente prioridad:
-1. **Scrape Web (`[web]`)**: Si se configuran `cookie` y `workspaceId` en `quotas.json` (y `AI_USAGE_OPENCODE_WEB` no está establecido en `0`), se mostrará la cuota real obtenida de la web.
-2. **Server Override Manual**: Si el scrape no está disponible o falla, pero `serverOverride.enabled` está en `true`, se usarán los valores manuales de `quotas.json`.
-3. **Estimado Local**: Si no hay datos web ni manuales, se utilizará la estimación local de consumo a partir del archivo de base de datos `opencode.db`.
-
-#### Desactivación del Scrape Web
-Puedes desactivar temporal o permanentemente el scrape web estableciendo la variable de entorno `AI_USAGE_OPENCODE_WEB=0`. Por defecto, su valor es `1`.
-
-#### Nota de seguridad
-La cookie es un secreto de sesión sensible:
-- El comando `ai-usage-quota show` oculta/redacta el valor de la cookie automáticamente en pantalla.
-- El archivo `quotas.json` se ubica fuera del repositorio (en `~/.config/ai-usage-live/`) y nunca debe ser añadido al control de versiones.
-
-## Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `REFRESH_SEC` | `10` | Auto-refresh interval in seconds |
-| `AI_USAGE_CLAUDE_LIVE` | `1` | Set to `0` to disable Claude /usage |
-| `AI_USAGE_CODEX_PROBE` | `1` | Set to `0` to disable Codex live probe |
-| `CODEX_PROBE_CACHE_MINUTES` | `15` | Codex probe cache duration |
-| `CODEX_PROBE_TIMEOUT` | `16` | Timeout for Codex probe execution (in seconds) |
-| `AI_USAGE_ANTIGRAVITY_USAGE` | `1` | Set to `0` to disable CLI capture, using API SDK only / Establece en `0` para desactivar la captura del CLI y usar solo la API SDK |
-| `AI_USAGE_ANTIGRAVITY_LIVE` | `1` | Set to `0` to disable Antigravity live quota capture / Establece en `0` para desactivar la captura de cuota real de Antigravity |
-| `ANTIGRAVITY_USAGE_CACHE_MINUTES` | `3` | Antigravity quota cache duration / Minutos de caché para la cuota de Antigravity (la captura `/usage` tarda ~4-5s) |
-| `MINIMAX_API_KEY` | — | MiniMax Coding Plan API key |
-| `AI_USAGE_MINIMAX_LIVE` | `1` | Set to `0` to disable MiniMax API capture |
-| `MINIMAX_USAGE_CACHE_MINUTES` | `0` | MiniMax API cache duration |
-| `AI_USAGE_MINIMAX_DEBUG` | — | Debug de captura MiniMax (boolean o ruta al archivo de log) |
-| `MINIMAX_USAGE_URL` | `https://api.minimax.io/v1/api/openplatform/coding_plan/remains` | Override endpoint API de MiniMax |
-| `AI_USAGE_OPENCODE_LIVE` | `1` | Set to `0` to disable OpenCode Go DB capture |
-| `OPENCODE_USAGE_CACHE_MINUTES` | `5` | OpenCode Go DB cache duration |
-| `AI_USAGE_OPENCODE_WEB` | `1` | Set to `0` to disable OpenCode Go web scraping / Establece en `0` para desactivar el scrape web de cuota de OpenCode Go |
-| `XDG_CONFIG_HOME` | `~/.config` | Base directory for `ai-usage-live/quotas.json` and local caches |
-| `AI_USAGE_GEMINI_LIVE` | `1` | *(Obsoleta/Removida)* Set to `0` to disable Gemini capture |
-| `AI_USAGE_GEMINI_TIMEOUT` | `45` | *(Obsoleta/Removida)* Gemini capture timeout in seconds |
-| `AI_USAGE_GEMINI_DEBUG_FILE` | — | *(Obsoleta/Removida)* Write raw Gemini capture output to file |
-
-## License
+## Licencia
 
 MIT

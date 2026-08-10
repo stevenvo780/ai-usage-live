@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -34,21 +35,27 @@ const SOURCE_META = {
   all: { label: "Todos", color: colors.cyan },
   claude: { label: "Claude", color: colors.magenta },
   codex: { label: "Codex", color: colors.green },
-  gemini: { label: "Gemini", color: colors.blue },
+  gemini: { label: "Gemini · Agy", color: colors.blue },
   antigravity: { label: "Antigravity", color: colors.yellow },
   minimax: { label: "MiniMax", color: colors.cyan },
   opencode: { label: "OpenCode", color: colors.green },
 };
 
-const ALL_SOURCES = ["claude", "codex", "opencode"];
-const SOURCE_KEYS = ["all", "claude", "codex", "antigravity", "minimax", "opencode"];
-// Orden de las tarjetas del grid de cuotas (drill-down con flechas + enter).
-const PROVIDER_ORDER = ["claude", "codex", "antigravity", "minimax", "opencode"];
+const ALL_SOURCES = ["claude", "codex", "gemini", "opencode"];
+const SOURCE_KEYS = ["all", "claude", "codex", "gemini", "minimax", "opencode"];
+// El grid muestra licencias ejecutables, no fuentes tecnicas. OpenCode sigue disponible en
+// consumo, pero no ocupa una tarjeta de licencia. Claude/Gemini se expanden mas abajo a una
+// tarjeta por cuenta.
+const PROVIDER_ORDER = ["claude", "codex", "gemini", "minimax"];
+// Inventario de colectores, independiente de lo que el TUI decide mostrar. Agy/Antigravity
+// sigue alimentando Gemini aunque no tenga una tarjeta duplicada en PROVIDER_ORDER.
+const ACCOUNT_PROVIDER_ORDER = ["claude", "codex", "gemini", "antigravity", "minimax", "opencode"];
 // Metadata visual de cada proveedor para el grid/detalle de cuotas.
 // Iconos single-width (NO emojis doble-ancho) para que no descuadren el TUI.
 const PROVIDER_META = {
   claude: { label: "Claude", color: colors.magenta, icon: "\u2726" },
-  codex: { label: "Codex", color: colors.green, icon: "\u2B21" },
+  codex: { label: "GPT · Codex", color: colors.green, icon: "\u2B21" },
+  gemini: { label: "Gemini · Agy", color: colors.blue, icon: "\u25C8" },
   antigravity: { label: "Antigravity", color: colors.yellow, icon: "\u25C6" },
   minimax: { label: "MiniMax", color: colors.cyan, icon: "\u25B0" },
   opencode: { label: "OpenCode", color: colors.blue, icon: "\u26C1" },
@@ -56,6 +63,13 @@ const PROVIDER_META = {
 const VIEW_KEYS = ["daily", "weekly", "monthly", "session", "blocks"];
 const TAB_KEYS = ["cuotas", "consumo"];
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const APP_VERSION = (() => {
+  try {
+    return String(JSON.parse(readFileSync(path.join(SCRIPT_DIR, "package.json"), "utf8")).version);
+  } catch {
+    return "unknown";
+  }
+})();
 const CONFIG_BASE_DIR = process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config");
 const CONFIG_DIR = path.join(CONFIG_BASE_DIR, "ai-usage-live");
 const QUOTA_CONFIG_PATH = path.join(CONFIG_DIR, "quotas.json");
@@ -63,7 +77,11 @@ const CLAUDE_USAGE_CACHE_PATH = path.join(CONFIG_DIR, "claude-usage-cache.json")
 const GEMINI_QUOTA_CACHE_PATH = path.join(CONFIG_DIR, "gemini-quota-cache.json");
 const MINIMAX_USAGE_CACHE_PATH = path.join(CONFIG_DIR, "minimax-usage-cache.json");
 const OPENCODE_USAGE_CACHE_PATH = path.join(CONFIG_DIR, "opencode-usage-cache.json");
-const OPENCODE_DB_PATH = path.join(homedir(), ".local", "share", "opencode", "opencode.db");
+const OPENCODE_DB_FALLBACK_PATH = path.join(
+  process.env.XDG_DATA_HOME || path.join(homedir(), ".local", "share"),
+  "opencode",
+  "opencode.db",
+);
 const ANTIGRAVITY_QUOTA_CACHE_PATH = path.join(CONFIG_DIR, "antigravity-quota-cache.json");
 const ANTIGRAVITY_TOKEN_PATH = path.join(homedir(), ".gemini", "antigravity-cli", "antigravity-oauth-token");
 const ANTIGRAVITY_PROJECTS_PATH = path.join(homedir(), ".gemini", "antigravity-cli", "cache", "projects.json");
@@ -85,6 +103,8 @@ const state = {
   error: "",
   selectedModel: 0,
   cardIndex: 0,
+  detailModelIndex: 0, // cursor de modelo dentro del detalle (indexa la lista aplanada de ventanas)
+  revealHidden: false, // modo "ver ocultos" (H): muestra tarjetas/modelos ocultos sin desocultarlos
   detail: false,
   once: args.once,
   json: args.json,
@@ -93,17 +113,22 @@ const state = {
 let ccusageCommand = null;
 let refreshTimer = null;
 let pendingRefresh = null;
+// Copia en memoria del bloque `display` de quotas.json; las teclas h/H la mutan y
+// saveDisplayConfig() la vuelca a disco. hiddenModels usa el token "provider:modelKey".
+let displayConfig = { hideUnusable: true, hiddenProviders: [], hiddenModels: [] };
 
 const INVOKED_DIRECTLY =
   Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
-if (INVOKED_DIRECTLY) {
-  main().catch((error) => {
-    cleanup();
-    console.error(error?.stack || String(error));
-    process.exit(1);
-  });
-}
+// El arranque (llamar a main()) se dispara al FINAL del archivo, no aca: aca solo se
+// calcula el flag. main() llega sincronicamente (antes de su primer await) hasta
+// resolveAllAccounts()/inspectAccountCredential(), que leen consts de modulo declaradas
+// mas abajo (DEFAULT_ACCOUNT_ID, PLACEHOLDER_TOKEN_RE, ACCOUNT_BLOCKING_STATUSES, etc. —
+// la infraestructura de cuentas). Si el arranque quedara aca, esas consts seguirian en su
+// TDZ (la evaluacion del modulo todavia no llego a esas lineas) y CUALQUIER ejecucion
+// directa (`node ai-usage-tui.mjs`, `--once`, `--json`, la TUI interactiva) reventaria con
+// "ReferenceError: Cannot access '<CONST>' before initialization" antes de imprimir nada
+// (verificado: se reproduce siempre, de forma determinista, no es intermitente).
 
 async function main() {
   ccusageCommand = detectCcusage();
@@ -117,6 +142,8 @@ async function main() {
     else console.log(renderPlainSummary(state.lastSnapshot));
     return;
   }
+
+  loadDisplayConfig(state.lastSnapshot?.quotaConfig?.display);
 
   process.stdout.write(ALT_ON + HIDE_CURSOR);
   process.stdin.setRawMode(true);
@@ -144,11 +171,15 @@ function parseArgs(argv) {
     else if (arg === "--source") parsed.source = argv[++i];
     else if (VIEW_KEYS.includes(arg)) parsed.view = arg;
     else if (SOURCE_KEYS.includes(arg)) parsed.source = arg;
+    else if (arg === "antigravity") parsed.source = "gemini";
     else if (arg === "-h" || arg === "--help") {
       printHelp();
       process.exit(0);
     }
   }
+  // Compatibilidad: scripts viejos pueden seguir pasando --source antigravity, pero la
+  // interfaz lo concilia bajo el unico nombre que usa el operador: Gemini · Agy.
+  if (parsed.source === "antigravity") parsed.source = "gemini";
   if (!VIEW_KEYS.includes(parsed.view ?? "daily")) parsed.view = "daily";
   if (!SOURCE_KEYS.includes(parsed.source ?? "all")) parsed.source = "all";
   if (!Number.isFinite(parsed.refreshSec) || parsed.refreshSec < 2) parsed.refreshSec = 10;
@@ -164,18 +195,19 @@ Views:
   daily, weekly, monthly, session, blocks
 
 Sources:
-  all, claude, codex, antigravity, minimax, opencode
-  (gemini-cli fue removido: Google revocó su OAuth; usa Antigravity para Gemini)
+  all, claude, codex, gemini (via Agy), minimax, opencode
 
 Opciones:
   --since YYYY-MM-DD
   --until YYYY-MM-DD
   --refresh SEGUNDOS
   --once
+  --json
 
 Teclas:
   q salir, r refrescar, 1 daily, 2 weekly, 3 monthly, 4 session, 5 blocks
-  a todos, c Claude, x Codex, v Antigravity, m MiniMax, o OpenCode, flechas mover modelo
+  a todos, c Claude, x Codex, g/v Gemini · Agy, m MiniMax, o OpenCode, flechas mover modelo
+  h ocultar proveedor/modelo seleccionado, H ver/gestionar ocultos (cuotas)
 `);
 }
 
@@ -227,6 +259,13 @@ async function refresh(options = {}) {
     state.error = error?.message || String(error);
   } finally {
     state.loading = false;
+    // El set visible pudo encogerse (un proveedor paso a needsAuth/not-installed) o el
+    // proveedor en detalle pudo perder ventanas: re-alinea los indices para que h/flechas
+    // no queden apuntando fuera de rango tras la captura.
+    reconcileCardIndex();
+    const selected = visibleQuotaCards()[state.cardIndex];
+    const listLen = selected ? detailWindowList(selected.quota, selected.provider).length : 0;
+    if (state.detailModelIndex > listLen - 1) state.detailModelIndex = Math.max(0, listLen - 1);
     render();
     if (pendingRefresh) {
       const nextRefresh = pendingRefresh;
@@ -241,31 +280,50 @@ async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ig
   const sources = {};
   const view = state.view;
   const quotaConfig = loadQuotaConfig();
-  const liveQuotaPromise = includeLive
-    ? Promise.allSettled([
-        collectClaudeUsageLive(quotaConfig.claude, { ignoreCache: ignoreLiveCache }),
-        collectAntigravityQuotaLive(quotaConfig.antigravity, { ignoreCache: ignoreLiveCache }),
-      ])
-    : Promise.resolve([
-        {
-          status: "fulfilled",
-          value: staleLiveQuota(
-            "claude",
-            CLAUDE_USAGE_CACHE_PATH,
-            "Claude /usage se esta capturando; mostrando ultimo dato conocido.",
-            "Claude /usage se esta capturando en segundo plano.",
-          ),
-        },
-        {
-          status: "fulfilled",
-          value: staleLiveQuota(
-            "antigravity",
-            ANTIGRAVITY_QUOTA_CACHE_PATH,
-            "Antigravity quota se esta capturando; mostrando ultimo dato conocido.",
-            "Antigravity quota se esta capturando en segundo plano.",
-          ),
-        },
-      ]);
+  // Cuentas resueltas UNA vez por snapshot: la validacion, el preflight de credenciales
+  // y la herencia de defaults se hacen aqui, no dentro de cada colector.
+  const accounts = resolveAllAccounts(quotaConfig);
+  const staleNote = (base) => (reason) => (reason ? `${base} (${reason})` : base);
+  // El paralelismo ENTRE proveedores no cambia; lo que cambia es que dentro de cada
+  // rama las cuentas se recorren en serie con presupuesto.
+  const liveQuotaPromise = Promise.allSettled([
+    collectProviderAccountsLive("claude", accounts.claude, {
+      includeLive,
+      ignoreCache: ignoreLiveCache,
+      cacheSuffix: "usage-cache",
+      run: (account, opts) => collectClaudeUsageLive(account.config, { ...opts, account }),
+      stale: (account, reason) => staleLiveQuota(
+        "claude",
+        accountCachePath(account, "usage-cache"),
+        staleNote("Claude /usage se esta capturando; mostrando ultimo dato conocido.")(reason),
+        staleNote("Claude /usage se esta capturando en segundo plano.")(reason),
+      ),
+    }),
+    collectProviderAccountsLive("antigravity", accounts.antigravity, {
+      includeLive,
+      ignoreCache: ignoreLiveCache,
+      cacheSuffix: "quota-cache",
+      run: (account, opts) => collectAntigravityQuotaLive(account.config, { ...opts, account }),
+      stale: (account, reason) => staleLiveQuota(
+        "antigravity",
+        accountCachePath(account, "quota-cache"),
+        staleNote("Antigravity quota se esta capturando; mostrando ultimo dato conocido.")(reason),
+        staleNote("Antigravity quota se esta capturando en segundo plano.")(reason),
+      ),
+    }),
+    collectProviderAccountsLive("gemini", accounts.gemini, {
+      includeLive,
+      ignoreCache: ignoreLiveCache,
+      cacheSuffix: "quota-cache",
+      run: (account, opts) => collectGeminiQuotaLive(account.config, { ...opts, account }),
+      stale: (account, reason) => staleLiveQuota(
+        "gemini",
+        accountCachePath(account, "quota-cache"),
+        staleNote("Gemini /stats model se esta capturando; mostrando ultimo dato conocido.")(reason),
+        staleNote("Gemini /stats model se esta capturando en segundo plano.")(reason),
+      ),
+    }),
+  ]);
 
   const ccusageJobs = [];
   const ccOpts = { ignoreCache: ignoreLiveCache };
@@ -290,24 +348,52 @@ async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ig
 
   fillFocusedModelGaps(sources);
   sources.antigravity = collectAntigravity();
-  sources.minimax = includeLive
-    ? await collectMiniMaxUsage(quotaConfig, { ignoreCache: ignoreMiniMaxCache })
-    : staleMiniMaxUsage("MiniMax se esta capturando; mostrando ultimo dato conocido.")
-      || { source: "minimax", ok: false, note: "MiniMax se esta capturando en segundo plano." };
-  sources.opencodeLive = includeLive
-    ? await collectOpenCodeUsage(quotaConfig, { ignoreCache: ignoreLiveCache || ignoreMiniMaxCache })
-    : staleOpenCodeUsage("OpenCode Go se esta capturando; mostrando ultimo dato conocido.")
-      || { source: "opencode", ok: false, note: "OpenCode Go se esta capturando en segundo plano." };
+  sources.minimaxAccounts = await collectProviderAccountsLive("minimax", accounts.minimax, {
+    includeLive,
+    ignoreCache: ignoreMiniMaxCache,
+    cacheSuffix: "usage-cache",
+    run: (account, opts) => collectMiniMaxUsage(quotaConfig, { ...opts, account }),
+    stale: (account) => staleCachedUsage(
+      "minimax",
+      accountCachePath(account, "usage-cache"),
+      "MiniMax se esta capturando; mostrando ultimo dato conocido.",
+      "MiniMax se esta capturando en segundo plano.",
+    ),
+  });
+  sources.minimax = primaryAccountLive(sources.minimaxAccounts, { source: "minimax", ok: false });
+  sources.opencodeAccounts = await collectProviderAccountsLive("opencode", accounts.opencode, {
+    includeLive,
+    ignoreCache: ignoreLiveCache || ignoreMiniMaxCache,
+    cacheSuffix: "usage-cache",
+    run: (account, opts) => collectOpenCodeUsage(quotaConfig, { ...opts, account }),
+    stale: (account) => staleCachedUsage(
+      "opencode",
+      accountCachePath(account, "usage-cache"),
+      "OpenCode Go se esta capturando; mostrando ultimo dato conocido.",
+      "OpenCode Go se esta capturando en segundo plano.",
+    ),
+  });
+  sources.opencodeLive = primaryAccountLive(sources.opencodeAccounts, { source: "opencode", ok: false });
+  enrichUnifiedReasoning(sources);
   sources.opencodeServer = includeLive
     ? await collectOpenCodeServerUsage(quotaConfig.opencode, { ignoreCache: ignoreLiveCache || ignoreMiniMaxCache })
     : (readJsonSafe(OPENCODE_SERVER_CACHE_PATH) ? { ...readJsonSafe(OPENCODE_SERVER_CACHE_PATH), cacheHit: true, cacheStale: true } : { ok: false });
   const liveQuotaSettled = await liveQuotaPromise;
-  sources.claudeLive = liveQuotaSettled[0].status === "fulfilled" ? liveQuotaSettled[0].value : { ok: false };
-  sources.antigravityLive = liveQuotaSettled[1].status === "fulfilled" ? liveQuotaSettled[1].value : { ok: false };
-  sources.codexLive = includeLive
-    ? await collectCodexLive(quotaConfig.codex, { ignoreCache: ignoreLiveCache })
-    : (readJsonSafe(CODEX_PROBE_CACHE_PATH) || { ok: false });
-  const quotas = buildQuotaState(sources, quotaConfig);
+  sources.claudeLiveAccounts = liveQuotaSettled[0].status === "fulfilled" ? liveQuotaSettled[0].value : [];
+  sources.antigravityLiveAccounts = liveQuotaSettled[1].status === "fulfilled" ? liveQuotaSettled[1].value : [];
+  sources.geminiLiveAccounts = liveQuotaSettled[2].status === "fulfilled" ? liveQuotaSettled[2].value : [];
+  sources.claudeLive = primaryAccountLive(sources.claudeLiveAccounts, { ok: false });
+  sources.antigravityLive = primaryAccountLive(sources.antigravityLiveAccounts, { ok: false });
+  sources.geminiLive = primaryAccountLive(sources.geminiLiveAccounts, { ok: false });
+  sources.codexLiveAccounts = await collectProviderAccountsLive("codex", accounts.codex, {
+    includeLive,
+    ignoreCache: ignoreLiveCache,
+    cacheSuffix: "probe-cache",
+    run: (account, opts) => collectCodexLive(account.config, { ...opts, account }),
+    stale: (account) => readJsonSafe(accountCachePath(account, "probe-cache")) || { ok: false },
+  });
+  sources.codexLive = primaryAccountLive(sources.codexLiveAccounts, { ok: false });
+  const quotas = buildQuotaState(sources, quotaConfig, accounts);
 
   return {
     view,
@@ -334,6 +420,199 @@ function staleLiveQuota(source, cachePath, cacheNote, emptyNote) {
     };
   }
   return { source, ok: false, note: emptyNote };
+}
+
+// Usada por los `stale:` callback de MiniMax/OpenCode (proveedores de "usage" cacheado, no
+// de "quota en vivo"): mismo shape/comportamiento que staleLiveQuota (cache-hit -> datos
+// viejos marcados stale; sin cache -> {ok:false, note}). Nombre propio solo para que cada
+// call-site sea autoexplicativo sobre que tipo de dato esta sirviendo.
+function staleCachedUsage(source, cachePath, cacheNote, emptyNote) {
+  return staleLiveQuota(source, cachePath, cacheNote, emptyNote);
+}
+
+// ---------------------------------------------------------------------------
+// Planificador de capturas vivas por cuenta.
+//
+// COSTO: claude /usage, agy /usage y gemini /stats abren un CLI COMPLETO (30-45 s) y el
+// tools/call del MCP BLOQUEA sobre el snapshot. Con N cuentas en paralelo se dispararia
+// la latencia del hook y el auto-throttle de /usage. Reglas:
+//   (a) las cuentas del MISMO proveedor se capturan EN SERIE (el paralelismo ENTRE
+//       proveedores no cambia);
+//   (b) presupuesto de 1 captura viva por refresh para proveedores pesados, eligiendo la
+//       cuenta menos reciente (LRU); las demas se sirven de SU cache marcadas stale.
+// Con UNA cuenta el presupuesto es infinito -> comportamiento identico al de siempre.
+// ---------------------------------------------------------------------------
+
+function providerLiveTtlMs(provider, config = {}) {
+  switch (provider) {
+    case "claude":
+      return Math.max(0, Number(config.liveUsageCacheSeconds ?? 300)) * 1000;
+    case "codex": {
+      const legacyMinutes = Number(process.env.CODEX_PROBE_CACHE_MINUTES ?? config.probeCacheMinutes ?? 1);
+      return Math.max(0, Number(process.env.CODEX_USAGE_CACHE_SECONDS ?? config.liveUsageCacheSeconds ?? legacyMinutes * 60)) * 1000;
+    }
+    case "gemini":
+      return Math.max(0, Number(config.liveCaptureCacheMinutes ?? 15)) * 60000;
+    case "antigravity":
+      return Math.max(0, Number(process.env.ANTIGRAVITY_USAGE_CACHE_MINUTES ?? config.liveCaptureCacheMinutes ?? 3)) * 60000;
+    case "minimax":
+      return Math.max(0, Number(process.env.MINIMAX_USAGE_CACHE_MINUTES ?? config.liveCaptureCacheMinutes ?? 0)) * 60000;
+    case "opencode":
+      return Math.max(0, Number(process.env.OPENCODE_USAGE_CACHE_MINUTES ?? config.liveCaptureCacheMinutes ?? 5)) * 60000;
+    default:
+      return 0;
+  }
+}
+
+function liveAccountBudget(provider, resolved, { ignoreCache = false } = {}) {
+  if (!resolved?.multi) return Infinity;
+  if (ignoreCache) return Infinity; // refresh manual explicito: el humano pidio todo
+  const fromEnv = Number(process.env.AI_USAGE_PROBE_BUDGET);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  const configured = Number(resolved.accounts[0]?.config?.maxLiveAccountsPerRefresh);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  return HEAVY_PROBE_PROVIDERS.has(provider) ? 1 : Infinity;
+}
+
+function readAccountSched(account) {
+  return readJsonSafe(accountCachePath(account, "sched")) || {};
+}
+
+function writeAccountSched(account, patch) {
+  const current = readAccountSched(account);
+  writeJsonCache(accountCachePath(account, "sched"), { ...current, ...patch });
+}
+
+// Backoff exponencial acotado: tras fallos consecutivos la cuenta deja de consumir
+// presupuesto (y de colgarse 30 s por refresh) hasta que toque su turno o el humano
+// pida un refresh manual con ignoreCache.
+function accountBackoffMs(failureCount) {
+  const n = Math.max(0, Number(failureCount) || 0);
+  if (!n) return 0;
+  return Math.min(5 * 60000 * 2 ** (n - 1), 6 * 3600000);
+}
+
+function blockedAccountLive(provider, account) {
+  const status = account.duplicateOf
+    ? "duplicate"
+    : account.enabled === false
+      ? "disabled"
+      : account.health?.status || "unknown";
+  const notes = {
+    duplicate: `Cuenta ignorada: apunta a la misma suscripcion que "${account.duplicateOf}".`,
+    disabled: "Cuenta deshabilitada en quotas.json (enabled:false).",
+    unauthenticated: `Cuenta sin credencial usable: ${account.health?.detail || "sin credenciales"}.`,
+    "credential-broken": `Credencial rota: ${account.health?.detail || "token invalido"}.`,
+    "credential-expired": `Credencial vencida: ${account.health?.detail || "token vencido"}.`,
+  };
+  return {
+    source: provider,
+    ok: false,
+    unusable: true,
+    reason: status === "unauthenticated" ? "unauthenticated" : "not-configured",
+    needsAuth: status === "unauthenticated" || status === "credential-broken" || status === "credential-expired",
+    accountBlocked: true,
+    accountStatus: status,
+    note: notes[status] || `Cuenta no utilizable (${status}).`,
+  };
+}
+
+async function collectProviderAccountsLive(provider, resolved, {
+  includeLive = true,
+  ignoreCache = false,
+  run,
+  stale,
+  cacheSuffix,
+} = {}) {
+  const accounts = resolved?.accounts || [];
+  const results = new Map();
+  const wrap = (account, live) => ({
+    accountId: account.id,
+    account,
+    provider,
+    label: account.label,
+    priority: account.priority,
+    enabled: account.enabled,
+    blocked: Boolean(account.blocked),
+    health: account.health,
+    live,
+  });
+
+  if (!includeLive) {
+    // Rama del TUI interactivo: SOLO lecturas de disco, jamas un proceso pesado.
+    return accounts.map((account) => wrap(account, stale(account)));
+  }
+
+  const budget = liveAccountBudget(provider, resolved, { ignoreCache });
+  const now = Date.now();
+  const pending = [];
+  for (const account of accounts) {
+    if (account.blocked) {
+      // Preflight gratis: nunca gastamos un CLI de 30-45 s en una credencial rota.
+      results.set(account.id, wrap(account, blockedAccountLive(provider, account)));
+      continue;
+    }
+    const cachePath = accountCachePath(account, cacheSuffix);
+    const ttlMs = providerLiveTtlMs(provider, account.config);
+    const fresh = !ignoreCache && ttlMs > 0 && Boolean(readJsonCache(cachePath, ttlMs));
+    if (fresh) {
+      // El cache esta vigente: el colector lo devuelve sin lanzar nada, no gasta presupuesto.
+      results.set(account.id, wrap(account, await run(account, { ignoreCache: false })));
+      continue;
+    }
+    const sched = resolved.multi ? readAccountSched(account) : {};
+    const nextEligibleAt = Date.parse(sched.nextEligibleAt || "");
+    const throttled = !ignoreCache && Number.isFinite(nextEligibleAt) && nextEligibleAt > now;
+    const cached = readJsonSafe(cachePath);
+    const lastSeen = Math.max(
+      Date.parse(cached?.capturedAt || "") || 0,
+      Date.parse(sched.lastAttemptAt || "") || 0,
+    );
+    pending.push({ account, cachePath, lastSeen, throttled });
+  }
+
+  // LRU: la cuenta con la observacion mas vieja primero. Se autocorrige si un refresh
+  // muere a mitad del probe y una cuenta nueva (lastSeen 0) gana turno automaticamente.
+  pending.sort((a, b) => a.lastSeen - b.lastSeen);
+  let spent = 0;
+  for (const item of pending) {
+    const { account, cachePath, throttled } = item;
+    if (throttled || spent >= budget) {
+      results.set(account.id, wrap(account, stale(account, throttled ? "backoff" : "presupuesto")));
+      continue;
+    }
+    spent += 1;
+    // lastAttemptAt ANTES del probe: si el proceso muere o hay timeout, el proximo
+    // refresh no reintenta la misma cuenta en bucle cerrado.
+    if (resolved.multi) writeAccountSched(account, { lastAttemptAt: new Date().toISOString() });
+    let live;
+    try {
+      live = await run(account, { ignoreCache });
+    } catch (error) {
+      live = { source: provider, ok: false, note: `captura fallo: ${shortError(error)}` };
+    }
+    if (resolved.multi) {
+      const sched = readAccountSched(account);
+      const failureCount = live?.ok ? 0 : Math.max(0, Number(sched.failureCount) || 0) + 1;
+      writeAccountSched(account, {
+        failureCount,
+        lastSuccessAt: live?.ok ? new Date().toISOString() : sched.lastSuccessAt || null,
+        nextEligibleAt: failureCount
+          ? new Date(Date.now() + accountBackoffMs(failureCount)).toISOString()
+          : null,
+      });
+    }
+    void cachePath;
+    results.set(account.id, wrap(account, live));
+  }
+  return accounts.map((account) => results.get(account.id)).filter(Boolean);
+}
+
+// El primer elemento es la cuenta declarada primero: mantiene `sources.<p>Live` con
+// exactamente la misma forma que antes para todos los consumidores existentes.
+function primaryAccountLive(entries, fallback) {
+  const first = Array.isArray(entries) ? entries[0] : null;
+  return first?.live ?? fallback;
 }
 
 function sourceSupportsView(source, view) {
@@ -391,7 +670,7 @@ function firstArray(raw) {
 function sumRows(rows) {
   const totals = {};
   for (const row of rows) {
-    for (const key of ["inputTokens", "outputTokens", "cacheCreationTokens", "cacheReadTokens", "totalTokens", "totalCost"]) {
+    for (const key of ["inputTokens", "outputTokens", "reasoningOutputTokens", "cacheCreationTokens", "cacheReadTokens", "totalTokens", "totalCost", "costUSD"]) {
       totals[key] = (totals[key] || 0) + Number(row[key] || 0);
     }
   }
@@ -401,12 +680,14 @@ function sumRows(rows) {
 function normalizeTotals(totals) {
   const inputTokens = Number(totals.inputTokens || 0);
   const outputTokens = Number(totals.outputTokens || 0);
+  const reasoningOutputTokens = Number(totals.reasoningOutputTokens || 0);
   const cacheCreationTokens = Number(totals.cacheCreationTokens || 0);
   const cacheReadTokens = Number(totals.cacheReadTokens || 0);
+  // ccusage/Codex reports reasoning as a subset of outputTokens, not an extra token bucket.
   const totalTokens = Number(totals.totalTokens || inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens);
   const effectiveTokens = inputTokens + cacheCreationTokens + outputTokens;
   const totalCost = Number(totals.totalCost || totals.cost || totals.costUSD || 0);
-  return { inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, totalTokens, effectiveTokens, totalCost };
+  return { inputTokens, outputTokens, reasoningOutputTokens, cacheCreationTokens, cacheReadTokens, totalTokens, effectiveTokens, totalCost };
 }
 
 function extractModels(row) {
@@ -421,6 +702,7 @@ function extractModels(row) {
         modelName,
         inputTokens: data.inputTokens,
         outputTokens: data.outputTokens,
+        reasoningOutputTokens: data.reasoningOutputTokens,
         cacheCreationTokens: data.cacheCreationTokens,
         cacheReadTokens: data.cacheReadTokens,
         totalTokens,
@@ -434,6 +716,7 @@ function extractModels(row) {
         modelName: row.modelsUsed[0],
         inputTokens: row.inputTokens,
         outputTokens: row.outputTokens,
+        reasoningOutputTokens: row.reasoningOutputTokens,
         cacheCreationTokens: row.cacheCreationTokens,
         cacheReadTokens: row.cacheReadTokens,
         totalTokens: row.totalTokens,
@@ -442,6 +725,62 @@ function extractModels(row) {
     ];
   }
   return [];
+}
+
+function enrichUnifiedReasoning(sources) {
+  const unified = sources?.all;
+  const codex = sources?.codex;
+  if (!unified?.totals) return;
+
+  const opencode = sources?.opencode;
+  const opencodeData = sources?.opencodeLive?.data || {};
+  const opencodeReasoning = Number(opencodeData.totalReasoning || 0);
+  const opencodeReasoningByModel = opencodeData.reasoningByModel && typeof opencodeData.reasoningByModel === "object"
+    ? opencodeData.reasoningByModel
+    : {};
+  let opencodeEffectiveDelta = 0;
+  if (opencode?.totals && opencodeReasoning > 0) {
+    const current = Number(opencode.totals.reasoningOutputTokens || 0);
+    const missing = Math.max(0, opencodeReasoning - current);
+    opencode.totals.reasoningOutputTokens = current + missing;
+    opencode.totals.effectiveTokens = Number(opencode.totals.effectiveTokens || 0) + missing;
+    opencodeEffectiveDelta = missing;
+    for (const model of opencode.models || []) {
+      const target = Number(opencodeReasoningByModel[String(model.modelName || "").toLowerCase()] || 0);
+      const modelCurrent = Number(model.reasoningOutputTokens || 0);
+      const modelMissing = Math.max(0, target - modelCurrent);
+      if (modelMissing <= 0) continue;
+      model.reasoningOutputTokens = modelCurrent + modelMissing;
+      model.effectiveTokens = Number(model.effectiveTokens || 0) + modelMissing;
+    }
+  }
+
+  const focusedReasoning = Number(codex?.totals?.reasoningOutputTokens || 0)
+    + Number(opencode?.totals?.reasoningOutputTokens || 0);
+  const unifiedReasoning = Number(unified.totals.reasoningOutputTokens || 0);
+  const missingReasoning = Math.max(0, focusedReasoning - unifiedReasoning);
+  if (missingReasoning > 0) {
+    unified.totals.reasoningOutputTokens = unifiedReasoning + missingReasoning;
+  }
+  // Solo OpenCode mantiene reasoning fuera de output; Codex ya lo incluye en outputTokens.
+  unified.totals.effectiveTokens = Number(unified.totals.effectiveTokens || 0) + opencodeEffectiveDelta;
+
+  const focusedByName = new Map();
+  for (const model of [...(codex?.models || []), ...(opencode?.models || [])]) {
+    const key = String(model.modelName || "").toLowerCase();
+    const current = focusedByName.get(key) || 0;
+    focusedByName.set(key, current + Number(model.reasoningOutputTokens || 0));
+  }
+  for (const model of unified.models || []) {
+    const focusedModelReasoning = Number(focusedByName.get(String(model.modelName || "").toLowerCase()) || 0);
+    if (focusedModelReasoning <= 0) continue;
+    const unifiedModelReasoning = Number(model.reasoningOutputTokens || 0);
+    const missingModelReasoning = Math.max(0, focusedModelReasoning - unifiedModelReasoning);
+    if (missingModelReasoning <= 0) continue;
+    model.reasoningOutputTokens = unifiedModelReasoning + missingModelReasoning;
+    const opencodeModelReasoning = Number(opencodeReasoningByModel[String(model.modelName || "").toLowerCase()] || 0);
+    model.effectiveTokens = Number(model.effectiveTokens || 0) + opencodeModelReasoning;
+  }
 }
 
 function fillFocusedModelGaps(sources) {
@@ -471,6 +810,7 @@ function mergeModels(models) {
       modelName: name,
       inputTokens: 0,
       outputTokens: 0,
+      reasoningOutputTokens: 0,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalTokens: 0,
@@ -478,6 +818,7 @@ function mergeModels(models) {
     };
     current.inputTokens += Number(model.inputTokens || 0);
     current.outputTokens += Number(model.outputTokens || 0);
+    current.reasoningOutputTokens += Number(model.reasoningOutputTokens || 0);
     current.cacheCreationTokens += Number(model.cacheCreationTokens || 0);
     current.cacheReadTokens += Number(model.cacheReadTokens || 0);
     current.cost += Number(model.cost || model.totalCost || 0);
@@ -556,7 +897,7 @@ function collectAntigravity() {
 
 function defaultQuotaConfig() {
   return {
-    version: 1,
+    version: 2,
     notes: [
       "Put your real plan limits here. Leave null when the provider does not expose a stable local limit.",
       "Token limits are local-dashboard limits, not official billing unless you copy them from the provider UI.",
@@ -568,6 +909,8 @@ function defaultQuotaConfig() {
       weeklyTokens: null,
     },
     codex: {
+      liveUsage: true,
+      liveUsageCacheSeconds: 60,
       useDetectedRateLimits: true,
       dailyTokens: null,
       probe: false,
@@ -580,17 +923,22 @@ function defaultQuotaConfig() {
       dailyRequests: null,
     },
     antigravity: {
+      liveCapture: true,
+      liveCaptureCacheMinutes: 3,
+      usageTimeoutSeconds: 40,
       monthlyCredits: null,
       usedCredits: null,
       resetsAt: null,
     },
     minimax: {
+      liveCapture: true,
       liveCaptureCacheMinutes: 0,
       monthlyCredits: null,
       resetsAt: null,
       apiKey: null,
     },
     opencode: {
+      liveCapture: true,
       liveCaptureCacheMinutes: 5,
       fiveHourCost: 12,
       weeklyCost: 30,
@@ -610,6 +958,14 @@ function defaultQuotaConfig() {
         note: "Pega aqui los valores reales de opencode.ai/auth (cost en USD y resets ISO). Pon capturedAt (ISO) al pegar para ver la frescura. Cuando enabled=true, reemplaza el estimado local.",
       },
     },
+    display: {
+      // Visibilidad de la TUI/--json/MCP. hideUnusable auto-oculta proveedores sin cuenta
+      // usable (no-auth/no-instalado/no-configurado). hiddenProviders/hiddenModels son la
+      // seleccion manual (tecla h en la TUI). Los modelos usan el token "provider:modelKey".
+      hideUnusable: true,
+      hiddenProviders: [],
+      hiddenModels: [],
+    },
   };
 }
 
@@ -622,9 +978,45 @@ function loadQuotaConfig() {
       return { ...defaults, configPath: QUOTA_CONFIG_PATH, created: true };
     }
     const parsed = JSON.parse(readFileSync(QUOTA_CONFIG_PATH, "utf8"));
-    return deepMerge(defaults, parsed, { configPath: QUOTA_CONFIG_PATH, created: false });
+    const merged = deepMerge(defaults, parsed, { configPath: QUOTA_CONFIG_PATH, created: false });
+    merged.version = defaults.version;
+    return merged;
   } catch {
     return { ...defaults, configPath: QUOTA_CONFIG_PATH, created: false, error: "No pude leer quotas.json" };
+  }
+}
+
+// Semilla el `displayConfig` global desde el bloque `display` ya fusionado de quotas.json.
+function loadDisplayConfig(display) {
+  const defaults = { hideUnusable: true, hiddenProviders: [], hiddenModels: [] };
+  if (!display || typeof display !== "object") { displayConfig = defaults; return; }
+  displayConfig = {
+    hideUnusable: display.hideUnusable !== false,
+    hiddenProviders: Array.isArray(display.hiddenProviders) ? [...display.hiddenProviders] : [],
+    hiddenModels: Array.isArray(display.hiddenModels) ? [...display.hiddenModels] : [],
+  };
+}
+
+// Persiste SOLO el bloque `display` en quotas.json. Re-lee el archivo crudo para nunca
+// pisar credenciales ni otros bloques (ni los campos runtime configPath/created/error).
+function saveDisplayConfig() {
+  try {
+    if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+    let parsed = {};
+    if (existsSync(QUOTA_CONFIG_PATH)) {
+      // Si el archivo existe pero no parsea, ABORTAR: reescribir solo `display` borraria
+      // credenciales y el resto de la config del usuario. Mejor no guardar la preferencia.
+      try { parsed = JSON.parse(readFileSync(QUOTA_CONFIG_PATH, "utf8")) || {}; } catch { return false; }
+    }
+    parsed.display = {
+      hideUnusable: displayConfig.hideUnusable !== false,
+      hiddenProviders: [...displayConfig.hiddenProviders],
+      hiddenModels: [...displayConfig.hiddenModels],
+    };
+    writeFileSync(QUOTA_CONFIG_PATH, `${JSON.stringify(parsed, null, 2)}\n`, { mode: 0o600 });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -640,15 +1032,691 @@ function deepMerge(base, override, extra = {}) {
   return { ...output, ...extra };
 }
 
-function buildQuotaState(sources, config) {
+// ===========================================================================
+// Multi-cuenta por proveedor (v0.13.0)
+//
+// MODELO: el proveedor sigue siendo la clave primaria de `providers`; las cuentas
+// son un nivel ANIDADO (providers[p].accounts[]). `accounts` es OPT-IN: si un
+// bloque de quotas.json no lo declara, resolveAccounts() materializa EN MEMORIA
+// una unica cuenta implicita "default" que no inyecta ninguna env var y usa las
+// rutas de cache historicas -> la salida es identica a la de antes del cambio.
+//
+// CREDENCIALES: quotas.json guarda REFERENCIAS, nunca valores.
+//   {kind:"configDir", path}  -> se inyecta como env var de aislamiento al CLI hijo
+//   {kind:"env",       var}   -> se lee process.env[var] solo al construir el header
+//   {kind:"legacy"}           -> apunta al campo inline preexistente del bloque
+// Nada de esto se serializa al output salvo {kind} y (para configDir) el path.
+// ===========================================================================
+
+const DEFAULT_ACCOUNT_ID = "default";
+// El id es componente de nombre de archivo de cache: sin sanear seria path traversal.
+const ACCOUNT_ID_RE = /^[a-z0-9][a-z0-9._-]{0,31}$/;
+const ACCOUNT_CREDENTIAL_KINDS = new Set(["legacy", "configDir", "env"]);
+
+// Env var que aisla la raiz de credenciales del CLI hijo de cada proveedor.
+// null = el proveedor no lanza un CLI aislable por env (credencial en proceso).
+const PROVIDER_ISOLATION_ENV = {
+  claude: "CLAUDE_CONFIG_DIR",
+  codex: "CODEX_HOME",
+  gemini: "GEMINI_CLI_HOME",
+  antigravity: null,
+  minimax: null,
+  opencode: null,
+};
+
+// Antigravity NO es aislable: su CLI fija la raiz en ~/.gemini/antigravity-cli y la
+// captura es scraping por PTY. Aceptar 2 cuentas leeria la MISMA credencial dos veces
+// y reportaria el mismo saldo con etiquetas distintas: datos falsos que parecen buenos.
+const PROVIDER_SUPPORTS_MULTI_ACCOUNT = {
+  claude: true,
+  codex: true,
+  gemini: true,
+  antigravity: false,
+  minimax: true,
+  opencode: true,
+};
+
+// Proveedores cuya captura viva abre un CLI/PTY completo (30-45 s). Se raciona con
+// presupuesto por refresh para que N cuentas no multipliquen la latencia del hook.
+const HEAVY_PROBE_PROVIDERS = new Set(["claude", "gemini", "antigravity"]);
+
+// Sufijo historico del archivo de cache de cada proveedor. providerCachePath() los
+// reproduce EXACTAMENTE para la cuenta "default", asi que actualizar no invalida
+// ningun cache existente ni obliga a migrar archivos.
+const PROVIDER_CACHE_SUFFIX = {
+  claude: "usage-cache",
+  gemini: "quota-cache",
+  minimax: "usage-cache",
+  opencode: "usage-cache",
+  antigravity: "quota-cache",
+  codex: "probe-cache",
+};
+
+function accountSlug(id) {
+  const raw = String(id ?? "");
+  if (ACCOUNT_ID_RE.test(raw)) return raw;
+  // Defensa en profundidad: la validacion de config ya rechaza ids invalidos, pero un
+  // id que llegue por otra via nunca debe convertirse en un componente de ruta.
+  return `x${sha256Hex(raw).slice(0, 12)}`;
+}
+
+function providerCachePath(provider, accountId, suffix) {
+  const id = accountId || DEFAULT_ACCOUNT_ID;
+  const slug = id === DEFAULT_ACCOUNT_ID ? "" : `-${accountSlug(id)}`;
+  return path.join(CONFIG_DIR, `${provider}${slug}-${suffix}.json`);
+}
+
+function accountCachePath(account, suffix) {
+  const provider = account?.provider || "provider";
+  return providerCachePath(provider, account?.id, suffix || PROVIDER_CACHE_SUFFIX[provider] || "cache");
+}
+
+// Entorno del proceso hijo para una cuenta. Para la cuenta implicita "default" (o
+// cualquier credencial legacy) devuelve `undefined`: execFile recibe exactamente las
+// mismas opciones que antes del cambio, sin tocar el entorno.
+function accountEnv(account, extra = null) {
+  const envVar = PROVIDER_ISOLATION_ENV[account?.provider];
+  const isolate = envVar && account?.credential?.kind === "configDir" && account.credential.path;
+  if (!isolate && !extra) return undefined;
+  const env = { ...process.env, ...(extra || {}) };
+  if (isolate) env[envVar] = account.credential.path;
+  return env;
+}
+
+function sha256Hex(value) {
+  return createHash("sha256").update(String(value ?? "")).digest("hex");
+}
+
+function credentialFingerprint(value) {
+  if (!value) return null;
+  return sha256Hex(value).slice(0, 12);
+}
+
+function normalizeAccountCredential(provider, raw) {
+  if (!raw || typeof raw !== "object") return { kind: "legacy" };
+  const kind = String(raw.kind || "legacy");
+  if (!ACCOUNT_CREDENTIAL_KINDS.has(kind)) return null;
+  if (kind === "configDir") {
+    const dir = typeof raw.path === "string" ? raw.path.trim() : "";
+    if (!dir) return null;
+    return { kind, path: dir };
+  }
+  if (kind === "env") {
+    const name = typeof raw.var === "string" ? raw.var.trim() : "";
+    if (!name) return null;
+    return { kind, var: name };
+  }
+  return { kind: "legacy" };
+}
+
+// --- Preflight de credencial: clasifica la salud de una cuenta SIN lanzar un CLI. ---
+// Es el mayor ahorro disponible: descarta raices rotas (accessToken vacio o el literal
+// "[REDACTED-...]") antes de gastar un proceso de 30-45 s, y se re-evalua gratis.
+// "credential-expired" (access+refresh ambos vencidos, ver inspectClaudeAccountRoot) tambien
+// bloquea: sin esto, una cuenta con ambos tokens muertos igual gastaba un CLI de 30-45s por
+// refresh (y encima fallaba) en vez de fallar gratis via preflight, como las otras 2 causas.
+const ACCOUNT_BLOCKING_STATUSES = new Set(["unauthenticated", "credential-broken", "credential-expired"]);
+const PLACEHOLDER_TOKEN_RE = /^\s*(\[[^\]]*\]|<[^>]*>|redacted|changeme|todo|null|none)\s*$/i;
+
+function inspectClaudeAccountRoot(dir, { ambient = false } = {}) {
+  const credPath = path.join(dir, ".credentials.json");
+  if (!existsSync(credPath)) {
+    return { status: "unauthenticated", detail: "sin .credentials.json en la raiz declarada" };
+  }
+  const data = readJsonSafe(credPath);
+  const oauth = data?.claudeAiOauth && typeof data.claudeAiOauth === "object" ? data.claudeAiOauth : null;
+  if (!oauth) return { status: "credential-broken", detail: ".credentials.json sin bloque claudeAiOauth" };
+  const token = typeof oauth.accessToken === "string" ? oauth.accessToken.trim() : "";
+  if (!token) return { status: "credential-broken", detail: "accessToken vacio" };
+  if (PLACEHOLDER_TOKEN_RE.test(token)) {
+    return { status: "credential-broken", detail: "accessToken es un marcador, no un token real" };
+  }
+  const identity = readJsonSafe(path.join(dir, ".claude.json"))
+    || (ambient ? readJsonSafe(path.join(homedir(), ".claude.json")) : null);
+  const oauthAccount = identity?.oauthAccount || {};
+  const expiresAt = Number(oauth.expiresAt);
+  const refreshExpiresAt = Number(oauth.refreshTokenExpiresAt);
+  const hasRefresh = Boolean(oauth.refreshToken);
+  let status = "ok";
+  let detail = "";
+  if (Number.isFinite(expiresAt) && expiresAt > 0 && expiresAt <= Date.now()) {
+    const refreshDead = !hasRefresh
+      || (Number.isFinite(refreshExpiresAt) && refreshExpiresAt > 0 && refreshExpiresAt <= Date.now());
+    // Con refreshToken vivo el CLI renueva solo: no es un fallo, no bloquea el probe.
+    status = refreshDead ? "credential-expired" : "ok";
+    detail = refreshDead ? "accessToken y refreshToken vencidos" : "accessToken vencido; el CLI lo renovara";
+  }
   return {
-    configPath: config.configPath,
-    codex: buildCodexQuota(sources.codex, config.codex, sources.codexLive),
-    claude: buildClaudeQuota(sources.claude, sources.claudeBlocks, config.claude, sources.claudeLive),
-    minimax: buildMiniMaxQuota(sources.minimax, config.minimax),
-    opencode: buildOpenCodeQuota(sources.opencodeLive, config.opencode, sources.opencodeServer),
-    antigravity: buildAntigravityQuota(sources.antigravity, config.antigravity, sources.antigravityLive),
+    status,
+    detail,
+    plan: typeof oauth.subscriptionType === "string" ? oauth.subscriptionType : null,
+    // Fingerprint irreversible del accountUuid: sirve para detectar dos raices que
+    // apuntan a la MISMA suscripcion (dedupe) sin exponer el uuid ni el email.
+    identityFingerprint: oauthAccount.accountUuid ? credentialFingerprint(oauthAccount.accountUuid) : null,
+    expiresAt: Number.isFinite(expiresAt) && expiresAt > 0 ? new Date(expiresAt).toISOString() : null,
   };
+}
+
+function inspectCodexAccountRoot(dir) {
+  const authPath = path.join(dir, "auth.json");
+  if (!existsSync(authPath)) return { status: "unauthenticated", detail: "sin auth.json en la raiz declarada" };
+  const data = readJsonSafe(authPath);
+  if (!data) return { status: "credential-broken", detail: "auth.json no parsea" };
+  const tokens = data.tokens && typeof data.tokens === "object" ? data.tokens : {};
+  const apiKey = typeof data.OPENAI_API_KEY === "string" ? data.OPENAI_API_KEY.trim() : "";
+  const accessToken = typeof tokens.access_token === "string" ? tokens.access_token.trim() : "";
+  const refreshToken = typeof tokens.refresh_token === "string" ? tokens.refresh_token.trim() : "";
+  if (!apiKey && !accessToken && !refreshToken) {
+    return { status: "credential-broken", detail: "auth.json sin tokens ni OPENAI_API_KEY" };
+  }
+  if (accessToken && PLACEHOLDER_TOKEN_RE.test(accessToken)) {
+    return { status: "credential-broken", detail: "access_token es un marcador, no un token real" };
+  }
+  const accountId = tokens.account_id || tokens.accountId || null;
+  return {
+    status: "ok",
+    detail: "",
+    authMode: data.auth_mode || (apiKey && !accessToken ? "apikey" : "oauth"),
+    identityFingerprint: accountId ? credentialFingerprint(accountId) : null,
+  };
+}
+
+function inspectGeminiAccountRoot(dir) {
+  const candidates = ["oauth_creds.json", "google_accounts.json", "settings.json"];
+  const found = candidates.find((name) => existsSync(path.join(dir, name)));
+  if (!found) return { status: "unauthenticated", detail: "sin credenciales de gemini-cli en la raiz declarada" };
+  return { status: "ok", detail: "" };
+}
+
+function inspectAccountCredential(provider, credential, { implicit = false } = {}) {
+  const kind = credential?.kind || "legacy";
+  if (kind === "env") {
+    const name = credential.var;
+    const value = process.env[name];
+    if (value === undefined || String(value).trim() === "") {
+      return { status: "unauthenticated", detail: `${name} sin valor en el entorno`, credentialRef: name };
+    }
+    return {
+      status: "ok",
+      detail: `${name} presente`,
+      credentialRef: name,
+      identityFingerprint: credentialFingerprint(value),
+    };
+  }
+  if (kind === "configDir") {
+    const dir = credential.path;
+    if (!existsSync(dir)) {
+      return { status: "unauthenticated", detail: "el directorio de credenciales no existe", credentialRef: dir };
+    }
+    let inspected;
+    if (provider === "claude") inspected = inspectClaudeAccountRoot(dir, { ambient: implicit });
+    else if (provider === "codex") inspected = inspectCodexAccountRoot(dir);
+    else if (provider === "gemini") inspected = inspectGeminiAccountRoot(dir);
+    else inspected = { status: "unknown", detail: "" };
+    return { ...inspected, credentialRef: dir };
+  }
+  // legacy: comportamiento historico. Nunca bloquea el probe (status "unknown"), pero
+  // reporta identidad best-effort para que el TUI/agente vea de que cuenta se trata.
+  if (provider === "claude") {
+    const ambientDir = process.env.CLAUDE_CONFIG_DIR || path.join(homedir(), ".claude");
+    const probe = existsSync(ambientDir)
+      ? inspectClaudeAccountRoot(ambientDir, { ambient: true })
+      : { status: "unknown", detail: "" };
+    return { ...probe, status: "unknown", observedStatus: probe.status, credentialRef: "ambiente" };
+  }
+  if (provider === "codex") {
+    const ambientDir = process.env.CODEX_HOME || path.join(homedir(), ".codex");
+    const probe = existsSync(ambientDir) ? inspectCodexAccountRoot(ambientDir) : { status: "unknown", detail: "" };
+    return { ...probe, status: "unknown", observedStatus: probe.status, credentialRef: "ambiente" };
+  }
+  return { status: "unknown", detail: "", credentialRef: "ambiente" };
+}
+
+// Umbrales de alerta con herencia cuenta > proveedor > raiz. Por defecto TODOS son
+// null (alertas apagadas) para que la salida en modo legacy siga siendo identica.
+function resolveAlertThresholds(...layers) {
+  const out = {
+    warnBelowPercent: null,
+    criticalBelowPercent: null,
+    notifyOnLimited: false,
+    notifyOnBrokenCredential: true,
+  };
+  for (const layer of layers) {
+    if (!layer || typeof layer !== "object") continue;
+    for (const key of Object.keys(out)) {
+      if (layer[key] === undefined || layer[key] === null) continue;
+      out[key] = typeof out[key] === "boolean" ? Boolean(layer[key]) : Number(layer[key]);
+    }
+  }
+  return out;
+}
+
+function implicitAccount(provider, providerConfig, rootConfig) {
+  const credential = { kind: "legacy" };
+  const health = inspectAccountCredential(provider, credential, { implicit: true });
+  return {
+    provider,
+    id: DEFAULT_ACCOUNT_ID,
+    label: PROVIDER_META[provider]?.label || provider,
+    enabled: true,
+    priority: 0,
+    implicit: true,
+    credential,
+    config: { ...(providerConfig || {}) },
+    alerts: resolveAlertThresholds(rootConfig?.alerts, providerConfig?.alerts),
+    health,
+  };
+}
+
+/**
+ * Resuelve la lista de cuentas de un proveedor.
+ * Fail-safe: cualquier error de configuracion cae a MODO LEGACY (una cuenta implicita)
+ * y se reporta en configErrors[]; nunca se adivina ni se falla en silencio.
+ */
+function resolveAccounts(provider, providerConfig = {}, rootConfig = {}) {
+  const configErrors = [];
+  const raw = Array.isArray(providerConfig?.accounts) ? providerConfig.accounts : [];
+  const legacyMode = (error) => {
+    if (error) configErrors.push(error);
+    return { accounts: [implicitAccount(provider, providerConfig, rootConfig)], multi: false, configErrors };
+  };
+  if (!raw.length) return legacyMode(null);
+  if (PROVIDER_SUPPORTS_MULTI_ACCOUNT[provider] === false && raw.length > 1) {
+    return legacyMode(
+      `${provider} no soporta multiples cuentas: su CLI fija la raiz de credenciales en el HOME. Usando modo legacy.`,
+    );
+  }
+
+  // `accounts` no hereda por deepMerge (los arrays se sobrescriben enteros): la herencia
+  // de los defaults del bloque del proveedor se hace explicitamente aqui.
+  const inherited = { ...(providerConfig || {}) };
+  delete inherited.accounts;
+  delete inherited.alerts;
+
+  const accounts = [];
+  const seenIds = new Set();
+  let legacyClaims = 0;
+  for (let index = 0; index < raw.length; index += 1) {
+    const entry = raw[index];
+    if (!entry || typeof entry !== "object") {
+      return legacyMode(`${provider}.accounts[${index}] no es un objeto.`);
+    }
+    const id = typeof entry.id === "string" ? entry.id.trim() : "";
+    if (!ACCOUNT_ID_RE.test(id) || id === "." || id === "..") {
+      return legacyMode(
+        `${provider}.accounts[${index}].id invalido (se exige ^[a-z0-9][a-z0-9._-]{0,31}$, sin separadores de ruta).`,
+      );
+    }
+    if (seenIds.has(id)) return legacyMode(`${provider}.accounts: el id "${id}" esta duplicado.`);
+    seenIds.add(id);
+    const credential = normalizeAccountCredential(provider, entry.credential);
+    if (!credential) return legacyMode(`${provider}.accounts[${index}].credential invalida o incompleta.`);
+    if (credential.kind === "configDir" && !PROVIDER_ISOLATION_ENV[provider]) {
+      return legacyMode(
+        `${provider} no admite credential.kind="configDir": no expone una env var que aisle su raiz.`,
+      );
+    }
+    if (credential.kind === "legacy") legacyClaims += 1;
+    const overrides = { ...entry };
+    for (const key of ["id", "label", "enabled", "priority", "credential", "alerts"]) delete overrides[key];
+    const config = { ...inherited, ...overrides };
+    const health = inspectAccountCredential(provider, credential, { implicit: false });
+    accounts.push({
+      provider,
+      id,
+      label: typeof entry.label === "string" && entry.label.trim() ? entry.label.trim() : id,
+      enabled: entry.enabled !== false,
+      priority: Number.isFinite(Number(entry.priority)) ? Number(entry.priority) : 0,
+      implicit: false,
+      credential,
+      config,
+      alerts: resolveAlertThresholds(rootConfig?.alerts, providerConfig?.alerts, entry.alerts),
+      health,
+    });
+  }
+  if (legacyClaims > 1) {
+    return legacyMode(
+      `${provider}.accounts: dos cuentas reclaman credential.kind="legacy" y no se puede adivinar cual usa el campo inline.`,
+    );
+  }
+
+  // DEDUPE: dos raices que resuelven a la MISMA suscripcion son UNA cuenta. Agregarlas
+  // como rutas alternativas duplicaria la capacidad aparente (el fallo mas caro posible
+  // porque es silencioso y en la direccion peligrosa).
+  const byFingerprint = new Map();
+  for (const account of accounts) {
+    const fingerprint = account.health?.identityFingerprint;
+    if (!fingerprint) continue;
+    if (byFingerprint.has(fingerprint)) {
+      account.duplicateOf = byFingerprint.get(fingerprint);
+      configErrors.push(
+        `${provider}.accounts: "${account.id}" apunta a la misma suscripcion que "${account.duplicateOf}"; se ignora para el agregado.`,
+      );
+    } else {
+      byFingerprint.set(fingerprint, account.id);
+    }
+  }
+
+  for (const account of accounts) {
+    const status = account.health?.status;
+    account.blocked = Boolean(account.duplicateOf)
+      || account.enabled === false
+      || ACCOUNT_BLOCKING_STATUSES.has(status);
+  }
+  return { accounts, multi: accounts.length > 1, configErrors };
+}
+
+function resolveAllAccounts(config) {
+  const out = {};
+  for (const provider of ACCOUNT_PROVIDER_ORDER) {
+    out[provider] = resolveAccounts(provider, config?.[provider] || {}, config || {});
+  }
+  return out;
+}
+
+// --- Agregacion entre cuentas -------------------------------------------------
+// Generaliza groupedQuotaAvailability() un nivel arriba: ventana -> grupo (MIN, AND)
+// -> cuenta (MAX entre grupos, ya existia) -> proveedor (MAX entre cuentas, nuevo).
+// Reutiliza availableGroups/limitingGroups porque es el MISMO concepto (rutas
+// alternativas abiertas/cerradas) y esos campos ya existen en el schema de salida.
+function aggregateAccountQuotas(entries) {
+  const availableGroups = [];
+  const limitingGroups = [];
+  const remains = [];
+  let considered = 0;
+  for (const entry of entries || []) {
+    const quota = entry?.quota;
+    // Una cuenta ROTA no es una cuenta AGOTADA: no debe arrastrar al proveedor a
+    // `limited`, o el hook publicaria "Claude AGOTADO" con las buenas intactas.
+    if (!quota || quota.ok === false || entry.blocked) continue;
+    considered += 1;
+    const remaining = finiteNumberOrNull(quota.effectiveRemainingPercent);
+    const isAvailable = quota.available === true
+      || (quota.limited !== true && remaining !== null && remaining > 0);
+    if (isAvailable) availableGroups.push(entry.accountId);
+    else if (quota.limited === true || (remaining !== null && remaining <= 0)) limitingGroups.push(entry.accountId);
+    if (remaining !== null) remains.push(remaining);
+  }
+  return {
+    available: availableGroups.length > 0,
+    limited: considered > 0 && availableGroups.length === 0 && limitingGroups.length > 0,
+    availableGroups,
+    limitingGroups,
+    // MAX y no suma: remainingPercent es un porcentaje POR CUENTA y sumar porcentajes
+    // entre cuentas es dimensionalmente invalido. MAX = "la mejor ruta unica abierta",
+    // que es justo la decision que toma el consumidor (un agente despacha a UNA cuenta).
+    effectiveRemainingPercent: remains.length ? Math.max(...remains) : null,
+  };
+}
+
+// Determinista para que el output sea estable entre refrescos:
+// 1o mayor effectiveRemainingPercent, 2o menor priority, 3o orden de declaracion.
+function selectAccountEntry(entries) {
+  const list = (entries || []).filter((entry) => entry && entry.quota);
+  if (!list.length) return null;
+  const usable = list.filter((entry) => !entry.blocked && entry.quota.ok !== false);
+  const pool = usable.length ? usable : list;
+  let best = pool[0];
+  for (const entry of pool.slice(1)) {
+    const candidate = finiteNumberOrNull(entry.quota.effectiveRemainingPercent);
+    const incumbent = finiteNumberOrNull(best.quota.effectiveRemainingPercent);
+    const candidateValue = candidate === null ? -1 : candidate;
+    const incumbentValue = incumbent === null ? -1 : incumbent;
+    if (candidateValue > incumbentValue) { best = entry; continue; }
+    if (candidateValue < incumbentValue) continue;
+    if (Number(entry.priority ?? 0) < Number(best.priority ?? 0)) best = entry;
+  }
+  return best;
+}
+
+/**
+ * Pliega N quotas por cuenta en el quota del proveedor.
+ * Con UNA sola cuenta devuelve el quota tal cual (identidad): ese es el mecanismo que
+ * garantiza que el modo legacy no cambie ni un byte.
+ */
+function foldProviderAccounts(entries) {
+  const list = (entries || []).filter(Boolean);
+  if (!list.length) return null;
+  if (list.length === 1) return list[0].quota;
+
+  const selected = selectAccountEntry(list) || list[0];
+  const base = selected.quota || {};
+  const aggregate = aggregateAccountQuotas(list);
+  // CRITICO: `windows` es la proyeccion de la cuenta SELECCIONADA, jamas la union.
+  // ai-usage-context.py hace min(remainingPercent) sobre providers[p].windows; con la
+  // union, una cuenta agotada publicaria "Claude 0%libre" teniendo otra al 80% libre.
+  const windows = (Array.isArray(base.windows) ? base.windows : [])
+    .map((window) => ({ ...window, accountId: selected.accountId }));
+  const folded = {
+    ...base,
+    windows,
+    available: aggregate.available,
+    limited: aggregate.limited,
+    availableGroups: aggregate.availableGroups,
+    limitingGroups: aggregate.limitingGroups,
+    effectiveRemainingPercent: aggregate.effectiveRemainingPercent,
+    selectedAccountId: selected.accountId,
+    accountCount: list.length,
+    accounts: list,
+  };
+  folded.ok = list.some((entry) => entry.quota?.ok !== false);
+  if (!aggregate.limited) delete folded.limitedRetry;
+  if (list.every((entry) => entry.quota?.needsAuth === true || entry.blocked)) folded.needsAuth = true;
+  else delete folded.needsAuth;
+  if (!aggregate.limited && Array.isArray(folded.limitingWindows) && !folded.limitingWindows.length) {
+    delete folded.limitingWindows;
+  }
+  return folded;
+}
+
+function conjunctiveQuotaAvailability(windows) {
+  const numeric = (windows || []).filter((window) => finiteNumberOrNull(window.remainingPercent) !== null);
+  const limitingWindows = numeric
+    .filter((window) => Number(window.remainingPercent) <= 0)
+    .map((window) => String(window.label || window.key || "limite"));
+  return {
+    available: numeric.length > 0 && limitingWindows.length === 0,
+    limited: limitingWindows.length > 0,
+    limitingWindows,
+    effectiveRemainingPercent: numeric.length
+      ? Math.min(...numeric.map((window) => Number(window.remainingPercent)))
+      : null,
+  };
+}
+
+function groupedQuotaAvailability(windows, groupField) {
+  const groups = new Map();
+  for (const window of windows || []) {
+    const group = String(window[groupField] || window.model || window.family || "default");
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(window);
+  }
+  const availableGroups = [];
+  const limitingGroups = [];
+  const groupRemaining = [];
+  for (const [group, entries] of groups) {
+    const numeric = entries.filter((entry) => finiteNumberOrNull(entry.remainingPercent) !== null);
+    const explicitAvailable = entries.some((entry) => entry.available === true);
+    const minimum = numeric.length
+      ? Math.min(...numeric.map((entry) => Number(entry.remainingPercent)))
+      : null;
+    if (explicitAvailable || (minimum !== null && minimum > 0)) availableGroups.push(group);
+    else if (minimum !== null && minimum <= 0) limitingGroups.push(group);
+    if (minimum !== null) groupRemaining.push(minimum);
+  }
+  return {
+    available: availableGroups.length > 0,
+    limited: groups.size > 0 && availableGroups.length === 0 && limitingGroups.length > 0,
+    availableGroups,
+    limitingGroups,
+    effectiveRemainingPercent: groupRemaining.length ? Math.max(...groupRemaining) : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Visibilidad de proveedores/modelos (v0.12.0)
+//
+// Regla: un proveedor se auto-oculta SOLO si no tiene datos usables (ni ventanas,
+// ni escalares, ni bloque activo) Y su razon es "sin cuenta" (no autenticado / no
+// instalado / no configurado). Un proveedor AGOTADO (autenticado, al limite) o con
+// un error transitorio permanece visible. `disabled` (live-probe apagado) tampoco
+// se auto-oculta: no es "sin cuenta" y ocultarlo seria un footgun (p.ej. Claude).
+// El filtro se aplica de forma uniforme a la TUI, --json y el MCP; `AI_USAGE_SHOW_ALL=1`
+// lo desactiva para agentes que quieran el set completo.
+// ---------------------------------------------------------------------------
+
+const AUTO_HIDE_REASONS = new Set(["unauthenticated", "not-installed", "not-configured"]);
+
+function quotaHasData(quota) {
+  if (!quota) return false;
+  const windows = Array.isArray(quota.windows) ? quota.windows : [];
+  if (windows.length > 0) return true;
+  if (finiteNumberOrNull(quota.remainingPercent) !== null) return true;
+  if (finiteNumberOrNull(quota.usedPercent) !== null) return true;
+  if (Array.isArray(quota.creditsList) && quota.creditsList.length > 0) return true;
+  if (quota.activeBlock) return true;
+  return false;
+}
+
+function classifyProviderAvailability(quota) {
+  if (!quota) return "no-data";
+  if (quota.needsAuth) return "unauthenticated";
+  if (quota.limited) return "exhausted"; // autenticado pero al limite -> visible
+  if (quotaHasData(quota)) {
+    const windows = Array.isArray(quota.windows) ? quota.windows : [];
+    const numeric = windows
+      .map((w) => finiteNumberOrNull(w.remainingPercent))
+      .filter((v) => v !== null);
+    const scalar = finiteNumberOrNull(quota.remainingPercent);
+    const allWindowsExhausted = numeric.length > 0 && numeric.every((v) => v <= 0);
+    if (quota.available === false || allWindowsExhausted || (numeric.length === 0 && scalar !== null && scalar <= 0)) {
+      return "exhausted";
+    }
+    return "available";
+  }
+  if (quota.unusable && typeof quota.reason === "string" && quota.reason) return quota.reason;
+  if (quota.disabled) return "disabled";
+  return "no-data";
+}
+
+function isProviderVisible(provider, quota, display = {}, revealHidden = false) {
+  if (revealHidden) return true;
+  const hiddenProviders = Array.isArray(display.hiddenProviders) ? display.hiddenProviders : [];
+  if (hiddenProviders.includes(provider)) return false;
+  if (display.hideUnusable !== false && AUTO_HIDE_REASONS.has(classifyProviderAvailability(quota))) return false;
+  return true;
+}
+
+function windowModelKey(provider, window) {
+  if (!window) return null;
+  // `key` es el identificador UNICO por ventana (MiniMax "weekly_general", Antigravity
+  // "Gemini-sem", Claude "week_opus"): usarlo primero evita que ocultar una fila arrastre a
+  // su hermana (misma familia/modelo, distinta ventana) y que se le quite al agente la
+  // ventana semanal por ocultar la diaria. Fallback: modelo/familia (+ tipo de ventana).
+  let raw = window.key;
+  if (!raw) {
+    const base = window.model || window.family || window.label;
+    if (!base) return null;
+    const disc = window.windowType || (window.windowMinutes != null ? `${window.windowMinutes}m` : "");
+    raw = disc ? `${base}-${disc}` : base;
+  }
+  const norm = String(raw).toLowerCase().trim().replace(/\s+/g, "-");
+  return norm ? `${provider}:${norm}` : null;
+}
+
+function isModelVisible(provider, window, display = {}, revealHidden = false) {
+  if (revealHidden) return true;
+  const hiddenModels = Array.isArray(display.hiddenModels) ? display.hiddenModels : [];
+  if (!hiddenModels.length) return true;
+  const key = windowModelKey(provider, window);
+  return !(key && hiddenModels.includes(key));
+}
+
+// Propaga la razon de "cuenta no usable" desde el resultado de captura (collect) al
+// quota final, SOLO cuando el quota no tiene datos utiles. Asi un agotado (con barras)
+// o un error transitorio nunca se marca no-usable por accidente.
+function annotateUnusable(quota, source) {
+  if (!quota || quotaHasData(quota)) return quota;
+  // Un limite configurado a mano por el usuario (kind "configured-*") es intencionalmente
+  // usable aunque el CLI en vivo falte: no lo marques no-usable ni lo auto-ocultes.
+  if (typeof quota.kind === "string" && quota.kind.startsWith("configured-")) return quota;
+  if (source?.needsAuth && !quota.needsAuth) quota.needsAuth = true;
+  if (source?.unusable && typeof source.reason === "string" && !quota.unusable) {
+    quota.unusable = true;
+    quota.reason = source.reason;
+  }
+  return quota;
+}
+
+/**
+ * Construye el quota final de UN proveedor plegando todas sus cuentas resueltas.
+ * `liveAccounts` es la lista que produce collectProviderAccountsLive() (forma
+ * {accountId, account, label, priority, blocked, health, live}); `fallbackLive` es
+ * el `sources.<p>Live`/`sources.<p>` historico, usado SOLO si la lista viene vacia
+ * (defensivo: un allSettled rechazado hoy deja `sources.<p>LiveAccounts = []`).
+ * `buildOne(entry)` arma el quota normalizado de esa cuenta con la MISMA firma que
+ * cada build<X>Quota ya usaba; con una sola cuenta (modo legacy, el 100% del parque
+ * hoy) foldProviderAccounts devuelve ese objeto SIN copiarlo, asi que el resto del
+ * pipeline (annotateUnusable, etc.) actua identico byte a byte al comportamiento previo.
+ */
+function foldedProviderQuota(liveAccounts, fallbackLive, buildOne) {
+  const source = Array.isArray(liveAccounts) && liveAccounts.length
+    ? liveAccounts
+    : [{ accountId: DEFAULT_ACCOUNT_ID, priority: 0, blocked: false, account: null, live: fallbackLive }];
+  const entries = source.map((entry) => ({
+    accountId: entry.accountId,
+    label: entry.label || entry.account?.label || entry.accountId,
+    priority: entry.priority,
+    blocked: Boolean(entry.blocked),
+    healthStatus: entry.health?.status || entry.account?.health?.status || null,
+    quota: buildOne(entry),
+  }));
+  return foldProviderAccounts(entries);
+}
+
+function buildQuotaState(sources, config, accounts = {}) {
+  // Cada builder recibe el config MERGEADO de SU cuenta (entry.account.config, que
+  // resolveAccounts ya arma como {...configDelProveedor, ...overridesDeLaCuenta}) en vez
+  // del config global del proveedor; para la cuenta implicita/legacy ambos son el MISMO
+  // contenido, asi que esto no cambia nada hoy y respeta overrides por cuenta el dia que
+  // alguien declare accounts[] con, p.ej., fiveHourTokens distintos por cuenta.
+  const quotas = {
+    configPath: config.configPath,
+    codex: foldedProviderQuota(sources.codexLiveAccounts, sources.codexLive, (entry) =>
+      buildCodexQuota(sources.codex, entry.account?.config || config.codex, entry.live)),
+    claude: foldedProviderQuota(sources.claudeLiveAccounts, sources.claudeLive, (entry) =>
+      buildClaudeQuota(sources.claude, sources.claudeBlocks, entry.account?.config || config.claude, entry.live)),
+    gemini: foldedProviderQuota(sources.geminiLiveAccounts, sources.geminiLive, (entry) =>
+      buildGeminiQuota(sources.gemini, entry.account?.config || config.gemini, entry.live)),
+    // MiniMax no tiene un `usage` separado de la captura en vivo: `entry.live` ES el
+    // argumento `usage` que buildMiniMaxQuota siempre tomo (ver sources.minimax de antes).
+    minimax: foldedProviderQuota(sources.minimaxAccounts, sources.minimax, (entry) =>
+      buildMiniMaxQuota(entry.live, entry.account?.config || config.minimax)),
+    // opencodeServer (el override manual pegado por el usuario) sigue GLOBAL, no por
+    // cuenta: es una decision explicita, ver docs/multi-account (no hay señal de que
+    // deba variar por cuenta y opencodeServer no se captura por cuenta hoy).
+    opencode: foldedProviderQuota(sources.opencodeAccounts, sources.opencodeLive, (entry) =>
+      buildOpenCodeQuota(entry.live, entry.account?.config || config.opencode, sources.opencodeServer)),
+    antigravity: foldedProviderQuota(sources.antigravityLiveAccounts, sources.antigravityLive, (entry) =>
+      buildAntigravityQuota(sources.antigravity, entry.account?.config || config.antigravity, entry.live)),
+  };
+  // Propaga la razon de no-usable desde cada captura en vivo al quota final.
+  annotateUnusable(quotas.claude, sources.claudeLive);
+  annotateUnusable(quotas.codex, sources.codexLive);
+  annotateUnusable(quotas.gemini, sources.geminiLive);
+  annotateUnusable(quotas.antigravity, sources.antigravityLive);
+  annotateUnusable(quotas.minimax, sources.minimax);
+  annotateUnusable(quotas.opencode, sources.opencodeLive);
+  // Errores de configuracion (id duplicado, credential invalida, proveedor sin soporte
+  // multi-cuenta, etc.) ya se calculan en resolveAccounts() pero hasta ahora se tiraban:
+  // se adjuntan al quota SOLO si hay alguno, para no tocar el output en el caso comun.
+  for (const provider of ["codex", "claude", "gemini", "minimax", "opencode", "antigravity"]) {
+    const errors = accounts?.[provider]?.configErrors;
+    if (Array.isArray(errors) && errors.length && quotas[provider]) {
+      quotas[provider].configErrors = errors;
+    }
+  }
+  return quotas;
 }
 
 function fmtTimeInTz(date, tz) {
@@ -661,10 +1729,9 @@ function fmtTimeInTz(date, tz) {
 }
 
 function parseCodexRetryTime(text) {
-  // Codex dice "try again at 5:43 AM" SIN zona ni fecha; formatea esa hora en la TZ LOCAL del
-  // host (aqui UTC). La parseamos en esa MISMA TZ local -> instante absoluto (proxima ocurrencia).
-  // Asi el countdown sale correcto y a prueba de zona: la web te lo muestra en TU hora, el CLI en
-  // la del host; el instante real es el mismo. Para mostrar tu hora local: fmtTimeInTz(date, tz).
+  // Codex dice "try again at 5:43 AM" SIN zona ni fecha desde el contenedor, cuya referencia es
+  // UTC. Construimos el instante explicitamente en UTC: usar setHours() lo reinterpretaba en la
+  // TZ de quien lanzara el test/TUI y desplazaba el retry al ejecutarlo desde la torre Bogota.
   const m = String(text || "").match(/(\d{1,2}):(\d{2})\s*([AP]M)?/i);
   if (!m) return null;
   let hour = Number(m[1]);
@@ -675,23 +1742,112 @@ function parseCodexRetryTime(text) {
   if (hour > 23 || min > 59) return null;
   const now = new Date();
   const d = new Date(now);
-  d.setHours(hour, min, 0, 0);
-  if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
+  d.setUTCHours(hour, min, 0, 0);
+  if (d.getTime() <= now.getTime()) d.setUTCDate(d.getUTCDate() + 1);
   return d;
+}
+
+function valueFromAny(obj, keys) {
+  for (const key of keys) {
+    if (obj?.[key] !== undefined && obj?.[key] !== null) return obj[key];
+  }
+  return null;
+}
+
+function normalizeCodexWindow(window) {
+  if (!window || typeof window !== "object") return null;
+  const usedRaw = valueFromAny(window, ["used_percent", "usedPercent"]);
+  if (usedRaw === null) return null;
+  const usedPercent = Number(usedRaw);
+  const windowMinutes = Number(valueFromAny(window, ["window_minutes", "windowDurationMins"]));
+  const resetsAt = Number(valueFromAny(window, ["resets_at", "resetsAt"]));
+  if (!Number.isFinite(usedPercent)) return null;
+  return {
+    used_percent: Math.max(0, Math.min(100, usedPercent)),
+    window_minutes: Number.isFinite(windowMinutes) && windowMinutes > 0 ? windowMinutes : null,
+    resets_at: Number.isFinite(resetsAt) && resetsAt > 0
+      ? (resetsAt > 1e12 ? Math.round(resetsAt / 1000) : resetsAt)
+      : null,
+  };
+}
+
+function normalizeCodexIndividualLimit(limit) {
+  if (!limit || typeof limit !== "object") return null;
+  const remainingRaw = valueFromAny(limit, ["remaining_percent", "remainingPercent"]);
+  const remainingPercent = Number(remainingRaw);
+  if (remainingRaw === null || !Number.isFinite(remainingPercent)) return null;
+  const resetsAt = Number(valueFromAny(limit, ["resets_at", "resetsAt"]));
+  return {
+    remaining_percent: Math.max(0, Math.min(100, remainingPercent)),
+    resets_at: Number.isFinite(resetsAt) && resetsAt > 0
+      ? (resetsAt > 1e12 ? Math.round(resetsAt / 1000) : resetsAt)
+      : null,
+    limit: limit.limit ?? null,
+    used: limit.used ?? null,
+  };
+}
+
+function normalizeCodexRateLimitEntry(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const creditsRaw = entry.credits;
+  const credits = creditsRaw && typeof creditsRaw === "object"
+    ? {
+        has_credits: Boolean(valueFromAny(creditsRaw, ["has_credits", "hasCredits"])),
+        unlimited: Boolean(creditsRaw.unlimited),
+        balance: creditsRaw.balance ?? null,
+      }
+    : null;
+  return {
+    limit_id: String(valueFromAny(entry, ["limit_id", "limitId"]) || "codex"),
+    limit_name: valueFromAny(entry, ["limit_name", "limitName"]),
+    primary: normalizeCodexWindow(entry.primary),
+    secondary: normalizeCodexWindow(entry.secondary),
+    credits,
+    individual_limit: normalizeCodexIndividualLimit(valueFromAny(entry, ["individual_limit", "individualLimit"])),
+    plan_type: valueFromAny(entry, ["plan_type", "planType"]),
+    rate_limit_reached_type: valueFromAny(entry, ["rate_limit_reached_type", "rateLimitReachedType"]),
+    detectedAt: entry.detectedAt || entry.detected_at || null,
+    file: entry.file || null,
+  };
+}
+
+function codexWindowLabel(windowMinutes, fallbackLabel) {
+  const minutes = Number(windowMinutes);
+  if (!Number.isFinite(minutes) || minutes <= 0) return fallbackLabel;
+  if (minutes === 300) return "5h";
+  if (minutes === 10080) return "semana";
+  if (minutes % 10080 === 0) return `${minutes / 10080} sem`;
+  if (minutes % 1440 === 0) return `${minutes / 1440}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+}
+
+function normalizeResetCredits(value) {
+  if (!value || typeof value !== "object") return null;
+  const availableCount = Number(valueFromAny(value, ["available_count", "availableCount"]));
+  const credits = Array.isArray(value.credits) ? value.credits.map((credit) => ({
+    status: credit.status || "",
+    resetType: valueFromAny(credit, ["reset_type", "resetType"]) || "",
+    expiresAt: valueFromAny(credit, ["expires_at", "expiresAt"]) || null,
+  })) : [];
+  if (!Number.isFinite(availableCount) && !credits.length) return null;
+  return { availableCount: Number.isFinite(availableCount) ? availableCount : credits.length, credits };
 }
 
 function buildCodexQuota(usage, config = {}, live = null) {
   const manual = buildTokenQuota("codex", usage, config.dailyTokens, "dia");
-  // Probe en vivo (codex-probe.py): si trae rate_limits frescos, son la fuente; si Codex
-  // esta LIMITADO lo marcamos; si no, leemos las sesiones pasivas (~/.codex/sessions).
-  const fromLive = Boolean(live?.ok && live.rate_limits);
-  const limited = Boolean(live?.ok && live.limited);
-  // Si el probe EN VIVO dice LIMITADO, esa es la verdad actual: NO mostramos barras viejas de
-  // sesiones (~/.codex/sessions). Son de ANTES del tope y contradicen el estado real (verias
-  // "5h 18%" junto a "[LIMITE]") -> confunde. Limitado => tarjeta de limite directo, sin barras.
-  const detected = limited ? null : (fromLive ? live.rate_limits : (config.useDetectedRateLimits !== false ? collectCodexRateLimits() : null));
+  // Codex >=0.144 expone una lectura gratuita por app-server. El helper la normaliza al formato
+  // historico snake_case; las sesiones locales quedan como fallback para versiones anteriores.
+  const liveRateLimits = live?.rate_limits || live?.rateLimits || null;
+  const fromLive = Boolean(live?.ok && liveRateLimits);
+  const explicitlyLimited = Boolean(live?.ok && live.limited);
+  const detected = fromLive
+    ? liveRateLimits
+    : explicitlyLimited
+      ? null
+      : (config.useDetectedRateLimits !== false ? collectCodexRateLimits() : null);
   if (!detected) {
-    if (limited) {
+    if (explicitlyLimited) {
       // Codex da la hora de reintento como texto en la TZ del host (UTC). La convertimos a un
       // instante absoluto para countdown (a prueba de zona) y, si hay tz configurada, a tu hora.
       const retryDate = parseCodexRetryTime(live.retryText);
@@ -710,9 +1866,13 @@ function buildCodexQuota(usage, config = {}, live = null) {
     return manual;
   }
 
-  const entries = Array.isArray(detected) ? detected : [detected];
+  const entries = (Array.isArray(detected) ? detected : [detected])
+    .map(normalizeCodexRateLimitEntry)
+    .filter(Boolean);
+  const reportedLimited = explicitlyLimited || entries.some((entry) => Boolean(entry.rate_limit_reached_type));
   const windows = [];
   const creditsList = [];
+  const resetCredits = normalizeResetCredits(live?.rate_limit_reset_credits || live?.rateLimitResetCredits);
 
   for (const entry of entries) {
     const limitId = entry.limit_id || "codex";
@@ -724,10 +1884,13 @@ function buildCodexQuota(usage, config = {}, live = null) {
     ]) {
       const item = entry[name];
       if (!item || typeof item.used_percent !== "number") continue;
-      const label = limitId === "premium" ? `mini-${defaultLabel}` : defaultLabel;
+      const windowLabel = codexWindowLabel(item.window_minutes, defaultLabel);
+      const label = limitId === "premium" ? `mini-${windowLabel}` : windowLabel;
       windows.push({
+        key: `${limitId}_${name}_${item.window_minutes || windowLabel}`,
         label,
         limitId,
+        sourceWindow: name,
         usedPercent: item.used_percent,
         remainingPercent: Math.max(0, 100 - item.used_percent),
         reset: item.resets_at ? new Date(item.resets_at * 1000) : null,
@@ -739,18 +1902,61 @@ function buildCodexQuota(usage, config = {}, live = null) {
     if (credits && typeof credits.has_credits === "boolean") {
       creditsList.push({ limitId, planType, ...credits });
     }
+    const individual = entry.individual_limit;
+    if (individual) {
+      windows.push({
+        key: `${limitId}_individual_limit`,
+        label: entry.limit_name || "limite mensual",
+        limitId,
+        sourceWindow: "individual",
+        windowType: "monthly-spend",
+        usedPercent: Math.max(0, 100 - individual.remaining_percent),
+        remainingPercent: individual.remaining_percent,
+        reset: individual.resets_at ? new Date(individual.resets_at * 1000) : null,
+        limitText: individual.limit == null ? "" : String(individual.limit),
+        usedText: individual.used == null ? "" : String(individual.used),
+      });
+    }
   }
+  const codexAvailability = groupedQuotaAvailability(windows, "limitId");
+  let reachedGroups = entries
+    .filter((entry) => Boolean(entry.rate_limit_reached_type))
+    .map((entry) => entry.limit_id);
+  if (explicitlyLimited && !reachedGroups.length) {
+    reachedGroups = entries.map((entry) => entry.limit_id);
+  }
+  reachedGroups = [...new Set(reachedGroups)];
+  if (reachedGroups.length) {
+    for (const window of windows) {
+      if (reachedGroups.includes(window.limitId)) window.status = "rate-limited";
+    }
+    codexAvailability.availableGroups = codexAvailability.availableGroups.filter((group) => !reachedGroups.includes(group));
+    codexAvailability.limitingGroups = [...new Set([...codexAvailability.limitingGroups, ...reachedGroups])];
+    codexAvailability.available = codexAvailability.availableGroups.length > 0;
+    codexAvailability.limited = !codexAvailability.available;
+    if (!codexAvailability.available) codexAvailability.effectiveRemainingPercent = 0;
+  }
+  const hasUsableCredits = creditsList.some((credit) => credit.unlimited || credit.has_credits);
+  if (hasUsableCredits && !codexAvailability.available && !reachedGroups.length) {
+    codexAvailability.available = true;
+    codexAvailability.limited = false;
+  }
+  const limited = codexAvailability.limited || (reportedLimited && !codexAvailability.available);
 
-  // Frescura: el rate_limit de Codex SOLO se escribe al USAR codex (no hay query en vivo);
-  // el dashboard lo lee pasivo de ~/.codex/sessions. Si el ultimo dato es viejo o su ventana
-  // ya reseteo, el % puede no reflejar el uso actual -> lo marcamos como stale.
+  // La lectura app-server trae capturedAt. Solo el fallback de sesiones puede quedar viejo si
+  // Codex no se ha usado recientemente o si una ventana ya se reinicio.
   const detectedTimes = entries.map((e) => Date.parse(e.detectedAt || "")).filter(Number.isFinite);
-  const freshestMs = fromLive ? Date.now() : (detectedTimes.length ? Math.max(...detectedTimes) : NaN);
-  const ageMin = fromLive ? 0 : (Number.isFinite(freshestMs) ? Math.max(0, Math.round((Date.now() - freshestMs) / 60000)) : null);
+  const liveCapturedMs = Date.parse(live?.capturedAt || "");
+  const freshestMs = fromLive
+    ? (Number.isFinite(liveCapturedMs) ? liveCapturedMs : Date.now())
+    : (detectedTimes.length ? Math.max(...detectedTimes) : NaN);
+  const ageMin = Number.isFinite(freshestMs) ? Math.max(0, Math.round((Date.now() - freshestMs) / 60000)) : null;
   for (const w of windows) {
-    if (!fromLive && w.reset instanceof Date && w.reset.getTime() < Date.now()) w.stale = true;
+    if ((!fromLive || live?.cacheStale) && w.reset instanceof Date && w.reset.getTime() < Date.now()) w.stale = true;
   }
-  const codexStale = !fromLive && ((ageMin != null && ageMin >= 20) || windows.some((w) => w.stale));
+  const codexStale = fromLive
+    ? Boolean(live?.cacheStale)
+    : ((ageMin != null && ageMin >= 20) || windows.some((w) => w.stale));
   const ageStr = ageMin == null ? "" : ageMin >= 120 ? `${Math.round(ageMin / 60)}h` : `${ageMin}m`;
   const ageTag = !fromLive && ageMin != null && ageMin >= 20 ? `  [dato de hace ${ageStr}; usa codex para refrescar]` : "";
   const limitTag = limited ? `LIMITE ALCANZADO (reintentar ${live.retryText || "mas tarde"}).  ` : "";
@@ -759,35 +1965,46 @@ function buildCodexQuota(usage, config = {}, live = null) {
   if (!windows.length && creditsList.length) {
     return {
       source: "codex",
+      dataSource: fromLive ? (live.source || "codex-app-server") : "codex-sessions",
       kind: "detected-credits",
       ok: true,
+      ...codexAvailability,
       plan: entries[0]?.plan_type || entries[0]?.limit_id || "",
       creditsList,
       manual,
+      resetCredits,
       detectedAt: codexDetectedAt,
+      observedAt: codexDetectedAt,
       stale: codexStale,
       limited,
       limitedRetry: limited ? live.retryText : undefined,
       note: limitTag + creditsList.map((c) => {
         const name = c.limitId === "premium" ? "mini" : c.limitId;
         return c.unlimited ? `${name}: ilimitado` : c.has_credits ? `${name}: balance ${c.balance}` : `${name}: sin creditos`;
-      }).join(" | ") + ageTag,
+      }).join(" | ") + (resetCredits?.availableCount ? ` | reinicios disponibles: ${resetCredits.availableCount}` : "") + ageTag,
     };
   }
 
   return {
     source: "codex",
+    dataSource: fromLive ? (live.source || "codex-app-server") : "codex-sessions",
     kind: "detected-percent",
     ok: true,
+    ...codexAvailability,
     plan: entries[0]?.plan_type || "",
     windows,
     creditsList,
+    resetCredits,
     manual,
     detectedAt: codexDetectedAt,
+    observedAt: codexDetectedAt,
     stale: codexStale,
     limited,
     limitedRetry: limited ? live.retryText : undefined,
-    note: limitTag + (fromLive ? "Codex (probe en vivo)." : windows.length ? "Rate limit detectado desde sesiones Codex." : "Codex sin rate_limits recientes.") + ageTag,
+    note: limitTag
+      + (fromLive ? "Codex app-server (consulta oficial)." : windows.length ? "Rate limit detectado desde sesiones Codex." : "Codex sin rate_limits recientes.")
+      + (resetCredits?.availableCount ? ` Reinicios disponibles: ${resetCredits.availableCount}.` : "")
+      + ageTag,
   };
 }
 
@@ -872,16 +2089,28 @@ function buildClaudeQuota(usage, blocksRaw, config = {}, live = null) {
     : null;
 
   if (live?.ok && Array.isArray(live.windows) && live.windows.length) {
-    const windows = live.windows.map((w) => ({
-      ...w,
-      reset: w.reset || parseClaudeResetText(w.resetText),
-    }));
+    const windows = live.windows.map((w) => {
+      const rawLabel = w.rawLabel || w.label || w.key || "";
+      return {
+        ...w,
+        key: claudeWindowKey(rawLabel),
+        label: claudeWindowLabel(rawLabel),
+        rawLabel,
+        reset: w.reset || parseClaudeResetText(w.resetText),
+      };
+    });
+    const globalWindows = windows.filter((window) => window.key === "session" || window.key === "week_all");
+    const availability = conjunctiveQuotaAvailability(globalWindows.length ? globalWindows : windows);
     return {
       source: "claude",
+      dataSource: "claude-cli",
       kind: "detected-percent",
       ok: true,
+      ...availability,
       windows,
       activeBlock,
+      observedAt: live.capturedAt || null,
+      stale: Boolean(live.cacheStale),
       live,
       note: live.cacheHit
         ? live.cacheStale
@@ -908,30 +2137,108 @@ function buildClaudeQuota(usage, blocksRaw, config = {}, live = null) {
 }
 
 function buildGeminiQuota(usage, config = {}, live = null) {
-  if (live?.ok && typeof live.usedPercent === "number") {
-    const usedPercent = Math.min(999, Number(live.usedPercent || 0));
-    const remainingPercent = Math.max(0, Number(live.remainingPercent ?? 100 - usedPercent));
+  const modelQuotas = Array.isArray(live?.modelQuotas) ? live.modelQuotas : [];
+  const hasGlobalQuota = live?.usedPercent !== null
+    && live?.usedPercent !== undefined
+    && Number.isFinite(Number(live.usedPercent));
+  if (live?.ok && (hasGlobalQuota || modelQuotas.length)) {
+    const usedPercent = hasGlobalQuota ? Math.min(999, Number(live.usedPercent)) : null;
+    const remainingPercent = hasGlobalQuota
+      ? Math.max(0, Number(live.remainingPercent ?? 100 - usedPercent))
+      : null;
     const limitRequests = Number(live.usageLimit || config.dailyRequests || 0) || null;
     const remainingRequests =
       live.remainingRequests != null
         ? Number(live.remainingRequests)
-        : limitRequests
+        : limitRequests && remainingPercent != null
           ? Math.max(0, Math.round((remainingPercent / 100) * limitRequests))
           : null;
+    const reset = dateFromProviderValue(live.resetAt);
+    const windows = [];
+    if (hasGlobalQuota) {
+      windows.push({
+        key: "daily_global",
+        label: "dia",
+        windowType: "daily",
+        windowMinutes: 1440,
+        usedPercent,
+        remainingPercent,
+        reset,
+        resetText: live.resetText || "",
+        limit: limitRequests,
+        remaining: remainingRequests,
+        used: limitRequests && remainingRequests != null ? Math.max(0, limitRequests - remainingRequests) : null,
+      });
+    }
+    for (const quota of modelQuotas) {
+      const modelUsed = quota.usedPercent == null ? NaN : Number(quota.usedPercent);
+      const modelRemaining = quota.remainingPercent == null ? NaN : Number(quota.remainingPercent);
+      if (!Number.isFinite(modelUsed) && !Number.isFinite(modelRemaining)) continue;
+      windows.push({
+        key: `model_${String(quota.model || "model").toLowerCase().replace(/[^a-z0-9]+/g, "_")}`,
+        label: quota.model || "modelo",
+        model: quota.model || "",
+        windowType: "model",
+        usedPercent: Number.isFinite(modelUsed) ? modelUsed : Math.max(0, 100 - modelRemaining),
+        remainingPercent: Number.isFinite(modelRemaining) ? modelRemaining : Math.max(0, 100 - modelUsed),
+        reset: dateFromProviderValue(quota.resetAt),
+        resetText: quota.resetText || "",
+      });
+    }
+    const modelWindows = windows.filter((window) => window.windowType === "model");
+    const availableModels = modelWindows
+      .filter((window) => window.remainingPercent > 0)
+      .map((window) => window.model || "modelo");
+    const unavailableModels = modelWindows
+      .filter((window) => window.remainingPercent <= 0)
+      .map((window) => window.model || "modelo");
+    const modelCapacity = modelWindows.length
+      ? Math.max(...modelWindows.map((window) => window.remainingPercent))
+      : null;
+    const globalAvailable = remainingPercent == null || remainingPercent > 0;
+    const modelsAvailable = !modelWindows.length || availableModels.length > 0;
+    const available = globalAvailable && modelsAvailable;
+    const limited = !available;
+    const capacityValues = [remainingPercent, modelCapacity].filter((value) => value !== null);
     return {
       source: "gemini",
+      dataSource: "gemini-cli",
       kind: "detected-requests",
       ok: true,
+      available,
+      limited,
+      effectiveRemainingPercent: capacityValues.length ? Math.min(...capacityValues) : null,
+      limitingWindows: remainingPercent !== null && remainingPercent <= 0 ? ["dia"] : [],
+      availableGroups: availableModels,
+      limitingGroups: unavailableModels,
+      unavailableModels,
+      windows,
       usedPercent,
       remainingPercent,
       limitRequests,
       remainingRequests,
       resetText: live.resetText || "",
-      resetAt: live.resetAt ? new Date(live.resetAt) : null,
+      resetAt: reset,
       tier: live.tier || "",
-      modelQuotas: Array.isArray(live.modelQuotas) ? live.modelQuotas : [],
+      plan: live.tier || "",
+      modelQuotas,
+      observedAt: live.capturedAt || null,
+      stale: Boolean(live.cacheStale),
       live,
       note: live.cacheHit ? "Gemini /stats model desde cache local." : "Gemini /stats model detectado desde el CLI.",
+    };
+  }
+
+  if (live?.needsAuth || live?.authDead) {
+    return {
+      source: "gemini",
+      kind: "unknown",
+      ok: false,
+      available: false,
+      needsAuth: true,
+      windows: [],
+      observedAt: live.capturedAt || null,
+      note: live.note || "Gemini CLI requiere autenticacion; ejecuta `gemini`.",
     };
   }
 
@@ -954,7 +2261,7 @@ function buildGeminiQuota(usage, config = {}, live = null) {
 
 function buildTokenQuota(source, usage, limit, windowLabel) {
   const numericLimit = Number(limit || 0);
-  const used = Number(usage?.totals?.totalTokens || 0);
+  const used = Number(usage?.totals?.effectiveTokens ?? usage?.totals?.totalTokens ?? 0);
   return {
     source,
     kind: numericLimit ? "configured-tokens" : "unknown",
@@ -965,6 +2272,41 @@ function buildTokenQuota(source, usage, limit, windowLabel) {
     usedPercent: numericLimit ? Math.min(999, (used / numericLimit) * 100) : null,
     windowLabel,
     note: numericLimit ? "Limite configurado localmente." : "Sin limite local configurado.",
+  };
+}
+
+function dateFromProviderValue(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const numeric = Number(value);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric > 0 && numeric < 1e12 ? numeric * 1000 : numeric)
+    : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function finiteNumberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function miniMaxWindowValues(model, prefix) {
+  const directRemaining = finiteNumberOrNull(model?.[`${prefix}_remaining_percent`]);
+  const status = finiteNumberOrNull(model?.[`${prefix}_status`]);
+  const total = finiteNumberOrNull(model?.[`${prefix}_total_count`]);
+  // Despite the historical field name, MiniMax returns remaining requests here.
+  const remainingCount = finiteNumberOrNull(model?.[`${prefix}_usage_count`]);
+  let remainingPercent = directRemaining;
+  if (remainingPercent === null && total !== null && total > 0 && remainingCount !== null) {
+    remainingPercent = (remainingCount / total) * 100;
+  }
+  return {
+    active: status === null || status === 1 || status === 2,
+    status,
+    remainingPercent: remainingPercent === null ? null : Math.max(0, Math.min(100, remainingPercent)),
+    limit: total !== null && total > 0 ? total : null,
+    remaining: total !== null && total > 0 && remainingCount !== null ? Math.max(0, remainingCount) : null,
+    used: total !== null && total > 0 && remainingCount !== null ? Math.max(0, total - remainingCount) : null,
   };
 }
 
@@ -981,37 +2323,76 @@ function buildMiniMaxQuota(usage, config = {}) {
   // Format 1: model_remains array (Coding Plan API) — per-model 5h + weekly windows
   if (Array.isArray(data.model_remains) && data.model_remains.length) {
     const windows = [];
+    const unavailableModels = [];
     for (const m of data.model_remains) {
       const modelName = m.model_name || "model";
-      const intervalPct = Number(m.current_interval_remaining_percent);
-      const weeklyPct = Number(m.current_weekly_remaining_percent);
-      if (Number.isFinite(intervalPct)) {
+      const interval = miniMaxWindowValues(m, "current_interval");
+      const weekly = miniMaxWindowValues(m, "current_weekly");
+      const intervalIsDaily = modelName !== "general";
+      if (interval.active && interval.remainingPercent !== null) {
         windows.push({
-          key: `interval_${modelName}`,
-          label: `${modelName} 5h`,
-          usedPercent: Math.max(0, Math.min(100, 100 - intervalPct)),
-          remainingPercent: Math.max(0, Math.min(100, intervalPct)),
-          reset: Number.isFinite(Number(m.end_time)) ? new Date(Number(m.end_time)) : null,
+          key: `${intervalIsDaily ? "daily" : "interval"}_${modelName}`,
+          label: `${modelName} ${intervalIsDaily ? "dia" : "5h"}`,
+          model: modelName,
+          windowType: intervalIsDaily ? "daily" : "rolling",
+          windowMinutes: intervalIsDaily ? 1440 : 300,
+          status: interval.status,
+          usedPercent: Math.max(0, 100 - interval.remainingPercent),
+          remainingPercent: interval.remainingPercent,
+          reset: dateFromProviderValue(m.end_time),
+          limit: interval.limit,
+          used: interval.used,
+          remaining: interval.remaining,
         });
       }
-      if (Number.isFinite(weeklyPct)) {
+      if (weekly.active && weekly.remainingPercent !== null) {
         windows.push({
           key: `weekly_${modelName}`,
           label: `${modelName} sem`,
-          usedPercent: Math.max(0, Math.min(100, 100 - weeklyPct)),
-          remainingPercent: Math.max(0, Math.min(100, weeklyPct)),
-          reset: Number.isFinite(Number(m.weekly_end_time)) ? new Date(Number(m.weekly_end_time)) : null,
+          model: modelName,
+          windowType: "weekly",
+          windowMinutes: 10080,
+          status: weekly.status,
+          usedPercent: Math.max(0, 100 - weekly.remainingPercent),
+          remainingPercent: weekly.remainingPercent,
+          reset: dateFromProviderValue(m.weekly_end_time),
+          limit: weekly.limit,
+          used: weekly.used,
+          remaining: weekly.remaining,
         });
       }
+      if (!interval.active && !weekly.active) unavailableModels.push(modelName);
     }
     if (windows.length) {
+      const availability = groupedQuotaAvailability(windows, "model");
       return {
         source: "minimax",
+        dataSource: "minimax-api",
         kind: "detected-percent",
         ok: true,
+        ...availability,
         windows,
+        unavailableModels,
+        observedAt: usage.capturedAt || null,
+        stale: Boolean(usage.cacheStale),
         raw: usage.raw || null,
-        note: usage.note || (usage.cacheHit ? "MiniMax desde cache local." : "MiniMax Coding Plan."),
+        note: usage.note || (usage.cacheHit ? "MiniMax desde cache local." : "MiniMax Token Plan."),
+      };
+    }
+    if (unavailableModels.length) {
+      return {
+        source: "minimax",
+        dataSource: "minimax-api",
+        kind: "unknown",
+        ok: false,
+        available: false,
+        unusable: true,
+        reason: "not-configured",
+        windows: [],
+        unavailableModels,
+        observedAt: usage.capturedAt || null,
+        stale: Boolean(usage.cacheStale),
+        note: "MiniMax Token Plan sin modelos suscritos en esta cuenta.",
       };
     }
   }
@@ -1033,11 +2414,23 @@ function buildMiniMaxQuota(usage, config = {}) {
   const finalRemaining = remaining != null ? remaining : computedRemaining;
 
   const plan = data.current_package_name || data.planName || data.plan_name || data.packageName || "";
+  const windows = finalUsedPercent != null ? [{
+    key: "plan",
+    label: plan || "plan",
+    usedPercent: finalUsedPercent,
+    remainingPercent,
+    reset: resetAt,
+    resetText,
+  }] : [];
+  const availability = conjunctiveQuotaAvailability(windows);
 
   return {
     source: "minimax",
+    dataSource: usage.source || "minimax-api",
     kind: limit > 0 ? "configured-credits" : "detected-percent",
     ok: true,
+    ...availability,
+    windows,
     used,
     limit: limit || null,
     remaining: finalRemaining,
@@ -1046,6 +2439,8 @@ function buildMiniMaxQuota(usage, config = {}) {
     resetAt,
     resetText,
     plan,
+    observedAt: usage.capturedAt || null,
+    stale: Boolean(usage.cacheStale),
     raw: usage.raw || null,
     note: usage.note || (usage.cacheHit ? "MiniMax desde cache local." : "MiniMax API consultada."),
   };
@@ -1071,12 +2466,12 @@ function pickAntigravityProject(projects) {
   return values[0] || null;
 }
 
-function staleAntigravityQuota(note) {
+function staleAntigravityQuota(note, reason = null) {
   const stale = readJsonSafe(ANTIGRAVITY_QUOTA_CACHE_PATH);
   if (stale?.ok) {
     return { ...stale, cacheHit: true, cacheStale: true, note: `${note} Usando cache.` };
   }
-  return { source: "antigravity", ok: false, note };
+  return { source: "antigravity", ok: false, note, ...(reason ? { unusable: true, reason } : {}) };
 }
 
 function parseRefreshShort(text) {
@@ -1111,7 +2506,11 @@ async function captureAntigravityUsage(config = {}) {
   }
 }
 
-async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false } = {}) {
+// NOTA: antigravity es SINGLE-ACCOUNT por diseno (resolveAccounts lo rechaza con >1
+// cuenta): su CLI fija la raiz en ~/.gemini/antigravity-cli y la captura es scraping por
+// PTY. Acepta `account` solo para que el runner generico lo llame igual que a los demas.
+async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false, account = null } = {}) {
+  void account;
   // Cuota REAL del plan consumer de Antigravity (Gemini) via el backend
   // cloudcode-pa.googleapis.com:retrieveUserQuota, usando el oauth-token local.
   if (process.env.AI_USAGE_ANTIGRAVITY_LIVE === "0" || config.liveCapture === false) {
@@ -1145,7 +2544,7 @@ async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false } 
   const tokenRaw = readJsonSafe(ANTIGRAVITY_TOKEN_PATH);
   const accessToken = tokenRaw?.token?.access_token || tokenRaw?.access_token;
   if (!accessToken) {
-    return staleAntigravityQuota("No encuentro token de Antigravity (~/.gemini/antigravity-cli/antigravity-oauth-token).");
+    return staleAntigravityQuota("No encuentro token de Antigravity (~/.gemini/antigravity-cli/antigravity-oauth-token).", "not-configured");
   }
 
   const project = pickAntigravityProject(readJsonSafe(ANTIGRAVITY_PROJECTS_PATH));
@@ -1172,11 +2571,11 @@ async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false } 
     const buckets = (Array.isArray(data.buckets) ? data.buckets : [])
       .map((b) => ({
         modelId: b.modelId || "",
-        remainingFraction: Number(b.remainingFraction),
+        remainingFraction: finiteNumberOrNull(b.remainingFraction),
         resetTime: b.resetTime || null,
         tokenType: b.tokenType || "",
       }))
-      .filter((b) => Number.isFinite(b.remainingFraction));
+      .filter((b) => b.remainingFraction !== null);
     const output = {
       source: "antigravity",
       ok: true,
@@ -1193,8 +2592,8 @@ async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false } 
 }
 
 function buildAntigravityQuota(usage, config = {}, live = null) {
-  // Antigravity es la ruta viva a modelos Gemini (Google revoco el OAuth del gemini-cli).
-  // Cuota REAL desde la API consumer; fallback a limites manuales; consumo (sesiones,
+  // Antigravity ofrece una cuota separada de Gemini CLI y tambien agrupa modelos Claude/GPT.
+  // Cuota real desde CLI/API consumer; fallback a limites manuales; consumo (sesiones,
   // pasos de modelo, ultima actividad) derivado de transcripts locales.
   const installed = Boolean(usage?.installed);
   const sessions = usage?.sessions ?? 0;
@@ -1210,8 +2609,8 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
     for (const g of live.groups) {
       const fam = g.name || "grupo";
       for (const [key, label, w] of [["5h", "5 horas", g.fiveHour], ["sem", "semanal", g.weekly]]) {
-        const rem = w ? Number(w.remainingPercent) : NaN;
-        if (!Number.isFinite(rem)) continue;
+        const rem = finiteNumberOrNull(w?.remainingPercent);
+        if (rem === null) continue;
         const remPct = Math.max(0, Math.min(100, rem));
         windows.push({
           key: `${fam}-${key}`,
@@ -1227,58 +2626,70 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
     if (windows.length) {
       const ageMs = live.capturedAt ? Date.now() - Date.parse(live.capturedAt) : NaN;
       const ageTag = Number.isFinite(ageMs) ? `  [hace ${Math.max(0, Math.round(ageMs / 60000))}m]` : "";
+      const availability = groupedQuotaAvailability(windows, "family");
       return {
         source: "antigravity",
+        dataSource: "antigravity-cli",
         kind: "detected-percent",
         ok: true,
+        ...availability,
         windows,
+        observedAt: live.capturedAt || null,
+        stale: Boolean(live.cacheStale),
         note: `Antigravity /usage (CLI, ${live.groups.length} grupos: Gemini + Claude/GPT).  ${statsNote}${ageTag}${live.cacheStale ? "  [cache vieja]" : ""}`,
       };
     }
   }
 
-  // 2) Fallback API: retrieveUserQuota (Gemini por-modelo) + modelos ofrecidos como "disponibles".
+  // 2) Fallback API: retrieveUserQuota expone cuotas Gemini por modelo.
   if (live?.ok && Array.isArray(live.buckets) && live.buckets.length) {
     const isGemini = (b) => /gemini/i.test(b.modelId);
-    const sorted = [...live.buckets].sort((a, b) => {
+    const sorted = live.buckets
+      .filter((bucket) => finiteNumberOrNull(bucket.remainingFraction) !== null)
+      .map((bucket) => ({ ...bucket, remainingFraction: Number(bucket.remainingFraction) }))
+      .sort((a, b) => {
       const ga = isGemini(a) ? 0 : 1;
       const gb = isGemini(b) ? 0 : 1;
       if (ga !== gb) return ga - gb; // gemini primero
       return a.remainingFraction - b.remainingFraction; // dentro del grupo, mas usado primero
-    });
+      });
     const windows = sorted.map((b) => {
       const remPct = Math.max(0, Math.min(100, b.remainingFraction * 100));
       return {
         key: b.modelId,
         label: shortText(b.modelId.replace(/-preview$/, ""), 18),
+        model: b.modelId,
         family: isGemini(b) ? "gemini" : "otros",
         usedPercent: Math.max(0, Math.min(100, 100 - remPct)),
         remainingPercent: remPct,
         reset: b.resetTime ? new Date(b.resetTime) : null,
       };
     });
-    // Modelos no-Gemini que Antigravity ofrece (Claude/GPT, desde `agy models`).
-    // La API de cuota NO expone su uso, asi que los listamos como "disponibles".
-    const offered = Array.isArray(usage?.models) ? usage.models : [];
-    let extraCount = 0;
-    for (const m of offered) {
-      if (/gemini/i.test(m)) continue; // los Gemini ya van con cuota real arriba
-      windows.push({ key: m, label: m, family: "otros", available: true });
-      extraCount += 1;
-    }
+    // `agy models` solo confirma que un modelo se ofrece, no que tenga cuota.
+    const offeredModels = (Array.isArray(usage?.models) ? usage.models : [])
+      .filter((model) => !/gemini/i.test(model));
     const unit = live.buckets[0]?.tokenType || "req";
-    const offeredNote = extraCount ? ` + ${extraCount} disponibles sin cuota (Claude/GPT)` : "";
+    const offeredNote = offeredModels.length
+      ? `; ${offeredModels.length} Claude/GPT ofrecidos con cuota desconocida`
+      : "";
+    const availability = groupedQuotaAvailability(windows, "model");
     return {
       source: "antigravity",
+      dataSource: "antigravity-api",
       kind: "detected-percent",
       ok: true,
+      ...availability,
       windows,
-      note: `Antigravity (API real, ${unit}, ${windows.length - extraCount} con cuota${offeredNote}).  ${statsNote}${live.cacheStale ? "  [cache]" : ""}`,
+      unavailableModels: availability.limitingGroups,
+      offeredModels,
+      observedAt: live.capturedAt || null,
+      stale: Boolean(live.cacheStale),
+      note: `Antigravity (API real, ${unit}, ${windows.length} con cuota${offeredNote}).  ${statsNote}${live.cacheStale ? "  [cache]" : ""}`,
     };
   }
 
   if (!installed && !(live && live.ok === false && live.note)) {
-    return { source: "antigravity", kind: "unknown", ok: false, note: "Antigravity no instalado (no encuentro antigravity/agy)." };
+    return { source: "antigravity", kind: "unknown", ok: false, unusable: true, reason: "not-installed", note: "Antigravity no instalado (no encuentro antigravity/agy)." };
   }
 
   // 2) Fallback: limites manuales en quotas.json.
@@ -1288,10 +2699,19 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
   if (Number.isFinite(monthlyCredits) && monthlyCredits > 0) {
     const used = Number.isFinite(usedCredits) ? Math.max(0, usedCredits) : 0;
     const usedPercent = Math.min(999, (used / monthlyCredits) * 100);
+    const windows = [{
+      key: "manual",
+      label: "manual",
+      usedPercent,
+      remainingPercent: Math.max(0, 100 - usedPercent),
+      reset: resetsAt,
+    }];
     return {
       source: "antigravity",
       kind: "configured-credits",
       ok: true,
+      ...conjunctiveQuotaAvailability(windows),
+      windows,
       used,
       limit: monthlyCredits,
       remaining: Math.max(0, monthlyCredits - used),
@@ -1315,22 +2735,50 @@ function buildAntigravityQuota(usage, config = {}, live = null) {
 function buildOpenCodeQuota(usage, config = {}, server = null) {
   const data = usage?.data || usage || {};
 
+  const availabilityFor = (windows) => {
+    const numeric = windows.filter((window) => finiteNumberOrNull(window.remainingPercent) !== null);
+    const limitingWindows = numeric
+      .filter((window) => Number(window.remainingPercent) <= 0 || /rate.?limited|blocked|exhausted/i.test(String(window.status || "")))
+      .map((window) => String(window.label || window.key || "limite"));
+    const effectiveRemainingPercent = numeric.length
+      ? Math.min(...numeric.map((window) => Number(window.remainingPercent)))
+      : null;
+    return {
+      available: numeric.length > 0 && limitingWindows.length === 0,
+      limited: limitingWindows.length > 0,
+      limitingWindows,
+      effectiveRemainingPercent,
+    };
+  };
+
   // 0) Cuota REAL desde opencode.ai/auth (scrape web autenticado). Precedencia maxima.
   if (server?.ok && Array.isArray(server.windows) && server.windows.length) {
     const localBits = [];
     if (typeof data.cost5h === "number") localBits.push(`5h ${fmtMoney(data.cost5h)}`);
     if (typeof data.costWeek === "number") localBits.push(`sem ${fmtMoney(data.costWeek)}`);
     if (typeof data.costMonth === "number") localBits.push(`mes ${fmtMoney(data.costMonth)}`);
+    const availability = availabilityFor(server.windows);
+    const requiredKeys = ["5h", "week", "month"];
+    const missingWindows = requiredKeys
+      .filter((key) => !server.windows.some((window) => window.key === key))
+      .map((key) => key === "5h" ? "5 horas" : key === "week" ? "semanal" : "mensual");
+    if (missingWindows.length) availability.available = false;
     return {
       source: "opencode",
+      dataSource: "opencode-web",
       kind: "detected-percent",
       ok: true,
       windows: server.windows,
+      ...availability,
+      incomplete: missingWindows.length > 0,
+      missingWindows,
+      observedAt: server.capturedAt || null,
+      stale: Boolean(server.cacheStale),
       totalCost: data.totalCost || 0,
       totalTokens: data.totalTokens || 0,
       sessionCount: data.sessionCount || 0,
       serverOverride: false,
-      note: `Cuota real (opencode.ai/auth)${server.cacheStale ? " [cache]" : ""}.${localBits.length ? `  ·  estimado local (tarifa publica): ${localBits.join("  ")}` : ""}`,
+      note: `${availability.limited ? `LIMITE ALCANZADO (${availability.limitingWindows.join(", ")}). ` : ""}${missingWindows.length ? `Cuota incompleta: falta ${missingWindows.join(", ")}; disponibilidad no confirmada. ` : ""}Cuota real (opencode.ai/auth)${server.cacheStale ? " [cache]" : ""}.${localBits.length ? `  ·  estimado local (tarifa publica): ${localBits.join("  ")}` : ""}`,
     };
   }
 
@@ -1451,14 +2899,19 @@ function buildOpenCodeQuota(usage, config = {}, server = null) {
 
   if (windows.length) {
     const allServer = windows.every((w) => w.source === "server");
+    const availability = availabilityFor(windows);
     let noteText = useOverride
       ? (override.note ? `Override manual: ${override.note}` : "Override manual desde opencode.ai/auth.")
       : (usage.note || (usage.cacheHit ? "OpenCode Go desde cache local." : "OpenCode Go DB local."));
+    let overrideStale = useOverride;
     if (useOverride) {
       const capturedAt = Date.parse(override.capturedAt || "");
       if (Number.isFinite(capturedAt)) {
         const ageH = Math.max(0, Math.round((Date.now() - capturedAt) / 3600000));
+        overrideStale = ageH >= 12;
         noteText = `${ageH >= 12 ? `[stale ${ageH}h - actualiza opencode.ai/auth] ` : `[hace ${ageH}h] `}${noteText}`;
+      } else {
+        noteText = `[stale - capturedAt desconocido] ${noteText}`;
       }
       const localBits = [];
       if (typeof data.cost5h === "number") localBits.push(`5h ${fmtMoney(data.cost5h)}`);
@@ -1468,14 +2921,18 @@ function buildOpenCodeQuota(usage, config = {}, server = null) {
     }
     return {
       source: "opencode",
+      dataSource: allServer ? "opencode-override" : "opencode-db",
       kind: "detected-percent",
       ok: true,
       windows,
+      ...availability,
+      observedAt: useOverride ? (override.capturedAt || null) : (usage.capturedAt || null),
+      stale: Boolean(usage.cacheStale) || overrideStale,
       totalCost: data.totalCost || 0,
       totalTokens: data.totalTokens || 0,
       sessionCount: data.sessionCount || 0,
       serverOverride: allServer,
-      note: noteText,
+      note: `${availability.limited ? `LIMITE ALCANZADO (${availability.limitingWindows.join(", ")}). ` : ""}${noteText}`,
     };
   }
 
@@ -1493,44 +2950,54 @@ function buildOpenCodeQuota(usage, config = {}, server = null) {
   };
 }
 
-async function collectCodexLive(config = {}, { ignoreCache = false } = {}) {
-  // Codex no expone una query de cuota gratis. codex-probe.py hace una mini-llamada
-  // `codex exec --json`: si Codex esta LIMITADO el backend responde un error (RAPIDO y
-  // GRATIS) con la hora de reintento; si no, devuelve rate_limits frescos. Opt-in via
-  // quotas.json codex.probe (solo el caso NO-limitado consume un poco de cuota).
-  if (config?.probe !== true || process.env.AI_USAGE_CODEX_PROBE === "0") return { ok: false, disabled: true };
-  if (!commandExists("codex")) return { ok: false, note: "codex no instalado." };
-  const cacheMinutes = Number(process.env.CODEX_PROBE_CACHE_MINUTES ?? config.probeCacheMinutes ?? 10);
+async function collectCodexLive(config = {}, { ignoreCache = false, account = null } = {}) {
+  // Codex moderno ofrece account/rateLimits/read por app-server, sin crear una sesion ni gastar
+  // tokens. codex-probe.py conserva el antiguo `codex exec` solo como fallback opt-in.
+  const cachePath = account ? accountCachePath(account, "probe-cache") : CODEX_PROBE_CACHE_PATH;
+  if (process.env.AI_USAGE_CODEX_LIVE === "0" || config?.liveUsage === false) {
+    return { ok: false, disabled: true, note: "Codex app-server desactivado." };
+  }
+  if (!commandExists("codex")) return { ok: false, unusable: true, reason: "not-installed", note: "codex no instalado." };
+  const legacyCacheMinutes = Number(process.env.CODEX_PROBE_CACHE_MINUTES ?? config.probeCacheMinutes ?? 1);
+  const cacheSeconds = Number(process.env.CODEX_USAGE_CACHE_SECONDS ?? config.liveUsageCacheSeconds ?? legacyCacheMinutes * 60);
   if (!ignoreCache) {
-    const cached = readJsonCache(CODEX_PROBE_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
+    const cached = readJsonCache(cachePath, Math.max(0, cacheSeconds) * 1000);
     if (cached) return { ...cached, cacheHit: true };
   }
   const helper = path.join(SCRIPT_DIR, "codex-probe.py");
-  if (!existsSync(helper)) return { ok: false, note: "falta codex-probe.py." };
+  if (!existsSync(helper)) return { ok: false, unusable: true, reason: "not-installed", note: "falta codex-probe.py." };
   try {
+    // codex-probe.py hace Popen(...) sin env=, asi que hereda este entorno; CODEX_HOME
+    // llega tanto al app-server como al escaneo de sesiones (que ahora tambien lo respeta).
     const { stdout } = await execFileAsync("python3", [helper], {
       encoding: "utf8",
       maxBuffer: 4 * 1024 * 1024,
       timeout: 35000,
-      env: { ...process.env, CODEX_PROBE_TIMEOUT: "16" },
+      env: accountEnv(account, {
+        AI_USAGE_LIVE_VERSION: APP_VERSION,
+        CODEX_PROBE_TIMEOUT: process.env.CODEX_PROBE_TIMEOUT || "16",
+        CODEX_ALLOW_EXEC_PROBE: config.probe === true && process.env.AI_USAGE_CODEX_PROBE !== "0" ? "1" : "0",
+      }),
     });
     const parsed = JSON.parse(stdout);
     if (parsed?.ok) {
-      writeJsonCache(CODEX_PROBE_CACHE_PATH, parsed);
+      writeJsonCache(cachePath, parsed);
       return parsed;
     }
-    const stale = readJsonSafe(CODEX_PROBE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok) return { ...stale, cacheHit: true, cacheStale: true };
     return parsed || { ok: false };
   } catch (error) {
-    const stale = readJsonSafe(CODEX_PROBE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok) return { ...stale, cacheHit: true, cacheStale: true };
     return { ok: false, note: `codex probe fallo: ${shortError(error)}` };
   }
 }
 
 function collectCodexRateLimits() {
-  const root = path.join(homedir(), ".codex", "sessions");
+  // CODEX_HOME manda: sin esto el fallback de escaneo de sesiones de la cuenta B leeria
+  // los rate_limits de la cuenta A y los reportaria como suyos (bug silencioso).
+  const root = path.join(process.env.CODEX_HOME || path.join(homedir(), ".codex"), "sessions");
   if (!existsSync(root)) return null;
   const files = [];
   walkFiles(root, (file) => {
@@ -1577,26 +3044,36 @@ function collectCodexRateLimits() {
   return results.length === 1 ? results[0] : results;
 }
 
-async function collectClaudeUsageLive(config = {}, { ignoreCache = false } = {}) {
+async function collectClaudeUsageLive(config = {}, { ignoreCache = false, account = null } = {}) {
+  // Sin `account` (modo legacy) el cache y el entorno son EXACTAMENTE los de siempre.
+  const cachePath = account ? accountCachePath(account, "usage-cache") : CLAUDE_USAGE_CACHE_PATH;
+  const childEnv = accountEnv(account);
   if (process.env.AI_USAGE_CLAUDE_LIVE === "0" || config.liveUsage === false) {
     return { source: "claude", ok: false, disabled: true, note: "Claude /usage desactivado." };
   }
 
   const cacheSeconds = Number(config.liveUsageCacheSeconds ?? 300);
   if (!ignoreCache) {
-    const cached = readJsonCache(CLAUDE_USAGE_CACHE_PATH, Math.max(0, cacheSeconds) * 1000);
+    const cached = readJsonCache(cachePath, Math.max(0, cacheSeconds) * 1000);
     if (cached) return { ...cached, cacheHit: true };
   }
 
   if (!commandExists("claude")) {
-    return { source: "claude", ok: false, note: "No encuentro el comando claude." };
+    return { source: "claude", ok: false, unusable: true, reason: "not-installed", note: "No encuentro el comando claude." };
   }
 
   try {
-    const { stdout } = await execFileAsync("claude", ["-p", "/usage", "--output-format", "json"], {
+    // Quota polling needs authentication but never user/project customizations. Loading the
+    // regular profile here starts channel plugins on every short-lived poll; detached Telegram
+    // and Clawbus Bun workers can then outlive Claude and leak CPU/RAM without bound.
+    const { stdout } = await execFileAsync("claude", ["--safe-mode", "-p", "/usage", "--output-format", "json"], {
       encoding: "utf8",
       maxBuffer: 4 * 1024 * 1024,
       timeout: 30000,
+      // accountEnv() devuelve undefined para la cuenta implicita: mismas opciones que antes.
+      // Con credential.kind="configDir" inyecta CLAUDE_CONFIG_DIR y aisla la credencial
+      // (verificado en claude 2.1.220: una raiz vacia no devuelve barras de uso).
+      ...(childEnv ? { env: childEnv } : {}),
     });
     let resultText = stdout;
     try {
@@ -1606,7 +3083,7 @@ async function collectClaudeUsageLive(config = {}, { ignoreCache = false } = {})
       // Some older builds may print plain text.
     }
     const parsed = parseClaudeUsageOutput(resultText);
-    const stale = readJsonSafe(CLAUDE_USAGE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
 
     // Claude /usage frequently omits the per-window bars when it is called too often (it
     // throttles them). Missing bars do NOT mean the plan is unlimited: every response now
@@ -1618,12 +3095,11 @@ async function collectClaudeUsageLive(config = {}, { ignoreCache = false } = {})
         const fallback = {
           ...stale,
           plan: parsed.plan || stale.plan || "",
-          capturedAt: new Date().toISOString(),
+          lastCheckedAt: new Date().toISOString(),
           cacheHit: true,
           cacheStale: true,
           note: "Claude no devolvio barras (limitado); mostrando ultimo dato conocido.",
         };
-        writeJsonCache(CLAUDE_USAGE_CACHE_PATH, fallback);
         return fallback;
       }
       // No prior windows to fall back on: report honestly instead of faking "unlimited".
@@ -1636,7 +3112,7 @@ async function collectClaudeUsageLive(config = {}, { ignoreCache = false } = {})
         cacheHit: false,
         note: "Claude no devolvio el uso por ventana; reintenta en unos minutos.",
       };
-      writeJsonCache(CLAUDE_USAGE_CACHE_PATH, output);
+      writeJsonCache(cachePath, output);
       return output;
     }
 
@@ -1648,10 +3124,10 @@ async function collectClaudeUsageLive(config = {}, { ignoreCache = false } = {})
       cacheHit: false,
       note: "Claude /usage detectado.",
     };
-    writeJsonCache(CLAUDE_USAGE_CACHE_PATH, output);
+    writeJsonCache(cachePath, output);
     return output;
   } catch (error) {
-    const stale = readJsonSafe(CLAUDE_USAGE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok) {
       return {
         ...stale,
@@ -1690,9 +3166,17 @@ function parseClaudeUsageOutput(text) {
 
 function claudeWindowKey(label) {
   const lower = label.toLowerCase();
-  if (lower.includes("sonnet")) return "week_sonnet";
-  if (lower.includes("week")) return "week_all";
   if (lower.includes("session")) return "session";
+  if (lower.includes("week")) {
+    const scope = lower.match(/\(([^)]+)\)/)?.[1]?.trim() || "";
+    if (!scope || scope === "all" || scope.includes("all model")) return "week_all";
+    const normalizedScope = scope
+      .replace(/\bonly\b/g, "")
+      .trim()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_|_$/g, "");
+    return `week_${normalizedScope || "other"}`;
+  }
   return lower.replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
 }
 
@@ -1700,28 +3184,33 @@ function claudeWindowLabel(label) {
   const key = claudeWindowKey(label);
   if (key === "session") return "sesion";
   if (key === "week_all") return "semana";
-  if (key === "week_sonnet") return "Sonnet";
+  if (key.startsWith("week_")) {
+    const scope = String(label).match(/\(([^)]+)\)/)?.[1]?.replace(/\bonly\b/gi, "").trim();
+    if (scope) return scope;
+    return key.slice(5).replace(/_/g, " ");
+  }
   return label;
 }
 
-async function collectGeminiQuotaLive(config = {}, { ignoreCache = false } = {}) {
+async function collectGeminiQuotaLive(config = {}, { ignoreCache = false, account = null } = {}) {
+  const cachePath = account ? accountCachePath(account, "quota-cache") : GEMINI_QUOTA_CACHE_PATH;
   if (process.env.AI_USAGE_GEMINI_LIVE === "0" || config.liveCapture === false) {
     return { source: "gemini", ok: false, disabled: true, note: "Gemini /stats model desactivado." };
   }
 
   const cacheMinutes = Number(config.liveCaptureCacheMinutes ?? 15);
   if (!ignoreCache) {
-    const cached = readJsonCache(GEMINI_QUOTA_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
+    const cached = readJsonCache(cachePath, Math.max(0, cacheMinutes) * 60000);
     if (cached) return { ...cached, cacheHit: true };
   }
 
   if (!commandExists("gemini")) {
-    return { source: "gemini", ok: false, note: "No encuentro el comando gemini." };
+    return { source: "gemini", ok: false, unusable: true, reason: "not-installed", note: "No encuentro el comando gemini." };
   }
 
   const helper = path.join(SCRIPT_DIR, "gemini-quota-capture.py");
   if (!existsSync(helper)) {
-    return { source: "gemini", ok: false, note: "Falta gemini-quota-capture.py." };
+    return { source: "gemini", ok: false, unusable: true, reason: "not-installed", note: "Falta gemini-quota-capture.py." };
   }
 
   const timeoutSeconds = Math.max(10, Number(config.liveCaptureTimeoutSeconds || 45));
@@ -1730,7 +3219,8 @@ async function collectGeminiQuotaLive(config = {}, { ignoreCache = false } = {})
       encoding: "utf8",
       maxBuffer: 4 * 1024 * 1024,
       timeout: (timeoutSeconds + 5) * 1000,
-      env: { ...process.env, AI_USAGE_GEMINI_TIMEOUT: String(timeoutSeconds) },
+      // gemini-quota-capture.py hace os.environ.copy(), asi que GEMINI_CLI_HOME se propaga.
+      env: accountEnv(account, { AI_USAGE_GEMINI_TIMEOUT: String(timeoutSeconds) }),
     });
     const parsed = JSON.parse(stdout);
     const output = {
@@ -1739,10 +3229,23 @@ async function collectGeminiQuotaLive(config = {}, { ignoreCache = false } = {})
       capturedAt: parsed.capturedAt || new Date().toISOString(),
       cacheHit: false,
     };
-    writeJsonCache(GEMINI_QUOTA_CACHE_PATH, output);
+    if (output.ok) {
+      writeJsonCache(cachePath, output);
+      return output;
+    }
+    if (output.needsAuth || output.authError) return output;
+    const stale = readJsonSafe(cachePath);
+    if (stale?.ok) {
+      return {
+        ...stale,
+        cacheHit: true,
+        cacheStale: true,
+        note: `Gemini /stats model no se pudo parsear; usando cache anterior (${output.note || "formato desconocido"}).`,
+      };
+    }
     return output;
   } catch (error) {
-    const stale = readJsonSafe(GEMINI_QUOTA_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok) {
       return {
         ...stale,
@@ -1755,22 +3258,32 @@ async function collectGeminiQuotaLive(config = {}, { ignoreCache = false } = {})
   }
 }
 
-async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false } = {}) {
+async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false, account = null } = {}) {
   const config = quotaConfig || loadQuotaConfig();
-  const configEntry = config?.minimax || {};
-  const keyFromEnv = process.env.MINIMAX_API_KEY || "";
-  const keyFromFile = configEntry.apiKey || "";
+  const configEntry = account?.config || config?.minimax || {};
+  const cachePath = account ? accountCachePath(account, "usage-cache") : MINIMAX_USAGE_CACHE_PATH;
+  // Con credential.kind="env" la key sale de la env var declarada por la cuenta y se lee
+  // SOLO aqui, al construir el header. Sin cuenta (legacy) el orden env-primero es el de
+  // siempre. En ningun caso el valor sale al output, a los logs ni al TUI.
+  const credentialKind = account?.credential?.kind || "legacy";
+  const keyFromEnv = credentialKind === "env"
+    ? (process.env[account.credential.var] || "")
+    : (process.env.MINIMAX_API_KEY || "");
+  const keyFromFile = credentialKind === "env" ? "" : (configEntry.apiKey || "");
   const apiKey = keyFromEnv || keyFromFile;
+  const keySourceLabel = credentialKind === "env"
+    ? `env:${account.credential.var}`
+    : keyFromEnv ? "env" : keyFromFile ? "quotas.json" : "none";
   const debug = process.env.AI_USAGE_MINIMAX_DEBUG === "1";
   const liveDisabled = process.env.AI_USAGE_MINIMAX_LIVE === "0" || configEntry.liveCapture === false;
   const cacheMinutes = Number(process.env.MINIMAX_USAGE_CACHE_MINUTES ?? configEntry.liveCaptureCacheMinutes ?? 0);
-  const cached = readJsonCache(MINIMAX_USAGE_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
+  const cached = readJsonCache(cachePath, Math.max(0, cacheMinutes) * 60000);
   if (cached && (!ignoreCache || liveDisabled)) {
     if (debug) process.stderr.write(`[minimax] cache hit (age < ${cacheMinutes}m)\n`);
     return { ...cached, cacheHit: true };
   }
   if (liveDisabled) {
-    const stale = readJsonSafe(MINIMAX_USAGE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok) {
       return {
         ...stale,
@@ -1783,19 +3296,21 @@ async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false } =
   }
 
   if (debug) {
-    process.stderr.write(`[minimax] key source: ${keyFromEnv ? "env" : keyFromFile ? "quotas.json" : "none"} (${apiKey ? apiKey.slice(0, 8) + "…" : "empty"})\n`);
+    process.stderr.write(`[minimax] key source: ${keySourceLabel} (${apiKey ? "present" : "empty"})\n`);
   }
   if (!apiKey) {
     return {
       source: "minimax",
       ok: false,
+      unusable: true,
+      reason: "not-configured",
       note: "MINIMAX_API_KEY no definida. Define la env var o agrega minimax.apiKey en quotas.json (ai-usage-quota edit).",
     };
   }
 
-  const url = process.env.MINIMAX_USAGE_URL || "https://api.minimax.io/v1/api/openplatform/coding_plan/remains";
+  const url = process.env.MINIMAX_USAGE_URL || "https://www.minimax.io/v1/token_plan/remains";
   if (debug) {
-    process.stderr.write(`[minimax] GET ${url}\n[minimax] Authorization: Bearer ${apiKey.slice(0, 8)}…\n`);
+    process.stderr.write(`[minimax] GET ${url}\n[minimax] Authorization: Bearer [redacted]\n`);
   }
   try {
     const response = await fetch(url, {
@@ -1821,7 +3336,7 @@ async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false } =
     const baseResp = data?.base_resp || {};
     if (baseResp.status_code && baseResp.status_code !== 0 && baseResp.status_code !== 200) {
       const msg = baseResp.status_msg || `status_code ${baseResp.status_code}`;
-      const stale = readJsonSafe(MINIMAX_USAGE_CACHE_PATH);
+      const stale = readJsonSafe(cachePath);
       if (stale?.ok) {
         return {
           ...stale,
@@ -1850,10 +3365,10 @@ async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false } =
       capturedAt: new Date().toISOString(),
       cacheHit: false,
     };
-    writeJsonCache(MINIMAX_USAGE_CACHE_PATH, output);
+    writeJsonCache(cachePath, output);
     return output;
   } catch (error) {
-    const stale = readJsonSafe(MINIMAX_USAGE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok) {
       return {
         ...stale,
@@ -1888,9 +3403,11 @@ function staleOpenCodeUsage(note) {
   };
 }
 
-function staleOpenCodeServer(note) {
+function staleOpenCodeServer(note, workspaceId = "") {
   const stale = readJsonSafe(OPENCODE_SERVER_CACHE_PATH);
-  if (stale?.ok) return { ...stale, cacheHit: true, cacheStale: true, note: `${note} Usando cache.` };
+  if (stale?.ok && (!workspaceId || stale.workspaceId === workspaceId)) {
+    return { ...stale, cacheHit: true, cacheStale: true, note: `${note} Usando cache.` };
+  }
   return { ok: false, note };
 }
 
@@ -1913,23 +3430,59 @@ function parseOpenCodeServerUsage(html) {
   // de hidratacion y extraemos los 3 bloques Rolling/Weekly/Monthly.
   const clean = String(html).replace(/<!--\$-->/g, "").replace(/<!--\/-->/g, "");
   const specs = [
-    { match: "Rolling", key: "5h", label: "5 horas" },
-    { match: "Weekly", key: "week", label: "semanal" },
-    { match: "Monthly", key: "month", label: "mensual" },
+    { match: "Rolling", object: "rollingUsage", key: "5h", label: "5 horas", windowMinutes: 300 },
+    { match: "Weekly", object: "weeklyUsage", key: "week", label: "semanal", windowMinutes: 10080 },
+    { match: "Monthly", object: "monthlyUsage", key: "month", label: "mensual", windowMinutes: null },
   ];
-  const resets = [...clean.matchAll(/reset-time">\s*Resets in\s*([^<]+?)\s*<\/span>/g)].map((r) => r[1].trim());
-  const windows = [];
-  let resetIdx = 0;
+
+  // SolidStart serializa tambien el estado de negocio. Es mas estable y, a diferencia de la
+  // barra visual, indica explicitamente `status:"rate-limited"`.
+  const structuredWindows = [];
   for (const spec of specs) {
-    const re = new RegExp(`usage-label">${spec.match} Usage</span><span data-slot="usage-value">\\s*(\\d+)\\s*%`);
-    const m = clean.match(re);
-    if (!m) continue;
-    const usedPercent = Math.max(0, Math.min(100, Number(m[1])));
-    const resetText = resets[resetIdx] || "";
-    resetIdx += 1;
+    const objectRe = new RegExp(`${spec.object}\\s*:\\s*(?:\\$R\\[\\d+\\]\\s*=\\s*)?\\{([^}]+)\\}`, "i");
+    const body = clean.match(objectRe)?.[1] || "";
+    const usedMatch = body.match(/usagePercent\s*:\s*(\d+(?:\.\d+)?)/i);
+    if (!usedMatch) continue;
+    const resetSeconds = Number(body.match(/resetInSec\s*:\s*(\d+)/i)?.[1]);
+    const status = body.match(/status\s*:\s*["']([^"']+)["']/i)?.[1] || "";
+    const usedPercent = Math.max(0, Math.min(100, Number(usedMatch[1])));
+    structuredWindows.push({
+      key: spec.key,
+      label: spec.label,
+      windowType: spec.key === "5h" ? "rolling" : spec.key === "week" ? "weekly" : "monthly",
+      windowMinutes: spec.windowMinutes,
+      status,
+      usedPercent,
+      remainingPercent: Math.max(0, 100 - usedPercent),
+      reset: Number.isFinite(resetSeconds) ? new Date(Date.now() + resetSeconds * 1000) : null,
+      resetText: Number.isFinite(resetSeconds) ? fmtCountdown(new Date(Date.now() + resetSeconds * 1000)) : "",
+      source: "web",
+    });
+  }
+  const windows = [...structuredWindows];
+  for (const spec of specs) {
+    if (windows.some((window) => window.key === spec.key)) continue;
+    const labelRe = new RegExp(`<span[^>]*data-slot=["']usage-label["'][^>]*>\\s*${spec.match}\\s+Usage\\s*</span>`, "i");
+    const labelMatch = labelRe.exec(clean);
+    if (!labelMatch) continue;
+    const afterLabel = clean.slice(labelMatch.index + labelMatch[0].length);
+    const nextLabel = afterLabel.search(/<span[^>]*data-slot=["']usage-label["']/i);
+    const section = nextLabel >= 0 ? afterLabel.slice(0, nextLabel) : afterLabel;
+    const valueMatch = section.match(/data-slot=["']usage-value["'][^>]*>[\s\S]*?(\d+(?:\.\d+)?)\s*%/i);
+    if (!valueMatch) continue;
+    const usedPercent = Math.max(0, Math.min(100, Number(valueMatch[1])));
+    const resetMatch = section.match(/data-slot=["']reset-time["'][^>]*>([\s\S]*?)<\/span>/i);
+    const resetText = String(resetMatch?.[1] || "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/^\s*Resets in\s*/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
     windows.push({
       key: spec.key,
       label: spec.label,
+      windowType: spec.key === "5h" ? "rolling" : spec.key === "week" ? "weekly" : "monthly",
+      windowMinutes: spec.windowMinutes,
       usedPercent,
       remainingPercent: Math.max(0, 100 - usedPercent),
       reset: parseResetDuration(resetText),
@@ -1938,7 +3491,58 @@ function parseOpenCodeServerUsage(html) {
     });
   }
   if (!windows.length) return { ok: false, note: "no pude parsear opencode.ai/go (cambio el HTML o cookie invalida)." };
-  return { ok: true, windows };
+  const missingWindows = specs
+    .filter((spec) => !windows.some((window) => window.key === spec.key))
+    .map((spec) => spec.label);
+  return {
+    ok: true,
+    windows,
+    complete: missingWindows.length === 0,
+    missingWindows,
+    format: structuredWindows.length === specs.length
+      ? "solid-state"
+      : structuredWindows.length
+        ? "solid-state+html"
+        : "html",
+  };
+}
+
+function resolveOpenCodeDbPath() {
+  if (process.env.OPENCODE_DB_PATH) return process.env.OPENCODE_DB_PATH;
+  if (commandExists("opencode")) {
+    try {
+      const value = execFileSync("opencode", ["db", "path"], {
+        encoding: "utf8",
+        timeout: 5000,
+        maxBuffer: 1024 * 1024,
+      }).trim();
+      if (value) return value;
+    } catch {
+      // Older OpenCode versions do not expose `db path`.
+    }
+  }
+  return OPENCODE_DB_FALLBACK_PATH;
+}
+
+async function queryOpenCodeSessions(dbPath, sql) {
+  if (!process.env.OPENCODE_DB_PATH && commandExists("opencode")) {
+    try {
+      const { stdout } = await execFileAsync("opencode", ["db", sql, "--format", "json"], {
+        encoding: "utf8",
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 15000,
+      });
+      return stdout.trim() ? JSON.parse(stdout) : [];
+    } catch {
+      // Fall through to sqlite3 for older or partially upgraded installations.
+    }
+  }
+  const { stdout } = await execFileAsync("sqlite3", [dbPath, "-json", sql], {
+    encoding: "utf8",
+    maxBuffer: 10 * 1024 * 1024,
+    timeout: 15000,
+  });
+  return stdout.trim() ? JSON.parse(stdout) : [];
 }
 
 async function collectOpenCodeServerUsage(config = {}, { ignoreCache = false } = {}) {
@@ -1952,7 +3556,7 @@ async function collectOpenCodeServerUsage(config = {}, { ignoreCache = false } =
   const cacheMinutes = Number(process.env.OPENCODE_USAGE_CACHE_MINUTES ?? config.liveCaptureCacheMinutes ?? 5);
   if (!ignoreCache) {
     const cached = readJsonCache(OPENCODE_SERVER_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
-    if (cached) return { ...cached, cacheHit: true };
+    if (cached?.workspaceId === workspaceId) return { ...cached, cacheHit: true };
   }
   try {
     const controller = new AbortController();
@@ -1968,59 +3572,90 @@ async function collectOpenCodeServerUsage(config = {}, { ignoreCache = false } =
       httpStatus = resp.status;
       if (resp.status >= 300) {
         const hint = resp.status === 302 || resp.status === 401 || resp.status === 403 ? " (cookie expirada? repega la cookie auth)" : "";
-        return staleOpenCodeServer(`opencode.ai HTTP ${resp.status}${hint}.`);
+        return staleOpenCodeServer(`opencode.ai HTTP ${resp.status}${hint}.`, workspaceId);
       }
       html = await resp.text();
     } finally {
       clearTimeout(timer);
     }
     const parsed = parseOpenCodeServerUsage(html);
-    if (!parsed.ok) return staleOpenCodeServer(parsed.note);
-    const output = { source: "opencode", ...parsed, capturedAt: new Date().toISOString(), cacheHit: false };
+    if (!parsed.ok) return staleOpenCodeServer(parsed.note, workspaceId);
+    if (!parsed.complete) {
+      return {
+        source: "opencode",
+        ...parsed,
+        workspaceId,
+        capturedAt: new Date().toISOString(),
+        cacheHit: false,
+        cachePartial: true,
+      };
+    }
+    const output = { source: "opencode", ...parsed, workspaceId, capturedAt: new Date().toISOString(), cacheHit: false };
     writeJsonCache(OPENCODE_SERVER_CACHE_PATH, output);
     return output;
   } catch (error) {
-    return staleOpenCodeServer(`opencode.ai web fallo: ${shortError(error)}`);
+    return staleOpenCodeServer(`opencode.ai web fallo: ${shortError(error)}`, workspaceId);
   }
 }
 
-async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } = {}) {
+async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false, account = null } = {}) {
   const config = quotaConfig || loadQuotaConfig();
-  const configEntry = config?.opencode || {};
+  const configEntry = account?.config || config?.opencode || {};
+  const cachePath = account ? accountCachePath(account, "usage-cache") : OPENCODE_USAGE_CACHE_PATH;
   const liveDisabled = process.env.AI_USAGE_OPENCODE_LIVE === "0" || configEntry.liveCapture === false;
   const cacheMinutes = Number(process.env.OPENCODE_USAGE_CACHE_MINUTES ?? configEntry.liveCaptureCacheMinutes ?? 5);
-  const cached = readJsonCache(OPENCODE_USAGE_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
-  if (cached && (!ignoreCache || liveDisabled)) {
+  const usageRangeKey = `${state.view}|${state.since || ""}|${state.until || ""}`;
+  const cached = readJsonCache(cachePath, Math.max(0, cacheMinutes) * 60000);
+  if (cached?.usageRangeKey === usageRangeKey && (!ignoreCache || liveDisabled)) {
     return { ...cached, cacheHit: true };
   }
   if (liveDisabled) {
-    const stale = readJsonSafe(OPENCODE_USAGE_CACHE_PATH);
-    if (stale?.ok) {
+    const stale = readJsonSafe(cachePath);
+    if (stale?.ok && stale.usageRangeKey === usageRangeKey) {
       return { ...stale, cacheHit: true, cacheStale: true, note: "OpenCode Go DB desactivado; usando cache local." };
     }
     return { source: "opencode", ok: false, disabled: true, note: "OpenCode Go DB desactivado." };
   }
 
-  if (!existsSync(OPENCODE_DB_PATH)) {
-    return { source: "opencode", ok: false, note: "No encuentro opencode.db; corre opencode al menos una vez." };
+  const dbPath = resolveOpenCodeDbPath();
+  if (!existsSync(dbPath)) {
+    return { source: "opencode", ok: false, unusable: true, reason: "not-installed", note: "No encuentro opencode.db; corre opencode al menos una vez." };
   }
 
   try {
-    const { stdout } = await execFileAsync("sqlite3", [OPENCODE_DB_PATH, "-json",
-      "SELECT s.model, s.cost, s.tokens_input, s.tokens_output, s.tokens_cache_read, s.tokens_cache_write, s.time_created " +
-      "FROM session s WHERE json_extract(s.model, '$.providerID') = 'opencode-go' " +
-      "OR json_extract(s.model, '$.providerID') LIKE 'opencode-go:%' " +
-      "ORDER BY s.time_created DESC"], {
-      encoding: "utf8",
-      maxBuffer: 10 * 1024 * 1024,
-      timeout: 15000,
-    });
-
-    const rows = stdout.trim() ? JSON.parse(stdout) : [];
+    let rows;
+    let dbGranularity;
+    try {
+      const messageColumns = await queryOpenCodeSessions(dbPath, "PRAGMA table_info(message)");
+      if (!messageColumns.some((column) => column.name === "data")) throw new Error("message.data no disponible");
+      const messageSql = "SELECT m.session_id, json_extract(m.data, '$.modelID') AS model_id, " +
+        "COALESCE(json_extract(m.data, '$.cost'), 0) AS cost, " +
+        "COALESCE(json_extract(m.data, '$.tokens.input'), 0) AS tokens_input, " +
+        "COALESCE(json_extract(m.data, '$.tokens.output'), 0) AS tokens_output, " +
+        "COALESCE(json_extract(m.data, '$.tokens.reasoning'), 0) AS tokens_reasoning, " +
+        "COALESCE(json_extract(m.data, '$.tokens.cache.read'), 0) AS tokens_cache_read, " +
+        "COALESCE(json_extract(m.data, '$.tokens.cache.write'), 0) AS tokens_cache_write, " +
+        "COALESCE(json_extract(m.data, '$.time.created'), m.time_created) AS time_created " +
+        "FROM message m WHERE json_extract(m.data, '$.role') = 'assistant' " +
+        "AND (json_extract(m.data, '$.providerID') = 'opencode-go' " +
+        "OR json_extract(m.data, '$.providerID') LIKE 'opencode-go:%') " +
+        "ORDER BY time_created DESC";
+      rows = await queryOpenCodeSessions(dbPath, messageSql);
+      dbGranularity = "message";
+    } catch {
+      const columns = await queryOpenCodeSessions(dbPath, "PRAGMA table_info(session)");
+      const hasReasoning = columns.some((column) => column.name === "tokens_reasoning");
+      const reasoningColumn = hasReasoning ? "s.tokens_reasoning" : "0 AS tokens_reasoning";
+      const sessionSql = `SELECT s.id AS session_id, s.model, s.cost, s.tokens_input, s.tokens_output, ${reasoningColumn}, s.tokens_cache_read, s.tokens_cache_write, s.time_created ` +
+        "FROM session s WHERE json_extract(s.model, '$.providerID') = 'opencode-go' " +
+        "OR json_extract(s.model, '$.providerID') LIKE 'opencode-go:%' " +
+        "ORDER BY s.time_created DESC";
+      rows = await queryOpenCodeSessions(dbPath, sessionSql);
+      dbGranularity = "session";
+    }
     const now = Date.now();
     const nowDate = new Date();
     const HOUR = 3600000;
-    const DAY = 86400000;
 
     // 5h = rolling window (last 5h from now)
     const fiveHoursAgo = now - 5 * HOUR;
@@ -2038,21 +3673,49 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
     // The server uses subscription date for the monthly window, but locally
     // we approximate to "this calendar month" which is close enough.
     const monthStartMs = Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth(), 1);
+    const usageStartMs = state.since ? Date.parse(`${state.since}T00:00:00Z`) : NaN;
+    const untilStartMs = state.until ? Date.parse(`${state.until}T00:00:00Z`) : NaN;
+    const usageEndMs = Number.isFinite(untilStartMs) ? untilStartMs + 86400000 : NaN;
 
     let cost5h = 0, costWeek = 0, costMonth = 0, totalCost = 0;
-    let totalTokens = 0, totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0;
+    let totalTokens = 0, totalInput = 0, totalOutput = 0, totalReasoning = 0, totalCacheRead = 0, totalCacheWrite = 0;
+    const reasoningByModel = {};
+    const usageSessions = new Set();
     let earliestIn5h = null;
 
     for (const row of rows) {
-      const ts = Number(row.time_created);
+      const rawTimestamp = Number(row.time_created);
+      const ts = rawTimestamp > 0 && rawTimestamp < 1e12 ? rawTimestamp * 1000 : rawTimestamp;
       const cost = Number(row.cost || 0);
       if (!Number.isFinite(ts)) continue;
-      totalCost += cost;
-      totalTokens += Number(row.tokens_input || 0) + Number(row.tokens_output || 0);
-      totalInput += Number(row.tokens_input || 0);
-      totalOutput += Number(row.tokens_output || 0);
-      totalCacheRead += Number(row.tokens_cache_read || 0);
-      totalCacheWrite += Number(row.tokens_cache_write || 0);
+      const input = Number(row.tokens_input || 0);
+      const outputTokens = Number(row.tokens_output || 0);
+      const reasoning = Number(row.tokens_reasoning || 0);
+      const cacheRead = Number(row.tokens_cache_read || 0);
+      const cacheWrite = Number(row.tokens_cache_write || 0);
+      const inUsageRange = (!Number.isFinite(usageStartMs) || ts >= usageStartMs)
+        && (!Number.isFinite(usageEndMs) || ts < usageEndMs);
+      if (inUsageRange) {
+        totalCost += cost;
+        totalTokens += input + outputTokens + reasoning + cacheWrite;
+        totalInput += input;
+        totalOutput += outputTokens;
+        totalReasoning += reasoning;
+        totalCacheRead += cacheRead;
+        totalCacheWrite += cacheWrite;
+        if (row.session_id) usageSessions.add(String(row.session_id));
+      }
+      if (inUsageRange && reasoning > 0) {
+        try {
+          const model = row.model_id
+            ? { id: row.model_id }
+            : typeof row.model === "string" ? JSON.parse(row.model) : row.model;
+          const modelId = String(model?.id || "").toLowerCase();
+          if (modelId) reasoningByModel[modelId] = Number(reasoningByModel[modelId] || 0) + reasoning;
+        } catch {
+          // Keep the provider total even if an older row has malformed model metadata.
+        }
+      }
 
       if (ts >= fiveHoursAgo) {
         cost5h += cost;
@@ -2085,9 +3748,11 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
         totalTokens: totalTokens,
         totalInput: totalInput,
         totalOutput: totalOutput,
+        totalReasoning: totalReasoning,
+        reasoningByModel: reasoningByModel,
         totalCacheRead: totalCacheRead,
         totalCacheWrite: totalCacheWrite,
-        sessionCount: rows.length,
+        sessionCount: usageSessions.size,
         reset5h: new Date((earliestIn5h !== null ? earliestIn5h : now) + 5 * HOUR).toISOString(),
         resetWeek: nextWeek.toISOString(),
         resetMonth: new Date(nextMonth).toISOString(),
@@ -2099,14 +3764,16 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
         note: "Estimado local (opencode.db). Valores reales del servidor: opencode.ai/auth (pueden diferir).",
       },
       capturedAt: new Date().toISOString(),
+      usageRangeKey,
+      dbGranularity,
       cacheHit: false,
       note: "Estimado local (opencode.db). Para valores exactos ve a opencode.ai/auth.",
     };
-    writeJsonCache(OPENCODE_USAGE_CACHE_PATH, output);
+    writeJsonCache(cachePath, output);
     return output;
   } catch (error) {
-    const stale = readJsonSafe(OPENCODE_USAGE_CACHE_PATH);
-    if (stale?.ok) {
+    const stale = readJsonSafe(cachePath);
+    if (stale?.ok && stale.usageRangeKey === usageRangeKey) {
       return { ...stale, cacheHit: true, cacheStale: true, note: `OpenCode Go DB fallo; usando cache anterior (${shortError(error)}).` };
     }
     return { source: "opencode", ok: false, note: `OpenCode Go DB fallo: ${shortError(error)}` };
@@ -2177,20 +3844,23 @@ function listTranscriptPaths(brainDir) {
 }
 
 function listAntigravityModels() {
-  if (!commandExists("antigravity")) return [];
-  try {
-    const output = execFileSync("antigravity", ["models"], {
-      encoding: "utf8",
-      timeout: 8000,
-      maxBuffer: 1024 * 1024,
-    });
-    return output
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
-  } catch {
-    return [];
+  for (const command of ["antigravity", "agy"]) {
+    if (!commandExists(command)) continue;
+    try {
+      const output = execFileSync(command, ["models"], {
+        encoding: "utf8",
+        timeout: 8000,
+        maxBuffer: 1024 * 1024,
+      });
+      return output
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+    } catch {
+      // Try the other supported binary name.
+    }
   }
+  return [];
 }
 
 function commandExists(command) {
@@ -2277,9 +3947,12 @@ function handleKey(key) {
   else if (key === "a") setSource("all");
   else if (key === "c") setSource("claude");
   else if (key === "x") setSource("codex");
-  else if (key === "v") setSource("antigravity");
+  else if (key === "g") setSource("gemini");
+  else if (key === "v") setSource("gemini"); // alias historico de Antigravity
   else if (key === "m") setSource("minimax");
   else if (key === "o") setSource("opencode");
+  else if (key === "h") onHideToggle();
+  else if (key === "H") onRevealToggle();
   else if (key === "\x1b[A") onArrow("up");
   else if (key === "\x1b[B") onArrow("down");
   else if (key === "\x1b[C") onArrow("right");
@@ -2294,21 +3967,166 @@ function onArrow(dir) {
     else if (dir === "down") moveModel(1);
     return;
   }
-  // Cuotas: grid o detalle — flechas mueven la tarjeta seleccionada.
+  // Cuotas: en detalle, arriba/abajo mueven el cursor de modelo; izq/der cambian de tarjeta.
+  if (state.detail) {
+    if (dir === "up") moveDetailModel(-1);
+    else if (dir === "down") moveDetailModel(1);
+    else moveCard(dir === "left" ? -1 : 1);
+    return;
+  }
+  // Grid: flechas mueven la tarjeta seleccionada (dentro del set VISIBLE).
   if (dir === "up" || dir === "left") moveCard(-1);
   else moveCard(1);
 }
 
+function quotaCardRowLabel(window) {
+  const type = String(window?.windowType || window?.key || "").toLowerCase();
+  if (type === "session" || type === "5h" || type === "five_hour") return "5 horas";
+  if (type === "weekly" || type === "sem" || type === "seven_day" || type === "week_all") return "semanal";
+  return String(window?.label || window?.key || "cuota");
+}
+
+function quotaCardResetLabel(window, quota = null) {
+  const direct = window?.reset ?? window?.resetAt ?? null;
+  if (direct) {
+    const countdown = fmtCountdown(direct);
+    if (countdown !== "--") return `↻${countdown}`;
+  }
+  if (Number.isFinite(Number(window?.resetInSeconds))) {
+    return `↻${fmtCountdown(new Date(Date.now() + Number(window.resetInSeconds) * 1000))}`;
+  }
+  if (window?.resetText) {
+    const compact = String(window.resetText)
+      .replace(/^resets?\s+(?:in|at)\s+/i, "")
+      .trim();
+    return `↻${shortText(compact || "--", 7)}`;
+  }
+  const fallback = quota?.resetAt ?? null;
+  return fallback ? `↻${fmtCountdown(fallback)}` : "↻--";
+}
+
+function quotaAccountEntries(provider, quota) {
+  if (Array.isArray(quota?.accounts) && quota.accounts.length) {
+    return quota.accounts.map((entry, index) => ({
+      account: String(entry.accountId || `cuenta${index + 1}`),
+      quota: entry.quota || { ok: false, note: entry.health?.detail || "sin datos" },
+    }));
+  }
+  if (!quota?.accounts || !Array.isArray(quota.windows)) return [];
+  const groups = new Map();
+  for (const window of quota.windows) {
+    const account = String(window.family || window.account || "cuenta").trim() || "cuenta";
+    if (!groups.has(account)) groups.set(account, []);
+    groups.get(account).push(window);
+  }
+  return [...groups].map(([account, windows]) => ({ account, quota: { ...quota, windows } }));
+}
+
+// Convierte el snapshot tecnico en el modelo visual: una tarjeta por licencia/cuenta.
+function buildQuotaCards(quotas = {}) {
+  const cards = [];
+  for (const provider of PROVIDER_ORDER) {
+    const quota = quotas[provider];
+    const entries = provider === "claude" || provider === "gemini"
+      ? quotaAccountEntries(provider, quota)
+      : [];
+    if (!entries.length) {
+      cards.push({ id: provider, provider, title: PROVIDER_META[provider]?.label || provider, quota });
+      continue;
+    }
+    for (const { account, quota: accountQuota } of entries) {
+      let rawWindows = Array.isArray(accountQuota?.windows) ? accountQuota.windows : [];
+      if (provider === "claude") {
+        const global = rawWindows.filter((window) => {
+          const key = String(window.key || window.windowType || "").toLowerCase();
+          return key === "session" || key === "5h" || key === "five_hour"
+            || key === "week_all" || key === "weekly" || key === "seven_day";
+        });
+        if (global.length) rawWindows = global;
+      }
+      const windows = rawWindows.map((window) => ({
+        ...window,
+        label: quotaCardRowLabel(window),
+        model: quotaCardRowLabel(window),
+        family: null,
+      }));
+      const availability = conjunctiveQuotaAvailability(windows);
+      const idPart = account.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "cuenta";
+      cards.push({
+        id: `${provider}:${idPart}`,
+        provider,
+        title: `${provider === "gemini" ? "Gemini" : "Claude"} · ${account}`,
+        account,
+        quota: {
+          ...accountQuota,
+          accounts: false,
+          cardAccount: account,
+          windows,
+          ...(windows.length ? availability : {}),
+        },
+      });
+    }
+  }
+  return cards;
+}
+
+function quotaCardHidden(card) {
+  return displayConfig.hiddenProviders.includes(card.id)
+    || displayConfig.hiddenProviders.includes(card.provider);
+}
+
+function visibleQuotaCards() {
+  const cards = buildQuotaCards(state.lastSnapshot?.quotas || {});
+  if (state.revealHidden) return cards;
+  return cards.filter((card) =>
+    isProviderVisible(card.provider, card.quota, displayConfig, false)
+    && !quotaCardHidden(card));
+}
+
+function reconcileCardIndex() {
+  const n = visibleQuotaCards().length;
+  if (n === 0) { state.cardIndex = 0; return; }
+  if (state.cardIndex > n - 1) state.cardIndex = n - 1;
+  if (state.cardIndex < 0) state.cardIndex = 0;
+}
+
+// Lista aplanada de ventanas del detalle en el MISMO orden que las pinta drawQuotaDetail
+// (familias por orden de insercion en Map), tras aplicar el filtro de modelos ocultos.
+function detailWindowList(quota, provider) {
+  const ws = (Array.isArray(quota?.windows) ? quota.windows : [])
+    .filter((w) => isModelVisible(provider, w, displayConfig, state.revealHidden));
+  if (!ws.some((w) => w.family)) return ws;
+  const groups = new Map();
+  for (const w of ws) {
+    const fam = w.family || "default";
+    if (!groups.has(fam)) groups.set(fam, []);
+    groups.get(fam).push(w);
+  }
+  return [...groups.values()].flat();
+}
+
 function moveCard(delta) {
-  const n = PROVIDER_ORDER.length;
+  const order = visibleQuotaCards();
+  const n = order.length;
   if (!n) return;
   state.cardIndex = (((state.cardIndex + delta) % n) + n) % n;
+  state.detailModelIndex = 0; // cambiar de proveedor resetea el cursor de modelo
+  render();
+}
+
+function moveDetailModel(delta) {
+  const order = visibleQuotaCards();
+  const card = order[state.cardIndex];
+  const list = card ? detailWindowList(card.quota, card.provider) : [];
+  if (!list.length) { state.detailModelIndex = 0; return; }
+  state.detailModelIndex = Math.max(0, Math.min(list.length - 1, state.detailModelIndex + delta));
   render();
 }
 
 function onEnter() {
   if (state.tab !== "cuotas") return;
   state.detail = !state.detail;
+  state.detailModelIndex = 0;
   render();
 }
 
@@ -2323,6 +4141,43 @@ function toggleTab() {
   const idx = TAB_KEYS.indexOf(state.tab);
   state.tab = TAB_KEYS[(idx + 1) % TAB_KEYS.length];
   state.detail = false;
+  state.detailModelIndex = 0;
+  render();
+}
+
+// h: oculta/muestra el proveedor seleccionado (grid) o el modelo seleccionado (detalle).
+function onHideToggle() {
+  if (state.tab !== "cuotas") return;
+  const card = visibleQuotaCards()[state.cardIndex];
+  if (!card) return;
+  const provider = card.provider;
+  if (state.detail) {
+    const list = detailWindowList(card.quota, provider);
+    const key = windowModelKey(provider, list[state.detailModelIndex]);
+    if (!key) return;
+    const i = displayConfig.hiddenModels.indexOf(key);
+    if (i >= 0) displayConfig.hiddenModels.splice(i, 1);
+    else displayConfig.hiddenModels.push(key);
+    saveDisplayConfig();
+    const newLen = detailWindowList(state.lastSnapshot?.quotas?.[provider], provider).length;
+    if (state.detailModelIndex > newLen - 1) state.detailModelIndex = Math.max(0, newLen - 1);
+  } else {
+    const i = displayConfig.hiddenProviders.indexOf(card.id);
+    if (i >= 0) displayConfig.hiddenProviders.splice(i, 1);
+    else displayConfig.hiddenProviders.push(card.id);
+    saveDisplayConfig();
+    reconcileCardIndex();
+    // No dejar el grid completamente vacio: si todo queda oculto, entra en modo "ver ocultos".
+    if (!state.revealHidden && visibleQuotaCards().length === 0) state.revealHidden = true;
+  }
+  render();
+}
+
+// H: alterna el modo "ver ocultos" (revela tarjetas/modelos ocultos con marca, sin desocultarlos).
+function onRevealToggle() {
+  if (state.tab !== "cuotas") return;
+  state.revealHidden = !state.revealHidden;
+  reconcileCardIndex();
   render();
 }
 
@@ -2335,8 +4190,11 @@ function setView(view) {
 function setSource(source) {
   state.source = source;
   state.selectedModel = 0;
-  const idx = PROVIDER_ORDER.indexOf(source);
-  if (idx >= 0) state.cardIndex = idx;
+  const idx = visibleQuotaCards().findIndex((card) => card.provider === source);
+  if (idx >= 0) {
+    state.cardIndex = idx;
+    state.detailModelIndex = 0; // cambiar de proveedor resetea el cursor de modelo del detalle
+  }
   render();
 }
 
@@ -2358,7 +4216,7 @@ function render() {
 function draw(width, height) {
   const snap = state.lastSnapshot;
   const lines = [];
-  const title = `${colors.bold}${colors.cyan}AI Usage TUI${RESET} ${colors.gray}ccusage + Antigravity monitor${RESET}`;
+  const title = `${colors.bold}${colors.cyan}AI Usage TUI${RESET} ${colors.gray}ccusage + Agy quota monitor${RESET}`;
   lines.push(padLine(title, width));
   lines.push(
     padLine(
@@ -2387,8 +4245,8 @@ function draw(width, height) {
   lines.push(hr(width));
   const helpText = state.tab === "cuotas"
     ? (state.detail
-        ? `${colors.gray}\u2191\u2193\u2190\u2192 navegar \u00B7 esc volver \u00B7 tab consumo \u00B7 r refrescar \u00B7 q salir${RESET}`
-        : `${colors.gray}\u2191\u2193\u2190\u2192 navegar \u00B7 enter detalle \u00B7 tab consumo \u00B7 r refrescar \u00B7 q salir${RESET}`)
+        ? `${colors.gray}\u2191\u2193 modelo \u00B7 \u2190\u2192 proveedor \u00B7 h ocultar \u00B7 H ver ocultos \u00B7 esc volver \u00B7 tab consumo \u00B7 q salir${RESET}`
+        : `${colors.gray}\u2191\u2193\u2190\u2192 navegar \u00B7 enter detalle \u00B7 h ocultar \u00B7 H ver ocultos \u00B7 tab consumo \u00B7 r refrescar \u00B7 q salir${RESET}`)
     : `${colors.gray}\u2191\u2193\u2190\u2192 modelos \u00B7 1-5 vista \u00B7 a/c/x/v/m/o fuente \u00B7 tab cuotas \u00B7 r refrescar \u00B7 q salir${RESET}`;
   lines.push(fit(helpText, width));
   return lines.slice(0, height);
@@ -2396,30 +4254,41 @@ function draw(width, height) {
 
 function drawQuotaTab(width, maxHeight, snap) {
   const quotas = (snap && snap.quotas) || {};
-  const selected = PROVIDER_ORDER[state.cardIndex] || PROVIDER_ORDER[0];
+  const cards = visibleQuotaCards();
+  const selected = cards[state.cardIndex] || cards[0];
 
   let lines;
   if (state.detail) {
-    lines = drawQuotaDetail(width, selected, quotas[selected]);
+    lines = selected ? drawQuotaDetail(width, selected.provider, selected.quota, selected.title) : [];
   } else {
-    lines = drawQuotaGrid(width, maxHeight, quotas, selected);
+    lines = drawQuotaGrid(width, maxHeight, quotas, cards, selected);
   }
   const cap = Math.max(1, Number(maxHeight) || 1);
   return lines.slice(0, cap);
 }
 
-function drawQuotaGrid(width, maxHeight, quotas, selected) {
+function drawQuotaGrid(width, maxHeight, quotas, cards, selected) {
   const gap = 2;
   const targetW = 52; // tarjetas ~el doble de anchas; las columnas se adaptan al ancho
   const cols = Math.max(1, Math.floor((width + gap) / (targetW + gap)));
   const cardW = Math.max(30, Math.floor((width - (cols - 1) * gap) / cols));
 
-  const cardList = PROVIDER_ORDER.map((provider) =>
-    renderQuotaCard(cardW, provider, quotas[provider], provider === selected),
+  const hiddenCount = buildQuotaCards(quotas).filter(quotaCardHidden).length;
+  const footer = hiddenCount > 0
+    ? `${colors.gray}oculto: ${hiddenCount} · h gestiona · H ${state.revealHidden ? "vuelve a ocultar" : "revela"}${RESET}`
+    : null;
+  const rowCap = Math.max(1, (Number(maxHeight) || cards.length * 6) - (footer ? 1 : 0));
+
+  const out = [];
+  if (!cards.length) {
+    out.push(fit(`${colors.gray} Todo oculto o no-usable. Pulsa H para revelar los proveedores ocultos.${RESET}`, width));
+    return out;
+  }
+
+  const cardList = cards.map((card) =>
+    renderQuotaCard(cardW, card.provider, card.quota, card.id === selected?.id, quotaCardHidden(card), card.title),
   );
 
-  const rowCap = Math.max(1, Number(maxHeight) || cardList.length * 6);
-  const out = [];
   for (let i = 0; i < cardList.length; i += cols) {
     if (out.length >= rowCap) break;
     const rowCards = cardList.slice(i, i + cols);
@@ -2437,10 +4306,17 @@ function drawQuotaGrid(width, maxHeight, quotas, selected) {
       out.push(fit(parts.join(" ".repeat(gap)), width));
     }
   }
+  if (footer) out.push(fit(footer, width));
   return out;
 }
 
-function renderQuotaCard(cardW, provider, quota, selected) {
+// Multi-account providers need enough rows to identify every account. Keeping only three
+// silently hid the fourth account even though its quota had been collected successfully.
+function maxCardRows(quota) {
+  return quota?.accounts ? 4 : 3;
+}
+
+function renderQuotaCard(cardW, provider, quota, selected, hidden = false, titleOverride = null) {
   const meta = PROVIDER_META[provider] || { label: provider, color: colors.gray, icon: "?" };
   const inner = Math.max(4, cardW - 2);
   const lines = [];
@@ -2449,11 +4325,13 @@ function renderQuotaCard(cardW, provider, quota, selected) {
   // (Sin inverse: antes pintaba TODA la tarjeta seleccionada y se veia horrible.)
   const borderColor = selected ? `${colors.bold}${meta.color}` : colors.gray;
 
-  const headPrefix = ` ${meta.icon} ${meta.label} `;
+  const headPrefix = ` ${meta.icon} ${titleOverride || meta.label}${hidden ? " [oculto]" : ""} `;
   const headFill = Math.max(1, inner - visibleLength(headPrefix));
   lines.push(`${borderColor}\u250C${RESET}${meta.color}${headPrefix}${RESET}${borderColor}${"\u2500".repeat(headFill)}\u2510${RESET}`);
 
-  const windows = quota && quota.ok !== false && Array.isArray(quota.windows) ? quota.windows : [];
+  const windows = quota && quota.ok !== false && Array.isArray(quota.windows)
+    ? quota.windows.filter((w) => isModelVisible(provider, w, displayConfig, state.revealHidden))
+    : [];
   const bodyLine = (content) =>
     `${borderColor}\u2502${RESET}${fit(content, inner)}${borderColor}\u2502${RESET}`;
 
@@ -2461,34 +4339,31 @@ function renderQuotaCard(cardW, provider, quota, selected) {
     const note = truncate(String(quota?.note || "sin datos"), Math.max(0, inner - 2));
     lines.push(bodyLine(` ${note} `));
   } else {
-    const labelW = 8;
     const pctMax = 5;
-    const barW = Math.max(5, inner - (labelW + pctMax + 4));
-    const shown = windows.filter((w) => !w.available).slice(0, 3);
-    for (const w of shown) {
+    const shown = windows.filter((w) => !w.available).slice(0, maxCardRows(quota));
+    // Primero se identifica la cuenta y despues se dibuja la barra. Antes el nombre tenia
+    // apenas 8 columnas ("steven7.", "stevenv."), mientras la barra absorbia todo el resto.
+    // Reservamos el ancho natural del nombre cuando cabe; la barra usa TODO el espacio que
+    // queda despues de nombre y porcentaje, sin un tope fijo que deje media tarjeta vacia.
+    const naturalLabelW = Math.max(0, ...shown.map((w) => visibleLength(String(w.label || w.key || ""))));
+    const maxLabelW = Math.max(8, inner - pctMax - 4 - 5);
+    const labelW = Math.min(18, maxLabelW, Math.max(10, naturalLabelW));
+    const resetLabels = shown.map((w) => quotaCardResetLabel(w, quota));
+    const resetW = Math.min(8, Math.max(4, ...resetLabels.map(visibleLength)));
+    // Cada ventana lleva SU reset en la misma fila. La barra cede unas columnas para que
+    // "5 horas" y "semanal" nunca compartan un unico countdown ambiguo en el pie.
+    const barW = Math.max(5, inner - (labelW + resetW + pctMax + 5));
+    for (const [index, w] of shown.entries()) {
       const label = truncate(String(w.label || w.key || ""), labelW).padEnd(labelW);
+      const resetLabel = truncate(resetLabels[index], resetW).padEnd(resetW);
+      if (w.remainingPercent === null || w.remainingPercent === undefined) {
+        lines.push(bodyLine(` ${label} ${resetLabel} ? ${colors.gray}${truncate(String(w.status || "sin dato"), Math.max(6, barW + pctMax - 2))}${RESET} `));
+        continue;
+      }
       const pct = fmtPct(w.usedPercent);
       const bar = blockBar(w.usedPercent, barW, quotaColor(Number(w.remainingPercent)));
-      const content = ` ${label} ${bar} ${pct.padStart(pctMax)} `;
+      const content = ` ${label} ${resetLabel} ${bar} ${pct.padStart(pctMax)} `;
       lines.push(bodyLine(content));
-    }
-  }
-
-  const upcomingResets = windows
-    .map((w) => w.reset)
-    .filter((r) => r != null)
-    .map((r) => (r instanceof Date ? r : new Date(r)))
-    .filter((d) => !Number.isNaN(d.getTime()));
-  let cdText = "--";
-  if (upcomingResets.length) {
-    upcomingResets.sort((a, b) => a.getTime() - b.getTime());
-    cdText = fmtCountdown(upcomingResets[0]);
-  } else {
-    const wt = windows.find((w) => w.resetText)?.resetText;
-    if (wt) cdText = shortText(wt, 18);
-    else if (quota?.resetAt) {
-      const d = quota.resetAt instanceof Date ? quota.resetAt : new Date(quota.resetAt);
-      if (!Number.isNaN(d.getTime())) cdText = fmtCountdown(d);
     }
   }
 
@@ -2500,23 +4375,25 @@ function renderQuotaCard(cardW, provider, quota, selected) {
     const family = windows.find((w) => w.family)?.family;
     if (family) tag = ` [${family}]`;
   }
-  const more = windows.length > 3 ? ` +${windows.length - 3} \u21B5` : "";
+  const rowCap = maxCardRows(quota);
+  const more = windows.length > rowCap ? ` +${windows.length - rowCap} \u21B5` : "";
   const limitTag = quota?.limited ? ` [LIMITE${quota.limitedRetry ? ` ${quota.limitedRetry}` : ""}]` : "";
   const staleTag = quota?.stale ? " [viejo]" : "";
-  const footContent = ` \u21BB ${cdText}${tag}${limitTag}${staleTag}${more} `;
-  lines.push(bodyLine(footContent));
+  const footContent = `${tag}${limitTag}${staleTag}${more}`.trim();
+  if (footContent) lines.push(bodyLine(` ${footContent} `));
 
   lines.push(`${borderColor}\u2514${"\u2500".repeat(inner)}\u2518${RESET}`);
   return lines;
 }
 
-function drawQuotaDetail(width, provider, quota) {
+function drawQuotaDetail(width, provider, quota, titleOverride = null) {
   const meta = PROVIDER_META[provider] || { label: provider, color: colors.gray, icon: "?" };
   const lines = [];
   const noteRaw = quota?.note ? String(quota.note) : "";
-  const maxNote = Math.max(0, width - meta.label.length - 8);
+  const titleLabel = titleOverride || meta.label;
+  const maxNote = Math.max(0, width - titleLabel.length - 8);
   const noteSuffix = noteRaw ? ` \u2014 ${truncate(noteRaw, maxNote)}` : "";
-  const title = ` ${meta.icon} ${meta.label}${noteSuffix}`;
+  const title = ` ${meta.icon} ${titleLabel}${noteSuffix}`;
   lines.push(fit(`${colors.bold}${meta.color}${title}${RESET}`, width));
   lines.push(hr(width));
 
@@ -2525,7 +4402,9 @@ function drawQuotaDetail(width, provider, quota) {
     return lines;
   }
 
-  const windows = Array.isArray(quota.windows) ? quota.windows : [];
+  // Filtra modelos ocultos (en modo "ver ocultos" se muestran todos con marca).
+  const allWindows = Array.isArray(quota.windows) ? quota.windows : [];
+  const windows = allWindows.filter((w) => isModelVisible(provider, w, displayConfig, state.revealHidden));
   if (!windows.length) {
     lines.push(fit(` ${colors.gray}${truncate(String(quota.note || "sin datos"), Math.max(0, width - 2))}${RESET}`, width));
     return lines;
@@ -2534,6 +4413,14 @@ function drawQuotaDetail(width, provider, quota) {
   const barW = Math.max(8, Math.floor(width * 0.4));
   const hasFamily = windows.some((w) => w.family);
   const labelW = 28;
+  // El cursor de modelo indexa la lista APLANADA en el mismo orden que se pinta (ver detailWindowList).
+  let flatIdx = 0;
+  const emit = (w) => {
+    const selected = flatIdx === state.detailModelIndex;
+    const hidden = state.revealHidden && displayConfig.hiddenModels.includes(windowModelKey(provider, w));
+    flatIdx += 1;
+    lines.push(fit(detailQuotaLine(w, barW, labelW, selected, hidden), width));
+  };
 
   if (hasFamily) {
     const groups = new Map();
@@ -2542,33 +4429,29 @@ function drawQuotaDetail(width, provider, quota) {
       if (!groups.has(fam)) groups.set(fam, []);
       groups.get(fam).push(w);
     }
-    const order = [...groups.keys()]; // Map: preserva orden de insercion (Gemini primero)
-    for (const fam of order) {
-      const ws = groups.get(fam);
+    for (const fam of groups.keys()) { // Map: preserva orden de insercion (Gemini primero)
       const famLabel = fam === "gemini" ? "Gemini" : fam === "otros" ? "Otros" : fam;
       lines.push(fit(`${colors.bold}${colors.yellow} ${famLabel}${RESET}`, width));
-      for (const w of ws) {
-        lines.push(fit(detailQuotaLine(w, barW, labelW), width));
-      }
+      for (const w of groups.get(fam)) emit(w);
     }
   } else {
-    for (const w of windows) {
-      lines.push(fit(detailQuotaLine(w, barW, labelW), width));
-    }
+    for (const w of windows) emit(w);
   }
 
   return lines;
 }
 
-function detailQuotaLine(w, barW, labelW) {
+function detailQuotaLine(w, barW, labelW, selected = false, hidden = false) {
+  const cur = selected ? `${colors.cyan}\u276F${RESET}` : " ";
+  const tag = hidden ? ` ${colors.gray}[oculto]${RESET}` : "";
   const label = truncate(String(w.label || w.key || ""), labelW).padEnd(labelW);
   if (w.available) {
-    return ` ${label} ${colors.gray}\u2014 disponible (sin cuota expuesta por la API)${RESET}`;
+    return `${cur} ${label} ${colors.gray}\u2014 disponible (sin cuota expuesta por la API)${RESET}${tag}`;
   }
   const pct = fmtPct(w.usedPercent);
   const cd = w.reset ? fmtCountdown(w.reset) : (w.resetText ? shortText(w.resetText, 24) : "--");
   const bar = blockBar(w.usedPercent, barW, quotaColor(Number(w.remainingPercent)));
-  return ` ${label} ${bar} ${pct} usado  \u21BB ${cd}`;
+  return `${cur} ${label} ${bar} ${pct} usado  \u21BB ${cd}${tag}`;
 }
 
 function quotaSection(label, color, quota, barWidth, totalWidth) {
@@ -2714,7 +4597,7 @@ function drawConsumoTab(width, maxHeight, snap) {
   lines.push(...sourceCards(width, snap));
   lines.push(hr(width));
 
-  if (state.source === "antigravity") {
+  if (state.source === "gemini") {
     lines.push(...antigravityPanel(width, snap.sources.antigravity));
   } else if (state.source === "minimax") {
     lines.push(...minimaxPanel(width, snap.sources.minimax, snap.quotas?.minimax));
@@ -2731,22 +4614,23 @@ function summaryCards(width, total, snap) {
   const cardWidth = Math.max(18, Math.floor((width - 6) / 5));
   const effectiveTokens = total?.effectiveTokens ?? (total?.totalTokens || 0);
   const cacheReadTokens = total?.cacheReadTokens || 0;
+  const reasoningTokens = total?.reasoningOutputTokens || 0;
   const cards = [
     card("Netos", fmtInt(effectiveTokens), "in+cacheCreate+out", cardWidth, colors.cyan),
     card("Cache leido", fmtInt(cacheReadTokens), cacheReadTokens ? `${((cacheReadTokens / Math.max(1, total?.totalTokens || 1)) * 100).toFixed(0)}% del total` : "sin cache", cardWidth, colors.gray),
     card("Coste est.", fmtMoney(total?.totalCost || 0), "no es factura oficial", cardWidth, colors.green),
-    card("Salida", fmtInt(total?.outputTokens || 0), "tokens output", cardWidth, colors.magenta),
+    card("Salida", fmtInt(total?.outputTokens || 0), reasoningTokens ? `${fmtInt(reasoningTokens)} reasoning reportado` : "tokens output", cardWidth, colors.magenta),
     card("Latencia", `${snap.elapsedMs} ms`, "lectura local", cardWidth, colors.yellow),
   ];
   return zipCards(cards, width);
 }
 
 function sourceCards(width, snap) {
-  const sources = ["claude", "codex", "gemini", "antigravity", "minimax", "opencode"];
+  const sources = ["claude", "codex", "gemini", "minimax", "opencode"];
   const max = Math.max(
     1,
     ...sources.map((source) => {
-      if (source === "antigravity") return snap.sources.antigravity?.modelSteps || 0;
+      if (source === "gemini") return snap.sources.antigravity?.modelSteps || 0;
       if (source === "opencode") return snap.sources.opencode?.data?.totalCost || 0;
       const totals = snap.sources[source]?.totals;
       return totals?.effectiveTokens ?? totals?.totalTokens ?? 0;
@@ -2756,10 +4640,10 @@ function sourceCards(width, snap) {
   const cardWidth = Math.max(18, Math.floor((width - gapWidth) / sources.length));
   const cards = sources.map((source) => {
     const meta = SOURCE_META[source];
-    if (source === "antigravity") {
+    if (source === "gemini") {
       const ag = snap.sources.antigravity;
       const body = [
-        `${ag.installed ? "instalado" : "no instalado"} | ${ag.sessions} sesiones`,
+        `${ag.installed ? "Agy OAuth" : "Agy no instalado"} | ${ag.sessions} sesiones`,
         bar(ag.modelSteps, max, cardWidth - 4, colors.yellow),
         `${fmtInt(ag.modelSteps)} pasos modelo`,
       ];
@@ -2954,7 +4838,7 @@ function modelPanel(width, maxRows) {
     const effective = selected.effectiveTokens ?? selected.totalTokens;
     rows.push(
       fit(
-        `${colors.bold}Detalle:${RESET} ${selected.modelName} | netos ${fmtInt(effective)} | input ${fmtInt(selected.inputTokens)} | cache create ${fmtInt(selected.cacheCreationTokens)} | cache read ${fmtInt(selected.cacheReadTokens)} | output ${fmtInt(selected.outputTokens)} | coste ${fmtMoney(selected.cost)}`,
+        `${colors.bold}Detalle:${RESET} ${selected.modelName} | netos ${fmtInt(effective)} | input ${fmtInt(selected.inputTokens)} | cache create ${fmtInt(selected.cacheCreationTokens)} | cache read ${fmtInt(selected.cacheReadTokens)} | output ${fmtInt(selected.outputTokens)} | reasoning ${fmtInt(selected.reasoningOutputTokens)} | coste ${fmtMoney(selected.cost)}`,
         width,
       ),
     );
@@ -3063,7 +4947,7 @@ function opencodePanel(width, usage, quota) {
   const effective = usage.totals?.effectiveTokens ?? usage.totals?.totalTokens ?? 0;
   const cacheRead = usage.totals?.cacheReadTokens || 0;
   rows.push(`Coste total: ${colors.bold}${fmtMoney(usage.totals.totalCost || 0)}${RESET}`);
-  rows.push(`Tokens netos: ${fmtInt(effective)} (in: ${fmtInt(usage.totals.inputTokens || 0)} out: ${fmtInt(usage.totals.outputTokens || 0)})`);
+  rows.push(`Tokens netos: ${fmtInt(effective)} (in: ${fmtInt(usage.totals.inputTokens || 0)} out: ${fmtInt(usage.totals.outputTokens || 0)} reasoning: ${fmtInt(usage.totals.reasoningOutputTokens || 0)})`);
   rows.push(`Cache read: ${fmtInt(cacheRead)}  cache create: ${fmtInt(usage.totals.cacheCreationTokens || 0)}`);
   rows.push(`${usage.models.length} modelos detectados`);
   rows.push("");
@@ -3100,6 +4984,7 @@ function visibleSources() {
   const snap = state.lastSnapshot;
   if (!snap) return [];
   if (state.source === "all") return ALL_SOURCES.map((source) => snap.sources[source]).filter(Boolean);
+  if (state.source === "gemini") return [snap.sources.antigravity].filter(Boolean);
   return [snap.sources[state.source]].filter(Boolean);
 }
 
@@ -3107,6 +4992,7 @@ function visibleModels() {
   const snap = state.lastSnapshot;
   if (!snap) return [];
   if (state.source === "all") return snap.sources.all?.models ?? [];
+  if (state.source === "gemini") return snap.sources.antigravity?.models ?? [];
   return snap.sources[state.source]?.models ?? [];
 }
 
@@ -3119,7 +5005,8 @@ function renderPlainSummary(snap) {
     const effective = usage.totals.effectiveTokens ?? usage.totals.totalTokens;
     const cacheRead = usage.totals.cacheReadTokens || 0;
     const cacheNote = cacheRead ? ` cache_read=${fmtInt(cacheRead)}` : "";
-    lines.push(`${SOURCE_META[source].label.padEnd(8)} effective=${fmtInt(effective)}${cacheNote} total=${fmtInt(usage.totals.totalTokens)} cost=${fmtMoney(usage.totals.totalCost)} models=${usage.models.length}`);
+    const reasoningNote = usage.totals.reasoningOutputTokens ? ` reasoning=${fmtInt(usage.totals.reasoningOutputTokens)}` : "";
+    lines.push(`${SOURCE_META[source].label.padEnd(8)} effective=${fmtInt(effective)}${cacheNote}${reasoningNote} total=${fmtInt(usage.totals.totalTokens)} cost=${fmtMoney(usage.totals.totalCost)} models=${usage.models.length}`);
   }
   const ag = snap.sources.antigravity;
   lines.push(`Antigravity installed=${ag.installed} sessions=${ag.sessions} model_steps=${ag.modelSteps} default="${ag.defaultModel || ""}"`);
@@ -3437,8 +5324,14 @@ function exit(code) {
 }
 
 function agentRound(value) {
+  if (value === null || value === undefined || value === "") return null;
   const n = Number(value);
   return Number.isFinite(n) ? Math.round(n * 10) / 10 : null;
+}
+
+function agentIsoDate(value) {
+  const date = dateFromProviderValue(value);
+  return date ? date.toISOString() : null;
 }
 
 // Resumen estructurado de cuotas para consumo por agentes (MCP / --json).
@@ -3446,13 +5339,28 @@ function agentRound(value) {
 // para que un agente decida que proveedor/modelo usar segun disponibilidad.
 function buildAgentQuotaSummary(snap) {
   const nowMs = Date.now();
-  const out = { capturedAt: new Date().toISOString(), since: snap?.since || null, providers: {} };
+  const out = {
+    schemaVersion: 2,
+    appVersion: APP_VERSION,
+    capturedAt: new Date().toISOString(),
+    since: snap?.since || null,
+    providers: {},
+  };
   const quotas = snap?.quotas || {};
-  for (const provider of ["claude", "codex", "antigravity", "minimax", "opencode"]) {
+  // Filtro de visibilidad (mismo que la TUI): oculta no-usables y los elegidos por el
+  // usuario en quotas.json `display`. `AI_USAGE_SHOW_ALL=1` lo desactiva para agentes.
+  const display = snap?.quotaConfig?.display || {};
+  const showAll = /^(1|true|yes|on)$/i.test(String(process.env.AI_USAGE_SHOW_ALL || ""));
+  for (const provider of ["claude", "codex", "gemini", "antigravity", "minimax", "opencode"]) {
     const quota = quotas[provider];
     if (!quota) continue;
-    const windows = (Array.isArray(quota.windows) ? quota.windows : []).map((w) => {
-      const resetMs = w.reset instanceof Date ? w.reset.getTime() : (w.reset ? Date.parse(w.reset) : NaN);
+    if (!showAll && !isProviderVisible(provider, quota, display)) continue;
+    const windows = (Array.isArray(quota.windows) ? quota.windows : [])
+      .filter((w) => showAll || isModelVisible(provider, w, display))
+      .map((w) => {
+      const resetValue = w.reset ?? w.resetAt ?? null;
+      const resetDate = dateFromProviderValue(resetValue);
+      const resetMs = resetDate ? resetDate.getTime() : NaN;
       const entry = {
         label: String(w.label || w.key || ""),
         usedPercent: agentRound(w.usedPercent),
@@ -3460,6 +5368,15 @@ function buildAgentQuotaSummary(snap) {
         resetInSeconds: Number.isFinite(resetMs) ? Math.max(0, Math.round((resetMs - nowMs) / 1000)) : null,
         resetAt: Number.isFinite(resetMs) ? new Date(resetMs).toISOString() : null,
       };
+      for (const key of ["key", "rawLabel", "limitId", "sourceWindow", "windowType", "model", "limitText", "usedText", "accountId"]) {
+        if (w[key] !== undefined && w[key] !== null && w[key] !== "") entry[key] = w[key];
+      }
+      if (typeof w.status === "string" && w.status) entry.status = w.status;
+      for (const key of ["windowMinutes", "status", "used", "remaining", "limit"]) {
+        if (w[key] === null || w[key] === undefined || w[key] === "") continue;
+        const value = Number(w[key]);
+        if (Number.isFinite(value)) entry[key] = value;
+      }
       if (w.family) entry.family = w.family;
       if (w.source) entry.source = w.source;
       if (w.resetText) entry.resetText = w.resetText;
@@ -3467,15 +5384,115 @@ function buildAgentQuotaSummary(snap) {
       if (w.stale) entry.stale = true;
       return entry;
     });
-    out.providers[provider] = {
+    const inferredAvailable = windows.some((window) => {
+      const remaining = finiteNumberOrNull(window.remainingPercent);
+      return remaining !== null && remaining > 0;
+    }) && !quota.limited;
+    const directRemaining = finiteNumberOrNull(quota.remainingPercent);
+    const directUsed = finiteNumberOrNull(quota.usedPercent);
+    const scalarRemaining = directRemaining !== null
+      ? directRemaining
+      : directUsed !== null
+        ? 100 - directUsed
+        : null;
+    const providerEntry = {
       ok: quota.ok !== false,
+      available: typeof quota.available === "boolean"
+        ? quota.available
+        : quota.ok !== false && !quota.limited && (
+            inferredAvailable
+            || (String(quota.kind || "").startsWith("configured-") && scalarRemaining !== null && scalarRemaining > 0)
+          ),
       kind: quota.kind || "unknown",
-      stale: quota.stale || undefined,
-      limited: quota.limited || undefined,
-      limitedRetry: quota.limitedRetry || undefined,
       windows,
       note: quota.note || "",
     };
+    if (quota.plan) providerEntry.plan = quota.plan;
+    if (quota.dataSource) providerEntry.source = quota.dataSource;
+    if (finiteNumberOrNull(quota.effectiveRemainingPercent) !== null) {
+      providerEntry.effectiveRemainingPercent = agentRound(quota.effectiveRemainingPercent);
+    }
+    if (Array.isArray(quota.limitingWindows) && quota.limitingWindows.length) {
+      providerEntry.limitingWindows = quota.limitingWindows;
+    }
+    if (quota.incomplete) providerEntry.incomplete = true;
+    if (Array.isArray(quota.missingWindows) && quota.missingWindows.length) {
+      providerEntry.missingWindows = quota.missingWindows;
+    }
+    for (const key of ["availableGroups", "limitingGroups"]) {
+      if (Array.isArray(quota[key]) && quota[key].length) providerEntry[key] = quota[key];
+    }
+    if (quota.stale) providerEntry.stale = true;
+    if (quota.needsAuth) providerEntry.needsAuth = true;
+    if (quota.limited) providerEntry.limited = true;
+    if (quota.limitedRetry) providerEntry.limitedRetry = quota.limitedRetry;
+    if (quota.detectedAt) providerEntry.detectedAt = agentIsoDate(quota.detectedAt);
+    const observedAt = agentIsoDate(quota.observedAt || quota.detectedAt);
+    if (observedAt) {
+      providerEntry.observedAt = observedAt;
+      providerEntry.ageSeconds = Math.max(0, Math.round((nowMs - Date.parse(observedAt)) / 1000));
+    }
+    if (Array.isArray(quota.unavailableModels) && quota.unavailableModels.length) {
+      providerEntry.unavailableModels = quota.unavailableModels;
+    }
+    if (Array.isArray(quota.offeredModels) && quota.offeredModels.length) {
+      providerEntry.offeredModels = quota.offeredModels;
+    }
+    if (quota.resetCredits) {
+      providerEntry.resetCredits = {
+        availableCount: Number(quota.resetCredits.availableCount || 0),
+        credits: (quota.resetCredits.credits || []).map((credit) => ({
+          status: credit.status || "",
+          resetType: credit.resetType || "",
+          expiresAt: agentIsoDate(credit.expiresAt),
+        })),
+      };
+    }
+    if (Array.isArray(quota.creditsList) && quota.creditsList.length) {
+      providerEntry.creditBalances = quota.creditsList.map((credit) => ({
+        limitId: credit.limitId || "",
+        planType: credit.planType || "",
+        hasCredits: Boolean(credit.has_credits),
+        unlimited: Boolean(credit.unlimited),
+        balance: credit.balance == null ? null : String(credit.balance),
+      }));
+    }
+    // Multi-cuenta: SOLO se emite cuando hay mas de una cuenta resuelta para el
+    // proveedor (foldProviderAccounts las agrega en `quota.accounts` desde v-multiaccount).
+    // Con 0 o 1 cuenta (el 100% del parque hoy, sin `accounts[]` en quotas.json) estos
+    // campos quedan ausentes y el output es identico al de antes de esta funcionalidad:
+    // el hook (min(remainingPercent) sobre providers[p].windows) y cualquier otro
+    // consumidor viejo siguen funcionando sin cambios.
+    if (Number(quota.accountCount) > 1 && Array.isArray(quota.accounts)) {
+      providerEntry.accountCount = quota.accountCount;
+      if (quota.selectedAccountId) providerEntry.selectedAccountId = quota.selectedAccountId;
+      providerEntry.accounts = quota.accounts.map((entry) => {
+        const accountQuota = entry.quota || {};
+        const item = {
+          id: entry.accountId,
+          label: entry.label || entry.accountId,
+          blocked: Boolean(entry.blocked),
+          healthStatus: entry.healthStatus || null,
+          ok: accountQuota.ok !== false,
+          available: Boolean(accountQuota.available),
+        };
+        const remaining = finiteNumberOrNull(accountQuota.effectiveRemainingPercent);
+        if (remaining !== null) item.effectiveRemainingPercent = agentRound(remaining);
+        if (Array.isArray(accountQuota.availableGroups) && accountQuota.availableGroups.length) {
+          item.availableGroups = accountQuota.availableGroups;
+        }
+        if (Array.isArray(accountQuota.limitingGroups) && accountQuota.limitingGroups.length) {
+          item.limitingGroups = accountQuota.limitingGroups;
+        }
+        return item;
+      });
+    }
+    // Errores de configuracion de cuentas (id duplicado, credencial invalida, proveedor
+    // sin soporte multi-cuenta, etc.) — nunca credenciales, solo texto diagnostico.
+    if (Array.isArray(quota.configErrors) && quota.configErrors.length) {
+      providerEntry.configErrors = quota.configErrors;
+    }
+    out.providers[provider] = providerEntry;
   }
   return out;
 }
@@ -3490,13 +5507,23 @@ async function runQuotaSnapshot() {
 
 // Exports para pruebas unitarias y el servidor MCP (no se ejecuta main() al importar).
 export {
+  APP_VERSION,
   buildAgentQuotaSummary,
   runQuotaSnapshot,
+  classifyProviderAvailability,
+  isProviderVisible,
+  windowModelKey,
+  isModelVisible,
+  quotaHasData,
+  annotateUnusable,
   normalizeTotals,
   sumRows,
   extractModels,
   mergeModels,
+  enrichUnifiedReasoning,
   buildCodexQuota,
+  normalizeCodexRateLimitEntry,
+  codexWindowLabel,
   parseCodexRetryTime,
   fmtTimeInTz,
   renderQuotaCard,
@@ -3526,4 +5553,26 @@ export {
   fmtMoney,
   fmtInt,
   fmtCompact,
+  buildQuotaCards,
+  resolveAccounts,
+  resolveAllAccounts,
+  foldProviderAccounts,
+  aggregateAccountQuotas,
+  selectAccountEntry,
+  buildQuotaState,
+  collectProviderAccountsLive,
+  accountCachePath,
+  accountEnv,
+  inspectAccountCredential,
+  DEFAULT_ACCOUNT_ID,
 };
+
+// Arranque real: recien aca, al final del modulo (ver comentario junto a INVOKED_DIRECTLY
+// mas arriba), TODAS las const de nivel de modulo ya estan inicializadas.
+if (INVOKED_DIRECTLY) {
+  main().catch((error) => {
+    cleanup();
+    console.error(error?.stack || String(error));
+    process.exit(1);
+  });
+}
