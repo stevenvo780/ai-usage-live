@@ -499,6 +499,23 @@ test("renderQuotaCard: a multi-account provider keeps four named quota rows visi
   assert.ok(card.every((line) => visibleLength(line) === 63));
 });
 
+test("renderQuotaCard: each quota window shows its own reset beside its label", () => {
+  const now = Date.now();
+  const card = renderQuotaCard(63, "claude", {
+    ok: true,
+    windows: [
+      { key: "session", label: "5 horas", usedPercent: 20, remainingPercent: 80, reset: new Date(now + 90 * 60 * 1000) },
+      { key: "week_all", label: "semanal", usedPercent: 40, remainingPercent: 60, reset: new Date(now + 3 * 24 * 60 * 60 * 1000) },
+    ],
+  }, false).map(stripAnsi);
+
+  const session = card.find((line) => line.includes("5 horas"));
+  const weekly = card.find((line) => line.includes("semanal"));
+  assert.match(session, /5 horas\s+↻1h30m/);
+  assert.match(weekly, /semanal\s+↻3d0h/);
+  assert.ok(card.every((line) => visibleLength(line) === 63));
+});
+
 test("buildQuotaCards: renders 4 Claude + 2 Gemini + GPT + MiniMax cards", () => {
   const accountQuota = (fiveHour, weekly) => ({
     ok: true,

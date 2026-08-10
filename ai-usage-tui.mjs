@@ -3986,6 +3986,25 @@ function quotaCardRowLabel(window) {
   return String(window?.label || window?.key || "cuota");
 }
 
+function quotaCardResetLabel(window, quota = null) {
+  const direct = window?.reset ?? window?.resetAt ?? null;
+  if (direct) {
+    const countdown = fmtCountdown(direct);
+    if (countdown !== "--") return `↻${countdown}`;
+  }
+  if (Number.isFinite(Number(window?.resetInSeconds))) {
+    return `↻${fmtCountdown(new Date(Date.now() + Number(window.resetInSeconds) * 1000))}`;
+  }
+  if (window?.resetText) {
+    const compact = String(window.resetText)
+      .replace(/^resets?\s+(?:in|at)\s+/i, "")
+      .trim();
+    return `↻${shortText(compact || "--", 7)}`;
+  }
+  const fallback = quota?.resetAt ?? null;
+  return fallback ? `↻${fmtCountdown(fallback)}` : "↻--";
+}
+
 function quotaAccountEntries(provider, quota) {
   if (Array.isArray(quota?.accounts) && quota.accounts.length) {
     return quota.accounts.map((entry, index) => ({
@@ -4329,35 +4348,22 @@ function renderQuotaCard(cardW, provider, quota, selected, hidden = false, title
     const naturalLabelW = Math.max(0, ...shown.map((w) => visibleLength(String(w.label || w.key || ""))));
     const maxLabelW = Math.max(8, inner - pctMax - 4 - 5);
     const labelW = Math.min(18, maxLabelW, Math.max(10, naturalLabelW));
-    const barW = Math.max(5, inner - (labelW + pctMax + 4));
-    for (const w of shown) {
+    const resetLabels = shown.map((w) => quotaCardResetLabel(w, quota));
+    const resetW = Math.min(8, Math.max(4, ...resetLabels.map(visibleLength)));
+    // Cada ventana lleva SU reset en la misma fila. La barra cede unas columnas para que
+    // "5 horas" y "semanal" nunca compartan un unico countdown ambiguo en el pie.
+    const barW = Math.max(5, inner - (labelW + resetW + pctMax + 5));
+    for (const [index, w] of shown.entries()) {
       const label = truncate(String(w.label || w.key || ""), labelW).padEnd(labelW);
+      const resetLabel = truncate(resetLabels[index], resetW).padEnd(resetW);
       if (w.remainingPercent === null || w.remainingPercent === undefined) {
-        lines.push(bodyLine(` ${label} ?  ${colors.gray}${truncate(String(w.status || "sin dato"), Math.max(6, barW + pctMax - 3))}${RESET} `));
+        lines.push(bodyLine(` ${label} ${resetLabel} ? ${colors.gray}${truncate(String(w.status || "sin dato"), Math.max(6, barW + pctMax - 2))}${RESET} `));
         continue;
       }
       const pct = fmtPct(w.usedPercent);
       const bar = blockBar(w.usedPercent, barW, quotaColor(Number(w.remainingPercent)));
-      const content = ` ${label} ${bar} ${pct.padStart(pctMax)} `;
+      const content = ` ${label} ${resetLabel} ${bar} ${pct.padStart(pctMax)} `;
       lines.push(bodyLine(content));
-    }
-  }
-
-  const upcomingResets = windows
-    .map((w) => w.reset)
-    .filter((r) => r != null)
-    .map((r) => (r instanceof Date ? r : new Date(r)))
-    .filter((d) => !Number.isNaN(d.getTime()));
-  let cdText = "--";
-  if (upcomingResets.length) {
-    upcomingResets.sort((a, b) => a.getTime() - b.getTime());
-    cdText = fmtCountdown(upcomingResets[0]);
-  } else {
-    const wt = windows.find((w) => w.resetText)?.resetText;
-    if (wt) cdText = shortText(wt, 18);
-    else if (quota?.resetAt) {
-      const d = quota.resetAt instanceof Date ? quota.resetAt : new Date(quota.resetAt);
-      if (!Number.isNaN(d.getTime())) cdText = fmtCountdown(d);
     }
   }
 
@@ -4373,8 +4379,8 @@ function renderQuotaCard(cardW, provider, quota, selected, hidden = false, title
   const more = windows.length > rowCap ? ` +${windows.length - rowCap} \u21B5` : "";
   const limitTag = quota?.limited ? ` [LIMITE${quota.limitedRetry ? ` ${quota.limitedRetry}` : ""}]` : "";
   const staleTag = quota?.stale ? " [viejo]" : "";
-  const footContent = ` \u21BB ${cdText}${tag}${limitTag}${staleTag}${more} `;
-  lines.push(bodyLine(footContent));
+  const footContent = `${tag}${limitTag}${staleTag}${more}`.trim();
+  if (footContent) lines.push(bodyLine(` ${footContent} `));
 
   lines.push(`${borderColor}\u2514${"\u2500".repeat(inner)}\u2518${RESET}`);
   return lines;
