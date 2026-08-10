@@ -43,10 +43,10 @@ const SOURCE_META = {
 
 const ALL_SOURCES = ["claude", "codex", "gemini", "opencode"];
 const SOURCE_KEYS = ["all", "claude", "codex", "gemini", "minimax", "opencode"];
-// Orden de las tarjetas del grid de cuotas (drill-down con flechas + enter).
-// Gemini ya se mide por Agy/OAuth en esta instalacion. Antigravity sigue siendo la fuente
-// interna, pero no aparece como un segundo proveedor porque duplicaria la misma cuota.
-const PROVIDER_ORDER = ["claude", "codex", "gemini", "minimax", "opencode"];
+// El grid muestra licencias ejecutables, no fuentes tecnicas. OpenCode sigue disponible en
+// consumo, pero no ocupa una tarjeta de licencia. Claude/Gemini se expanden mas abajo a una
+// tarjeta por cuenta.
+const PROVIDER_ORDER = ["claude", "codex", "gemini", "minimax"];
 // Inventario de colectores, independiente de lo que el TUI decide mostrar. Agy/Antigravity
 // sigue alimentando Gemini aunque no tenga una tarjeta duplicada en PROVIDER_ORDER.
 const ACCOUNT_PROVIDER_ORDER = ["claude", "codex", "gemini", "antigravity", "minimax", "opencode"];
@@ -54,7 +54,7 @@ const ACCOUNT_PROVIDER_ORDER = ["claude", "codex", "gemini", "antigravity", "min
 // Iconos single-width (NO emojis doble-ancho) para que no descuadren el TUI.
 const PROVIDER_META = {
   claude: { label: "Claude", color: colors.magenta, icon: "\u2726" },
-  codex: { label: "Codex", color: colors.green, icon: "\u2B21" },
+  codex: { label: "GPT · Codex", color: colors.green, icon: "\u2B21" },
   gemini: { label: "Gemini · Agy", color: colors.blue, icon: "\u25C8" },
   antigravity: { label: "Antigravity", color: colors.yellow, icon: "\u25C6" },
   minimax: { label: "MiniMax", color: colors.cyan, icon: "\u25B0" },
@@ -263,8 +263,8 @@ async function refresh(options = {}) {
     // proveedor en detalle pudo perder ventanas: re-alinea los indices para que h/flechas
     // no queden apuntando fuera de rango tras la captura.
     reconcileCardIndex();
-    const selected = visibleProviders()[state.cardIndex];
-    const listLen = detailWindowList(state.lastSnapshot?.quotas?.[selected], selected).length;
+    const selected = visibleQuotaCards()[state.cardIndex];
+    const listLen = selected ? detailWindowList(selected.quota, selected.provider).length : 0;
     if (state.detailModelIndex > listLen - 1) state.detailModelIndex = Math.max(0, listLen - 1);
     render();
     if (pendingRefresh) {
@@ -3979,16 +3979,93 @@ function onArrow(dir) {
   else moveCard(1);
 }
 
-// Proveedores mostrados en el grid: en modo "ver ocultos" (H) van todos; si no, se aplica
-// el filtro (auto-oculta no-usables + hiddenProviders del usuario).
-function visibleProviders() {
-  if (state.revealHidden) return PROVIDER_ORDER.slice();
-  const quotas = state.lastSnapshot?.quotas || {};
-  return PROVIDER_ORDER.filter((p) => isProviderVisible(p, quotas[p], displayConfig, false));
+function quotaCardRowLabel(window) {
+  const type = String(window?.windowType || window?.key || "").toLowerCase();
+  if (type === "session" || type === "5h" || type === "five_hour") return "5 horas";
+  if (type === "weekly" || type === "sem" || type === "seven_day" || type === "week_all") return "semanal";
+  return String(window?.label || window?.key || "cuota");
+}
+
+function quotaAccountEntries(provider, quota) {
+  if (Array.isArray(quota?.accounts) && quota.accounts.length) {
+    return quota.accounts.map((entry, index) => ({
+      account: String(entry.accountId || `cuenta${index + 1}`),
+      quota: entry.quota || { ok: false, note: entry.health?.detail || "sin datos" },
+    }));
+  }
+  if (!quota?.accounts || !Array.isArray(quota.windows)) return [];
+  const groups = new Map();
+  for (const window of quota.windows) {
+    const account = String(window.family || window.account || "cuenta").trim() || "cuenta";
+    if (!groups.has(account)) groups.set(account, []);
+    groups.get(account).push(window);
+  }
+  return [...groups].map(([account, windows]) => ({ account, quota: { ...quota, windows } }));
+}
+
+// Convierte el snapshot tecnico en el modelo visual: una tarjeta por licencia/cuenta.
+function buildQuotaCards(quotas = {}) {
+  const cards = [];
+  for (const provider of PROVIDER_ORDER) {
+    const quota = quotas[provider];
+    const entries = provider === "claude" || provider === "gemini"
+      ? quotaAccountEntries(provider, quota)
+      : [];
+    if (!entries.length) {
+      cards.push({ id: provider, provider, title: PROVIDER_META[provider]?.label || provider, quota });
+      continue;
+    }
+    for (const { account, quota: accountQuota } of entries) {
+      let rawWindows = Array.isArray(accountQuota?.windows) ? accountQuota.windows : [];
+      if (provider === "claude") {
+        const global = rawWindows.filter((window) => {
+          const key = String(window.key || window.windowType || "").toLowerCase();
+          return key === "session" || key === "5h" || key === "five_hour"
+            || key === "week_all" || key === "weekly" || key === "seven_day";
+        });
+        if (global.length) rawWindows = global;
+      }
+      const windows = rawWindows.map((window) => ({
+        ...window,
+        label: quotaCardRowLabel(window),
+        model: quotaCardRowLabel(window),
+        family: null,
+      }));
+      const availability = conjunctiveQuotaAvailability(windows);
+      const idPart = account.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "cuenta";
+      cards.push({
+        id: `${provider}:${idPart}`,
+        provider,
+        title: `${provider === "gemini" ? "Gemini" : "Claude"} · ${account}`,
+        account,
+        quota: {
+          ...accountQuota,
+          accounts: false,
+          cardAccount: account,
+          windows,
+          ...(windows.length ? availability : {}),
+        },
+      });
+    }
+  }
+  return cards;
+}
+
+function quotaCardHidden(card) {
+  return displayConfig.hiddenProviders.includes(card.id)
+    || displayConfig.hiddenProviders.includes(card.provider);
+}
+
+function visibleQuotaCards() {
+  const cards = buildQuotaCards(state.lastSnapshot?.quotas || {});
+  if (state.revealHidden) return cards;
+  return cards.filter((card) =>
+    isProviderVisible(card.provider, card.quota, displayConfig, false)
+    && !quotaCardHidden(card));
 }
 
 function reconcileCardIndex() {
-  const n = visibleProviders().length;
+  const n = visibleQuotaCards().length;
   if (n === 0) { state.cardIndex = 0; return; }
   if (state.cardIndex > n - 1) state.cardIndex = n - 1;
   if (state.cardIndex < 0) state.cardIndex = 0;
@@ -4010,7 +4087,7 @@ function detailWindowList(quota, provider) {
 }
 
 function moveCard(delta) {
-  const order = visibleProviders();
+  const order = visibleQuotaCards();
   const n = order.length;
   if (!n) return;
   state.cardIndex = (((state.cardIndex + delta) % n) + n) % n;
@@ -4019,9 +4096,9 @@ function moveCard(delta) {
 }
 
 function moveDetailModel(delta) {
-  const order = visibleProviders();
-  const provider = order[state.cardIndex];
-  const list = detailWindowList(state.lastSnapshot?.quotas?.[provider], provider);
+  const order = visibleQuotaCards();
+  const card = order[state.cardIndex];
+  const list = card ? detailWindowList(card.quota, card.provider) : [];
   if (!list.length) { state.detailModelIndex = 0; return; }
   state.detailModelIndex = Math.max(0, Math.min(list.length - 1, state.detailModelIndex + delta));
   render();
@@ -4052,10 +4129,11 @@ function toggleTab() {
 // h: oculta/muestra el proveedor seleccionado (grid) o el modelo seleccionado (detalle).
 function onHideToggle() {
   if (state.tab !== "cuotas") return;
-  const provider = visibleProviders()[state.cardIndex];
-  if (!provider) return;
+  const card = visibleQuotaCards()[state.cardIndex];
+  if (!card) return;
+  const provider = card.provider;
   if (state.detail) {
-    const list = detailWindowList(state.lastSnapshot?.quotas?.[provider], provider);
+    const list = detailWindowList(card.quota, provider);
     const key = windowModelKey(provider, list[state.detailModelIndex]);
     if (!key) return;
     const i = displayConfig.hiddenModels.indexOf(key);
@@ -4065,13 +4143,13 @@ function onHideToggle() {
     const newLen = detailWindowList(state.lastSnapshot?.quotas?.[provider], provider).length;
     if (state.detailModelIndex > newLen - 1) state.detailModelIndex = Math.max(0, newLen - 1);
   } else {
-    const i = displayConfig.hiddenProviders.indexOf(provider);
+    const i = displayConfig.hiddenProviders.indexOf(card.id);
     if (i >= 0) displayConfig.hiddenProviders.splice(i, 1);
-    else displayConfig.hiddenProviders.push(provider);
+    else displayConfig.hiddenProviders.push(card.id);
     saveDisplayConfig();
     reconcileCardIndex();
     // No dejar el grid completamente vacio: si todo queda oculto, entra en modo "ver ocultos".
-    if (!state.revealHidden && visibleProviders().length === 0) state.revealHidden = true;
+    if (!state.revealHidden && visibleQuotaCards().length === 0) state.revealHidden = true;
   }
   render();
 }
@@ -4093,7 +4171,7 @@ function setView(view) {
 function setSource(source) {
   state.source = source;
   state.selectedModel = 0;
-  const idx = visibleProviders().indexOf(source);
+  const idx = visibleQuotaCards().findIndex((card) => card.provider === source);
   if (idx >= 0) {
     state.cardIndex = idx;
     state.detailModelIndex = 0; // cambiar de proveedor resetea el cursor de modelo del detalle
@@ -4157,39 +4235,39 @@ function draw(width, height) {
 
 function drawQuotaTab(width, maxHeight, snap) {
   const quotas = (snap && snap.quotas) || {};
-  const order = visibleProviders();
-  const selected = order[state.cardIndex] || order[0];
+  const cards = visibleQuotaCards();
+  const selected = cards[state.cardIndex] || cards[0];
 
   let lines;
   if (state.detail) {
-    lines = selected ? drawQuotaDetail(width, selected, quotas[selected]) : [];
+    lines = selected ? drawQuotaDetail(width, selected.provider, selected.quota, selected.title) : [];
   } else {
-    lines = drawQuotaGrid(width, maxHeight, quotas, order, selected);
+    lines = drawQuotaGrid(width, maxHeight, quotas, cards, selected);
   }
   const cap = Math.max(1, Number(maxHeight) || 1);
   return lines.slice(0, cap);
 }
 
-function drawQuotaGrid(width, maxHeight, quotas, order, selected) {
+function drawQuotaGrid(width, maxHeight, quotas, cards, selected) {
   const gap = 2;
   const targetW = 52; // tarjetas ~el doble de anchas; las columnas se adaptan al ancho
   const cols = Math.max(1, Math.floor((width + gap) / (targetW + gap)));
   const cardW = Math.max(30, Math.floor((width - (cols - 1) * gap) / cols));
 
-  const hiddenCount = displayConfig.hiddenProviders.filter((provider) => PROVIDER_ORDER.includes(provider)).length;
+  const hiddenCount = buildQuotaCards(quotas).filter(quotaCardHidden).length;
   const footer = hiddenCount > 0
     ? `${colors.gray}oculto: ${hiddenCount} · h gestiona · H ${state.revealHidden ? "vuelve a ocultar" : "revela"}${RESET}`
     : null;
-  const rowCap = Math.max(1, (Number(maxHeight) || order.length * 6) - (footer ? 1 : 0));
+  const rowCap = Math.max(1, (Number(maxHeight) || cards.length * 6) - (footer ? 1 : 0));
 
   const out = [];
-  if (!order.length) {
+  if (!cards.length) {
     out.push(fit(`${colors.gray} Todo oculto o no-usable. Pulsa H para revelar los proveedores ocultos.${RESET}`, width));
     return out;
   }
 
-  const cardList = order.map((provider) =>
-    renderQuotaCard(cardW, provider, quotas[provider], provider === selected, displayConfig.hiddenProviders.includes(provider)),
+  const cardList = cards.map((card) =>
+    renderQuotaCard(cardW, card.provider, card.quota, card.id === selected?.id, quotaCardHidden(card), card.title),
   );
 
   for (let i = 0; i < cardList.length; i += cols) {
@@ -4219,7 +4297,7 @@ function maxCardRows(quota) {
   return quota?.accounts ? 4 : 3;
 }
 
-function renderQuotaCard(cardW, provider, quota, selected, hidden = false) {
+function renderQuotaCard(cardW, provider, quota, selected, hidden = false, titleOverride = null) {
   const meta = PROVIDER_META[provider] || { label: provider, color: colors.gray, icon: "?" };
   const inner = Math.max(4, cardW - 2);
   const lines = [];
@@ -4228,7 +4306,7 @@ function renderQuotaCard(cardW, provider, quota, selected, hidden = false) {
   // (Sin inverse: antes pintaba TODA la tarjeta seleccionada y se veia horrible.)
   const borderColor = selected ? `${colors.bold}${meta.color}` : colors.gray;
 
-  const headPrefix = ` ${meta.icon} ${meta.label}${hidden ? " [oculto]" : ""} `;
+  const headPrefix = ` ${meta.icon} ${titleOverride || meta.label}${hidden ? " [oculto]" : ""} `;
   const headFill = Math.max(1, inner - visibleLength(headPrefix));
   lines.push(`${borderColor}\u250C${RESET}${meta.color}${headPrefix}${RESET}${borderColor}${"\u2500".repeat(headFill)}\u2510${RESET}`);
 
@@ -4302,13 +4380,14 @@ function renderQuotaCard(cardW, provider, quota, selected, hidden = false) {
   return lines;
 }
 
-function drawQuotaDetail(width, provider, quota) {
+function drawQuotaDetail(width, provider, quota, titleOverride = null) {
   const meta = PROVIDER_META[provider] || { label: provider, color: colors.gray, icon: "?" };
   const lines = [];
   const noteRaw = quota?.note ? String(quota.note) : "";
-  const maxNote = Math.max(0, width - meta.label.length - 8);
+  const titleLabel = titleOverride || meta.label;
+  const maxNote = Math.max(0, width - titleLabel.length - 8);
   const noteSuffix = noteRaw ? ` \u2014 ${truncate(noteRaw, maxNote)}` : "";
-  const title = ` ${meta.icon} ${meta.label}${noteSuffix}`;
+  const title = ` ${meta.icon} ${titleLabel}${noteSuffix}`;
   lines.push(fit(`${colors.bold}${meta.color}${title}${RESET}`, width));
   lines.push(hr(width));
 
@@ -5468,6 +5547,7 @@ export {
   fmtMoney,
   fmtInt,
   fmtCompact,
+  buildQuotaCards,
   resolveAccounts,
   resolveAllAccounts,
   foldProviderAccounts,

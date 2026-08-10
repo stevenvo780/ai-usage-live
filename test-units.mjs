@@ -34,6 +34,7 @@ import {
   fmtCountdown,
   blockBar,
   renderQuotaCard,
+  buildQuotaCards,
   buildAgentQuotaSummary,
   enrichUnifiedReasoning,
   classifyProviderAvailability,
@@ -496,6 +497,42 @@ test("renderQuotaCard: a multi-account provider keeps four named quota rows visi
   assert.match(card.join("\n"), /cuenta-dos sem/);
   assert.doesNotMatch(card.join("\n"), /\+1/);
   assert.ok(card.every((line) => visibleLength(line) === 63));
+});
+
+test("buildQuotaCards: renders 4 Claude + 2 Gemini + GPT + MiniMax cards", () => {
+  const accountQuota = (fiveHour, weekly) => ({
+    ok: true,
+    windows: [
+      { key: "session", label: "sesion", windowType: "session", usedPercent: 100 - fiveHour, remainingPercent: fiveHour },
+      { key: "week_all", label: "semana", windowType: "weekly", usedPercent: 100 - weekly, remainingPercent: weekly },
+    ],
+  });
+  const cards = buildQuotaCards({
+    claude: {
+      ok: true,
+      accounts: ["steven", "saldantia", "juan", "b2b"].map((accountId, index) => ({
+        accountId,
+        quota: accountQuota(90 - index, 80 - index),
+      })),
+    },
+    gemini: {
+      ok: true,
+      accounts: ["gemini-a", "gemini-b"].map((accountId, index) => ({
+        accountId,
+        quota: accountQuota(70 - index, 60 - index),
+      })),
+    },
+    codex: accountQuota(50, 40),
+    minimax: accountQuota(30, 20),
+  });
+
+  assert.equal(cards.length, 8);
+  assert.equal(cards.filter((card) => card.provider === "claude").length, 4);
+  assert.equal(cards.filter((card) => card.provider === "gemini").length, 2);
+  assert.equal(cards.filter((card) => card.provider === "codex").length, 1);
+  assert.equal(cards.filter((card) => card.provider === "minimax").length, 1);
+  assert.ok(cards.filter((card) => card.provider === "gemini")
+    .every((card) => card.quota.windows.map((window) => window.label).join(",") === "5 horas,semanal"));
 });
 
 test("buildMiniMaxQuota: creates quota from usage", () => {
