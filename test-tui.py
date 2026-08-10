@@ -130,6 +130,7 @@ def capture(keys, wait_after_keys=2, total_timeout=20, env_overrides=None):
     start = time.time()
     key_idx = 0
     first_frame_seen = False
+    first_frame_at = None
     
     while time.time() - start < total_timeout:
         r, _, _ = select.select([fd], [], [], 0.2)
@@ -140,19 +141,25 @@ def capture(keys, wait_after_keys=2, total_timeout=20, env_overrides=None):
                     out += chunk
                     if not first_frame_seen and b"\x1b[2J" in out:
                         first_frame_seen = True
+                        first_frame_at = time.time()
             except OSError:
                 break
         
         elapsed = time.time() - start
         if first_frame_seen and key_idx < len(keys):
             key_time, key_value = keys[key_idx]
-            if elapsed >= key_time:
+            # Los tiempos declarados por cada escenario son relativos al primer frame
+            # interactivo, no al arranque del proceso. En una maquina ocupada el snapshot
+            # inicial puede tardar varios segundos; medir desde `start` juntaba dos teclas
+            # casi simultaneas y volvia intermitente el test de ocultar tarjetas.
+            key_elapsed = time.time() - first_frame_at
+            if key_elapsed >= key_time:
                 os.write(fd, key_value.encode() if isinstance(key_value, str) else key_value)
                 key_idx += 1
         
         if key_idx >= len(keys) and first_frame_seen:
-            wait_start = next((t for t, _ in keys), 0) + wait_after_keys
-            if elapsed >= wait_start:
+            wait_start = max((t for t, _ in keys), default=0) + wait_after_keys
+            if time.time() - first_frame_at >= wait_start:
                 time.sleep(1.0)  # dar tiempo extra para que se renderice
                 # leer lo que quede en el buffer
                 while True:

@@ -233,6 +233,37 @@ La ruta de la base se resuelve con `opencode db path`; `OPENCODE_DB_PATH` permit
 
 Los campos manuales son fallbacks. No sustituyen una lectura en vivo valida salvo `opencode.serverOverride.enabled: true`. El bloque `display` controla la visibilidad (ver "Visibilidad de proveedores y modelos"); la TUI lo reescribe al usar `h`/`H` sin tocar el resto del archivo.
 
+## Multi-cuenta (opt-in)
+
+Cada proveedor admite un array `accounts` opcional. **Sin `accounts` declarado, el comportamiento es exactamente el de siempre** (una cuenta implicita `"default"` con las credenciales ambientes de tu `$HOME`): esto no rompe ninguna instalacion existente.
+
+```json
+{
+  "claude": {
+    "liveUsage": true,
+    "accounts": [
+      { "id": "principal", "label": "Cuenta A", "credential": { "kind": "configDir", "path": "/home/tu-usuario/.claude" } },
+      { "id": "secundaria", "label": "Cuenta B", "credential": { "kind": "configDir", "path": "/home/tu-usuario/.claude-cuenta-b" } }
+    ]
+  }
+}
+```
+
+- `id`: `^[a-z0-9][a-z0-9._-]{0,31}$` (es componente de nombre de archivo de cache: `claude-<id>-usage-cache.json`, etc.). No puede repetirse.
+- `credential.kind`:
+  - `"configDir"` — aisla la raiz de credenciales del CLI hijo via variable de entorno (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME` segun el proveedor). Es la unica forma real de tener 2+ cuentas Claude/Codex/Gemini en la misma maquina. **Antigravity no lo admite** (su CLI fija la raiz en `~/.gemini/antigravity-cli` sin variable de entorno de aislamiento); declarar `accounts` ahi cae a modo legacy con un error explicito en vez de reportar la misma suscripcion dos veces.
+  - `"env"` — lee la credencial de una variable de entorno por cuenta (`{"kind":"env","var":"MINIMAX_API_KEY_CUENTA_B"}`), para proveedores sin CLI aislable (MiniMax, OpenCode Go).
+  - `"legacy"` (default si se omite `credential`) — usa las credenciales ambientes; solo tiene sentido en una de las cuentas declaradas.
+- Cualquier campo del bloque del proveedor (`fiveHourTokens`, `liveUsageCacheSeconds`, etc.) puede sobreescribirse por cuenta poniendolo junto a `id`/`credential` en la entrada — hereda del bloque del proveedor si se omite.
+- `priority` (numero, default 0) desempata cuando dos cuentas quedan con el mismo `remainingPercent`: gana la de menor `priority`.
+- `enabled: false` deshabilita una cuenta sin borrarla.
+
+**Salud de la credencial, sin gastar CLI**: antes de lanzar el proceso de 30-45s, cada cuenta se preflight-chequea leyendo su archivo de credenciales en disco. Estados posibles: `ok`, `unauthenticated` (no hay credencial), `credential-broken` (token vacio o un marcador como `"[REDACTED]"`), `credential-expired` (access y refresh token vencidos). Las tres ultimas BLOQUEAN la cuenta (nunca se gasta un CLI en una credencial muerta) y quedan expuestas en `get_ai_quotas` como `accounts[].healthStatus`.
+
+**Dedupe**: si dos raices resuelven a la MISMA suscripcion (mismo `accountUuid`/`account_id`), la segunda se marca `duplicateOf` y se excluye del agregado — evita reportar el doble de capacidad por error de configuracion.
+
+**Agregacion**: con 2+ cuentas sanas, el proveedor reporta el AGREGADO (`available`/`effectiveRemainingPercent` = la mejor cuenta; una cuenta agotada nunca tapa a otra con cupo) y el detalle completo en `accounts[]`. Con 0 o 1 cuenta, la salida es identica a no tener `accounts` declarado.
+
 ## Servidor MCP
 
 `ai-usage-mcp` es un servidor Model Context Protocol sin dependencias externas que usa JSON-RPC 2.0 por stdio. Negocia MCP `2025-11-25` y `2025-06-18` (ambas versiones incluyen `outputSchema`/`structuredContent` y no usan batch). Los mensajes de protocolo (`initialize`, `tools/list`, `ping`) se responden de inmediato aunque un `get_ai_quotas` lento este consultando los CLIs; las llamadas concurrentes comparten una unica captura en vuelo.
@@ -310,6 +341,7 @@ En el schema v2:
 - `ok: true` y `available: false` es una respuesta valida cuando la cuenta esta agotada.
 - `stale`, `observedAt` y `ageSeconds` indican la frescura de la observacion.
 - `needsAuth` indica que el CLI requiere volver a autenticarse.
+- Con `accounts[]` declaradas para un proveedor (ver "Multi-cuenta"), `windows[]`/`effectiveRemainingPercent`/`available` reflejan el AGREGADO entre cuentas (nunca la union de ventanas: cada `window` trae `accountId` de la cuenta seleccionada). El detalle por cuenta va en `accountCount`, `selectedAccountId` y `accounts[]` (`{id, label, blocked, healthStatus, ok, available, effectiveRemainingPercent, availableGroups, limitingGroups}`, sin credenciales) — estos tres campos SOLO aparecen cuando el proveedor resolvio mas de una cuenta; con 0 o 1 cuenta el output es identico al de antes de esta funcionalidad.
 
 La primera llamada puede tardar porque consulta los CLI; las siguientes aprovechan los caches de cada proveedor.
 

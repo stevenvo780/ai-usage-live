@@ -21,7 +21,10 @@ import threading
 import time
 
 HOME = os.path.expanduser("~")
-SESSIONS = os.path.join(HOME, ".codex", "sessions")
+# CODEX_HOME manda para que el aislamiento por cuenta tambien cubra el escaneo de
+# sesiones: sin esto la cuenta B leeria los rate_limits cacheados de la cuenta A.
+CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+SESSIONS = os.path.join(CODEX_HOME, "sessions")
 
 _KEY_ALIASES = {
     "rateLimits": "rate_limits",

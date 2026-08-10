@@ -56,6 +56,36 @@ const QUOTA_OUTPUT_SCHEMA = {
           missingWindows: { type: "array", items: { type: "string" } },
           availableGroups: { type: "array", items: { type: "string" } },
           limitingGroups: { type: "array", items: { type: "string" } },
+          // Multi-cuenta (opt-in via quotas.json <provider>.accounts[]): SOLO presentes
+          // cuando el proveedor resolvio mas de una cuenta. `windows`/`effectiveRemainingPercent`
+          // arriba siguen reflejando el AGREGADO (MAX entre cuentas sanas) con `windows` proyectado
+          // de la cuenta seleccionada (selectedAccountId) — nunca la union de todas las cuentas.
+          // Para precision por cuenta o para elegir una cuenta especifica, usar accounts[].
+          accountCount: { type: "number" },
+          selectedAccountId: { type: "string" },
+          accounts: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["id", "label", "blocked", "ok", "available"],
+              properties: {
+                id: { type: "string" },
+                label: { type: "string" },
+                blocked: { type: "boolean" },
+                healthStatus: { type: ["string", "null"] },
+                ok: { type: "boolean" },
+                available: { type: "boolean" },
+                effectiveRemainingPercent: { type: "number" },
+                availableGroups: { type: "array", items: { type: "string" } },
+                limitingGroups: { type: "array", items: { type: "string" } },
+              },
+              additionalProperties: false,
+            },
+          },
+          // Errores de configuracion no fatales de quotas.json <provider>.accounts[] (id
+          // duplicado, credencial invalida, proveedor sin soporte multi-cuenta, etc.).
+          // Nunca incluye valores de credenciales.
+          configErrors: { type: "array", items: { type: "string" } },
           unavailableModels: { type: "array", items: { type: "string" } },
           offeredModels: { type: "array", items: { type: "string" } },
           resetCredits: { type: "object" },
@@ -94,6 +124,9 @@ const QUOTA_OUTPUT_SCHEMA = {
                 family: { type: "string" },
                 source: { type: "string" },
                 status: { type: ["string", "number"] },
+                // Presente solo en proveedores multi-cuenta: id de la cuenta seleccionada
+                // (providers.<p>.selectedAccountId) de la que proviene esta ventana.
+                accountId: { type: "string" },
               },
               additionalProperties: true,
             },
@@ -171,7 +204,7 @@ async function handle(msg) {
       return;
     case "tools/call": {
       if (params?.name !== "get_ai_quotas") {
-        replyError(id, -32602, `Unknown tool: ${params?.name}`);
+        replyError(id, -32602, "Unknown tool");
         return;
       }
       // get_ai_quotas no acepta argumentos; null/ausente/{} son equivalentes a "sin args".
@@ -208,7 +241,7 @@ async function handle(msg) {
       return;
     default:
       // Notificaciones (sin id) se ignoran; metodos desconocidos con id -> error.
-      if (id !== undefined && id !== null) replyError(id, -32601, `Method not found: ${method}`);
+      if (id !== undefined && id !== null) replyError(id, -32601, "Method not found");
   }
 }
 

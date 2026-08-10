@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -34,22 +35,27 @@ const SOURCE_META = {
   all: { label: "Todos", color: colors.cyan },
   claude: { label: "Claude", color: colors.magenta },
   codex: { label: "Codex", color: colors.green },
-  gemini: { label: "Gemini", color: colors.blue },
+  gemini: { label: "Gemini · Agy", color: colors.blue },
   antigravity: { label: "Antigravity", color: colors.yellow },
   minimax: { label: "MiniMax", color: colors.cyan },
   opencode: { label: "OpenCode", color: colors.green },
 };
 
 const ALL_SOURCES = ["claude", "codex", "gemini", "opencode"];
-const SOURCE_KEYS = ["all", "claude", "codex", "gemini", "antigravity", "minimax", "opencode"];
+const SOURCE_KEYS = ["all", "claude", "codex", "gemini", "minimax", "opencode"];
 // Orden de las tarjetas del grid de cuotas (drill-down con flechas + enter).
-const PROVIDER_ORDER = ["claude", "codex", "gemini", "antigravity", "minimax", "opencode"];
+// Gemini ya se mide por Agy/OAuth en esta instalacion. Antigravity sigue siendo la fuente
+// interna, pero no aparece como un segundo proveedor porque duplicaria la misma cuota.
+const PROVIDER_ORDER = ["claude", "codex", "gemini", "minimax", "opencode"];
+// Inventario de colectores, independiente de lo que el TUI decide mostrar. Agy/Antigravity
+// sigue alimentando Gemini aunque no tenga una tarjeta duplicada en PROVIDER_ORDER.
+const ACCOUNT_PROVIDER_ORDER = ["claude", "codex", "gemini", "antigravity", "minimax", "opencode"];
 // Metadata visual de cada proveedor para el grid/detalle de cuotas.
 // Iconos single-width (NO emojis doble-ancho) para que no descuadren el TUI.
 const PROVIDER_META = {
   claude: { label: "Claude", color: colors.magenta, icon: "\u2726" },
   codex: { label: "Codex", color: colors.green, icon: "\u2B21" },
-  gemini: { label: "Gemini", color: colors.blue, icon: "\u25C8" },
+  gemini: { label: "Gemini · Agy", color: colors.blue, icon: "\u25C8" },
   antigravity: { label: "Antigravity", color: colors.yellow, icon: "\u25C6" },
   minimax: { label: "MiniMax", color: colors.cyan, icon: "\u25B0" },
   opencode: { label: "OpenCode", color: colors.blue, icon: "\u26C1" },
@@ -114,13 +120,15 @@ let displayConfig = { hideUnusable: true, hiddenProviders: [], hiddenModels: [] 
 const INVOKED_DIRECTLY =
   Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
-if (INVOKED_DIRECTLY) {
-  main().catch((error) => {
-    cleanup();
-    console.error(error?.stack || String(error));
-    process.exit(1);
-  });
-}
+// El arranque (llamar a main()) se dispara al FINAL del archivo, no aca: aca solo se
+// calcula el flag. main() llega sincronicamente (antes de su primer await) hasta
+// resolveAllAccounts()/inspectAccountCredential(), que leen consts de modulo declaradas
+// mas abajo (DEFAULT_ACCOUNT_ID, PLACEHOLDER_TOKEN_RE, ACCOUNT_BLOCKING_STATUSES, etc. —
+// la infraestructura de cuentas). Si el arranque quedara aca, esas consts seguirian en su
+// TDZ (la evaluacion del modulo todavia no llego a esas lineas) y CUALQUIER ejecucion
+// directa (`node ai-usage-tui.mjs`, `--once`, `--json`, la TUI interactiva) reventaria con
+// "ReferenceError: Cannot access '<CONST>' before initialization" antes de imprimir nada
+// (verificado: se reproduce siempre, de forma determinista, no es intermitente).
 
 async function main() {
   ccusageCommand = detectCcusage();
@@ -163,11 +171,15 @@ function parseArgs(argv) {
     else if (arg === "--source") parsed.source = argv[++i];
     else if (VIEW_KEYS.includes(arg)) parsed.view = arg;
     else if (SOURCE_KEYS.includes(arg)) parsed.source = arg;
+    else if (arg === "antigravity") parsed.source = "gemini";
     else if (arg === "-h" || arg === "--help") {
       printHelp();
       process.exit(0);
     }
   }
+  // Compatibilidad: scripts viejos pueden seguir pasando --source antigravity, pero la
+  // interfaz lo concilia bajo el unico nombre que usa el operador: Gemini · Agy.
+  if (parsed.source === "antigravity") parsed.source = "gemini";
   if (!VIEW_KEYS.includes(parsed.view ?? "daily")) parsed.view = "daily";
   if (!SOURCE_KEYS.includes(parsed.source ?? "all")) parsed.source = "all";
   if (!Number.isFinite(parsed.refreshSec) || parsed.refreshSec < 2) parsed.refreshSec = 10;
@@ -183,7 +195,7 @@ Views:
   daily, weekly, monthly, session, blocks
 
 Sources:
-  all, claude, codex, gemini, antigravity, minimax, opencode
+  all, claude, codex, gemini (via Agy), minimax, opencode
 
 Opciones:
   --since YYYY-MM-DD
@@ -194,7 +206,7 @@ Opciones:
 
 Teclas:
   q salir, r refrescar, 1 daily, 2 weekly, 3 monthly, 4 session, 5 blocks
-  a todos, c Claude, x Codex, g Gemini, v Antigravity, m MiniMax, o OpenCode, flechas mover modelo
+  a todos, c Claude, x Codex, g/v Gemini · Agy, m MiniMax, o OpenCode, flechas mover modelo
   h ocultar proveedor/modelo seleccionado, H ver/gestionar ocultos (cuotas)
 `);
 }
@@ -268,41 +280,50 @@ async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ig
   const sources = {};
   const view = state.view;
   const quotaConfig = loadQuotaConfig();
-  const liveQuotaPromise = includeLive
-    ? Promise.allSettled([
-        collectClaudeUsageLive(quotaConfig.claude, { ignoreCache: ignoreLiveCache }),
-        collectAntigravityQuotaLive(quotaConfig.antigravity, { ignoreCache: ignoreLiveCache }),
-        collectGeminiQuotaLive(quotaConfig.gemini, { ignoreCache: ignoreLiveCache }),
-      ])
-    : Promise.resolve([
-        {
-          status: "fulfilled",
-          value: staleLiveQuota(
-            "claude",
-            CLAUDE_USAGE_CACHE_PATH,
-            "Claude /usage se esta capturando; mostrando ultimo dato conocido.",
-            "Claude /usage se esta capturando en segundo plano.",
-          ),
-        },
-        {
-          status: "fulfilled",
-          value: staleLiveQuota(
-            "antigravity",
-            ANTIGRAVITY_QUOTA_CACHE_PATH,
-            "Antigravity quota se esta capturando; mostrando ultimo dato conocido.",
-            "Antigravity quota se esta capturando en segundo plano.",
-          ),
-        },
-        {
-          status: "fulfilled",
-          value: staleLiveQuota(
-            "gemini",
-            GEMINI_QUOTA_CACHE_PATH,
-            "Gemini /stats model se esta capturando; mostrando ultimo dato conocido.",
-            "Gemini /stats model se esta capturando en segundo plano.",
-          ),
-        },
-      ]);
+  // Cuentas resueltas UNA vez por snapshot: la validacion, el preflight de credenciales
+  // y la herencia de defaults se hacen aqui, no dentro de cada colector.
+  const accounts = resolveAllAccounts(quotaConfig);
+  const staleNote = (base) => (reason) => (reason ? `${base} (${reason})` : base);
+  // El paralelismo ENTRE proveedores no cambia; lo que cambia es que dentro de cada
+  // rama las cuentas se recorren en serie con presupuesto.
+  const liveQuotaPromise = Promise.allSettled([
+    collectProviderAccountsLive("claude", accounts.claude, {
+      includeLive,
+      ignoreCache: ignoreLiveCache,
+      cacheSuffix: "usage-cache",
+      run: (account, opts) => collectClaudeUsageLive(account.config, { ...opts, account }),
+      stale: (account, reason) => staleLiveQuota(
+        "claude",
+        accountCachePath(account, "usage-cache"),
+        staleNote("Claude /usage se esta capturando; mostrando ultimo dato conocido.")(reason),
+        staleNote("Claude /usage se esta capturando en segundo plano.")(reason),
+      ),
+    }),
+    collectProviderAccountsLive("antigravity", accounts.antigravity, {
+      includeLive,
+      ignoreCache: ignoreLiveCache,
+      cacheSuffix: "quota-cache",
+      run: (account, opts) => collectAntigravityQuotaLive(account.config, { ...opts, account }),
+      stale: (account, reason) => staleLiveQuota(
+        "antigravity",
+        accountCachePath(account, "quota-cache"),
+        staleNote("Antigravity quota se esta capturando; mostrando ultimo dato conocido.")(reason),
+        staleNote("Antigravity quota se esta capturando en segundo plano.")(reason),
+      ),
+    }),
+    collectProviderAccountsLive("gemini", accounts.gemini, {
+      includeLive,
+      ignoreCache: ignoreLiveCache,
+      cacheSuffix: "quota-cache",
+      run: (account, opts) => collectGeminiQuotaLive(account.config, { ...opts, account }),
+      stale: (account, reason) => staleLiveQuota(
+        "gemini",
+        accountCachePath(account, "quota-cache"),
+        staleNote("Gemini /stats model se esta capturando; mostrando ultimo dato conocido.")(reason),
+        staleNote("Gemini /stats model se esta capturando en segundo plano.")(reason),
+      ),
+    }),
+  ]);
 
   const ccusageJobs = [];
   const ccOpts = { ignoreCache: ignoreLiveCache };
@@ -327,26 +348,52 @@ async function collectSnapshot({ includeLive = true, ignoreLiveCache = false, ig
 
   fillFocusedModelGaps(sources);
   sources.antigravity = collectAntigravity();
-  sources.minimax = includeLive
-    ? await collectMiniMaxUsage(quotaConfig, { ignoreCache: ignoreMiniMaxCache })
-    : staleMiniMaxUsage("MiniMax se esta capturando; mostrando ultimo dato conocido.")
-      || { source: "minimax", ok: false, note: "MiniMax se esta capturando en segundo plano." };
-  sources.opencodeLive = includeLive
-    ? await collectOpenCodeUsage(quotaConfig, { ignoreCache: ignoreLiveCache || ignoreMiniMaxCache })
-    : staleOpenCodeUsage("OpenCode Go se esta capturando; mostrando ultimo dato conocido.")
-      || { source: "opencode", ok: false, note: "OpenCode Go se esta capturando en segundo plano." };
+  sources.minimaxAccounts = await collectProviderAccountsLive("minimax", accounts.minimax, {
+    includeLive,
+    ignoreCache: ignoreMiniMaxCache,
+    cacheSuffix: "usage-cache",
+    run: (account, opts) => collectMiniMaxUsage(quotaConfig, { ...opts, account }),
+    stale: (account) => staleCachedUsage(
+      "minimax",
+      accountCachePath(account, "usage-cache"),
+      "MiniMax se esta capturando; mostrando ultimo dato conocido.",
+      "MiniMax se esta capturando en segundo plano.",
+    ),
+  });
+  sources.minimax = primaryAccountLive(sources.minimaxAccounts, { source: "minimax", ok: false });
+  sources.opencodeAccounts = await collectProviderAccountsLive("opencode", accounts.opencode, {
+    includeLive,
+    ignoreCache: ignoreLiveCache || ignoreMiniMaxCache,
+    cacheSuffix: "usage-cache",
+    run: (account, opts) => collectOpenCodeUsage(quotaConfig, { ...opts, account }),
+    stale: (account) => staleCachedUsage(
+      "opencode",
+      accountCachePath(account, "usage-cache"),
+      "OpenCode Go se esta capturando; mostrando ultimo dato conocido.",
+      "OpenCode Go se esta capturando en segundo plano.",
+    ),
+  });
+  sources.opencodeLive = primaryAccountLive(sources.opencodeAccounts, { source: "opencode", ok: false });
   enrichUnifiedReasoning(sources);
   sources.opencodeServer = includeLive
     ? await collectOpenCodeServerUsage(quotaConfig.opencode, { ignoreCache: ignoreLiveCache || ignoreMiniMaxCache })
     : (readJsonSafe(OPENCODE_SERVER_CACHE_PATH) ? { ...readJsonSafe(OPENCODE_SERVER_CACHE_PATH), cacheHit: true, cacheStale: true } : { ok: false });
   const liveQuotaSettled = await liveQuotaPromise;
-  sources.claudeLive = liveQuotaSettled[0].status === "fulfilled" ? liveQuotaSettled[0].value : { ok: false };
-  sources.antigravityLive = liveQuotaSettled[1].status === "fulfilled" ? liveQuotaSettled[1].value : { ok: false };
-  sources.geminiLive = liveQuotaSettled[2].status === "fulfilled" ? liveQuotaSettled[2].value : { ok: false };
-  sources.codexLive = includeLive
-    ? await collectCodexLive(quotaConfig.codex, { ignoreCache: ignoreLiveCache })
-    : (readJsonSafe(CODEX_PROBE_CACHE_PATH) || { ok: false });
-  const quotas = buildQuotaState(sources, quotaConfig);
+  sources.claudeLiveAccounts = liveQuotaSettled[0].status === "fulfilled" ? liveQuotaSettled[0].value : [];
+  sources.antigravityLiveAccounts = liveQuotaSettled[1].status === "fulfilled" ? liveQuotaSettled[1].value : [];
+  sources.geminiLiveAccounts = liveQuotaSettled[2].status === "fulfilled" ? liveQuotaSettled[2].value : [];
+  sources.claudeLive = primaryAccountLive(sources.claudeLiveAccounts, { ok: false });
+  sources.antigravityLive = primaryAccountLive(sources.antigravityLiveAccounts, { ok: false });
+  sources.geminiLive = primaryAccountLive(sources.geminiLiveAccounts, { ok: false });
+  sources.codexLiveAccounts = await collectProviderAccountsLive("codex", accounts.codex, {
+    includeLive,
+    ignoreCache: ignoreLiveCache,
+    cacheSuffix: "probe-cache",
+    run: (account, opts) => collectCodexLive(account.config, { ...opts, account }),
+    stale: (account) => readJsonSafe(accountCachePath(account, "probe-cache")) || { ok: false },
+  });
+  sources.codexLive = primaryAccountLive(sources.codexLiveAccounts, { ok: false });
+  const quotas = buildQuotaState(sources, quotaConfig, accounts);
 
   return {
     view,
@@ -373,6 +420,199 @@ function staleLiveQuota(source, cachePath, cacheNote, emptyNote) {
     };
   }
   return { source, ok: false, note: emptyNote };
+}
+
+// Usada por los `stale:` callback de MiniMax/OpenCode (proveedores de "usage" cacheado, no
+// de "quota en vivo"): mismo shape/comportamiento que staleLiveQuota (cache-hit -> datos
+// viejos marcados stale; sin cache -> {ok:false, note}). Nombre propio solo para que cada
+// call-site sea autoexplicativo sobre que tipo de dato esta sirviendo.
+function staleCachedUsage(source, cachePath, cacheNote, emptyNote) {
+  return staleLiveQuota(source, cachePath, cacheNote, emptyNote);
+}
+
+// ---------------------------------------------------------------------------
+// Planificador de capturas vivas por cuenta.
+//
+// COSTO: claude /usage, agy /usage y gemini /stats abren un CLI COMPLETO (30-45 s) y el
+// tools/call del MCP BLOQUEA sobre el snapshot. Con N cuentas en paralelo se dispararia
+// la latencia del hook y el auto-throttle de /usage. Reglas:
+//   (a) las cuentas del MISMO proveedor se capturan EN SERIE (el paralelismo ENTRE
+//       proveedores no cambia);
+//   (b) presupuesto de 1 captura viva por refresh para proveedores pesados, eligiendo la
+//       cuenta menos reciente (LRU); las demas se sirven de SU cache marcadas stale.
+// Con UNA cuenta el presupuesto es infinito -> comportamiento identico al de siempre.
+// ---------------------------------------------------------------------------
+
+function providerLiveTtlMs(provider, config = {}) {
+  switch (provider) {
+    case "claude":
+      return Math.max(0, Number(config.liveUsageCacheSeconds ?? 300)) * 1000;
+    case "codex": {
+      const legacyMinutes = Number(process.env.CODEX_PROBE_CACHE_MINUTES ?? config.probeCacheMinutes ?? 1);
+      return Math.max(0, Number(process.env.CODEX_USAGE_CACHE_SECONDS ?? config.liveUsageCacheSeconds ?? legacyMinutes * 60)) * 1000;
+    }
+    case "gemini":
+      return Math.max(0, Number(config.liveCaptureCacheMinutes ?? 15)) * 60000;
+    case "antigravity":
+      return Math.max(0, Number(process.env.ANTIGRAVITY_USAGE_CACHE_MINUTES ?? config.liveCaptureCacheMinutes ?? 3)) * 60000;
+    case "minimax":
+      return Math.max(0, Number(process.env.MINIMAX_USAGE_CACHE_MINUTES ?? config.liveCaptureCacheMinutes ?? 0)) * 60000;
+    case "opencode":
+      return Math.max(0, Number(process.env.OPENCODE_USAGE_CACHE_MINUTES ?? config.liveCaptureCacheMinutes ?? 5)) * 60000;
+    default:
+      return 0;
+  }
+}
+
+function liveAccountBudget(provider, resolved, { ignoreCache = false } = {}) {
+  if (!resolved?.multi) return Infinity;
+  if (ignoreCache) return Infinity; // refresh manual explicito: el humano pidio todo
+  const fromEnv = Number(process.env.AI_USAGE_PROBE_BUDGET);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  const configured = Number(resolved.accounts[0]?.config?.maxLiveAccountsPerRefresh);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  return HEAVY_PROBE_PROVIDERS.has(provider) ? 1 : Infinity;
+}
+
+function readAccountSched(account) {
+  return readJsonSafe(accountCachePath(account, "sched")) || {};
+}
+
+function writeAccountSched(account, patch) {
+  const current = readAccountSched(account);
+  writeJsonCache(accountCachePath(account, "sched"), { ...current, ...patch });
+}
+
+// Backoff exponencial acotado: tras fallos consecutivos la cuenta deja de consumir
+// presupuesto (y de colgarse 30 s por refresh) hasta que toque su turno o el humano
+// pida un refresh manual con ignoreCache.
+function accountBackoffMs(failureCount) {
+  const n = Math.max(0, Number(failureCount) || 0);
+  if (!n) return 0;
+  return Math.min(5 * 60000 * 2 ** (n - 1), 6 * 3600000);
+}
+
+function blockedAccountLive(provider, account) {
+  const status = account.duplicateOf
+    ? "duplicate"
+    : account.enabled === false
+      ? "disabled"
+      : account.health?.status || "unknown";
+  const notes = {
+    duplicate: `Cuenta ignorada: apunta a la misma suscripcion que "${account.duplicateOf}".`,
+    disabled: "Cuenta deshabilitada en quotas.json (enabled:false).",
+    unauthenticated: `Cuenta sin credencial usable: ${account.health?.detail || "sin credenciales"}.`,
+    "credential-broken": `Credencial rota: ${account.health?.detail || "token invalido"}.`,
+    "credential-expired": `Credencial vencida: ${account.health?.detail || "token vencido"}.`,
+  };
+  return {
+    source: provider,
+    ok: false,
+    unusable: true,
+    reason: status === "unauthenticated" ? "unauthenticated" : "not-configured",
+    needsAuth: status === "unauthenticated" || status === "credential-broken" || status === "credential-expired",
+    accountBlocked: true,
+    accountStatus: status,
+    note: notes[status] || `Cuenta no utilizable (${status}).`,
+  };
+}
+
+async function collectProviderAccountsLive(provider, resolved, {
+  includeLive = true,
+  ignoreCache = false,
+  run,
+  stale,
+  cacheSuffix,
+} = {}) {
+  const accounts = resolved?.accounts || [];
+  const results = new Map();
+  const wrap = (account, live) => ({
+    accountId: account.id,
+    account,
+    provider,
+    label: account.label,
+    priority: account.priority,
+    enabled: account.enabled,
+    blocked: Boolean(account.blocked),
+    health: account.health,
+    live,
+  });
+
+  if (!includeLive) {
+    // Rama del TUI interactivo: SOLO lecturas de disco, jamas un proceso pesado.
+    return accounts.map((account) => wrap(account, stale(account)));
+  }
+
+  const budget = liveAccountBudget(provider, resolved, { ignoreCache });
+  const now = Date.now();
+  const pending = [];
+  for (const account of accounts) {
+    if (account.blocked) {
+      // Preflight gratis: nunca gastamos un CLI de 30-45 s en una credencial rota.
+      results.set(account.id, wrap(account, blockedAccountLive(provider, account)));
+      continue;
+    }
+    const cachePath = accountCachePath(account, cacheSuffix);
+    const ttlMs = providerLiveTtlMs(provider, account.config);
+    const fresh = !ignoreCache && ttlMs > 0 && Boolean(readJsonCache(cachePath, ttlMs));
+    if (fresh) {
+      // El cache esta vigente: el colector lo devuelve sin lanzar nada, no gasta presupuesto.
+      results.set(account.id, wrap(account, await run(account, { ignoreCache: false })));
+      continue;
+    }
+    const sched = resolved.multi ? readAccountSched(account) : {};
+    const nextEligibleAt = Date.parse(sched.nextEligibleAt || "");
+    const throttled = !ignoreCache && Number.isFinite(nextEligibleAt) && nextEligibleAt > now;
+    const cached = readJsonSafe(cachePath);
+    const lastSeen = Math.max(
+      Date.parse(cached?.capturedAt || "") || 0,
+      Date.parse(sched.lastAttemptAt || "") || 0,
+    );
+    pending.push({ account, cachePath, lastSeen, throttled });
+  }
+
+  // LRU: la cuenta con la observacion mas vieja primero. Se autocorrige si un refresh
+  // muere a mitad del probe y una cuenta nueva (lastSeen 0) gana turno automaticamente.
+  pending.sort((a, b) => a.lastSeen - b.lastSeen);
+  let spent = 0;
+  for (const item of pending) {
+    const { account, cachePath, throttled } = item;
+    if (throttled || spent >= budget) {
+      results.set(account.id, wrap(account, stale(account, throttled ? "backoff" : "presupuesto")));
+      continue;
+    }
+    spent += 1;
+    // lastAttemptAt ANTES del probe: si el proceso muere o hay timeout, el proximo
+    // refresh no reintenta la misma cuenta en bucle cerrado.
+    if (resolved.multi) writeAccountSched(account, { lastAttemptAt: new Date().toISOString() });
+    let live;
+    try {
+      live = await run(account, { ignoreCache });
+    } catch (error) {
+      live = { source: provider, ok: false, note: `captura fallo: ${shortError(error)}` };
+    }
+    if (resolved.multi) {
+      const sched = readAccountSched(account);
+      const failureCount = live?.ok ? 0 : Math.max(0, Number(sched.failureCount) || 0) + 1;
+      writeAccountSched(account, {
+        failureCount,
+        lastSuccessAt: live?.ok ? new Date().toISOString() : sched.lastSuccessAt || null,
+        nextEligibleAt: failureCount
+          ? new Date(Date.now() + accountBackoffMs(failureCount)).toISOString()
+          : null,
+      });
+    }
+    void cachePath;
+    results.set(account.id, wrap(account, live));
+  }
+  return accounts.map((account) => results.get(account.id)).filter(Boolean);
+}
+
+// El primer elemento es la cuenta declarada primero: mantiene `sources.<p>Live` con
+// exactamente la misma forma que antes para todos los consumidores existentes.
+function primaryAccountLive(entries, fallback) {
+  const first = Array.isArray(entries) ? entries[0] : null;
+  return first?.live ?? fallback;
 }
 
 function sourceSupportsView(source, view) {
@@ -792,6 +1032,483 @@ function deepMerge(base, override, extra = {}) {
   return { ...output, ...extra };
 }
 
+// ===========================================================================
+// Multi-cuenta por proveedor (v0.13.0)
+//
+// MODELO: el proveedor sigue siendo la clave primaria de `providers`; las cuentas
+// son un nivel ANIDADO (providers[p].accounts[]). `accounts` es OPT-IN: si un
+// bloque de quotas.json no lo declara, resolveAccounts() materializa EN MEMORIA
+// una unica cuenta implicita "default" que no inyecta ninguna env var y usa las
+// rutas de cache historicas -> la salida es identica a la de antes del cambio.
+//
+// CREDENCIALES: quotas.json guarda REFERENCIAS, nunca valores.
+//   {kind:"configDir", path}  -> se inyecta como env var de aislamiento al CLI hijo
+//   {kind:"env",       var}   -> se lee process.env[var] solo al construir el header
+//   {kind:"legacy"}           -> apunta al campo inline preexistente del bloque
+// Nada de esto se serializa al output salvo {kind} y (para configDir) el path.
+// ===========================================================================
+
+const DEFAULT_ACCOUNT_ID = "default";
+// El id es componente de nombre de archivo de cache: sin sanear seria path traversal.
+const ACCOUNT_ID_RE = /^[a-z0-9][a-z0-9._-]{0,31}$/;
+const ACCOUNT_CREDENTIAL_KINDS = new Set(["legacy", "configDir", "env"]);
+
+// Env var que aisla la raiz de credenciales del CLI hijo de cada proveedor.
+// null = el proveedor no lanza un CLI aislable por env (credencial en proceso).
+const PROVIDER_ISOLATION_ENV = {
+  claude: "CLAUDE_CONFIG_DIR",
+  codex: "CODEX_HOME",
+  gemini: "GEMINI_CLI_HOME",
+  antigravity: null,
+  minimax: null,
+  opencode: null,
+};
+
+// Antigravity NO es aislable: su CLI fija la raiz en ~/.gemini/antigravity-cli y la
+// captura es scraping por PTY. Aceptar 2 cuentas leeria la MISMA credencial dos veces
+// y reportaria el mismo saldo con etiquetas distintas: datos falsos que parecen buenos.
+const PROVIDER_SUPPORTS_MULTI_ACCOUNT = {
+  claude: true,
+  codex: true,
+  gemini: true,
+  antigravity: false,
+  minimax: true,
+  opencode: true,
+};
+
+// Proveedores cuya captura viva abre un CLI/PTY completo (30-45 s). Se raciona con
+// presupuesto por refresh para que N cuentas no multipliquen la latencia del hook.
+const HEAVY_PROBE_PROVIDERS = new Set(["claude", "gemini", "antigravity"]);
+
+// Sufijo historico del archivo de cache de cada proveedor. providerCachePath() los
+// reproduce EXACTAMENTE para la cuenta "default", asi que actualizar no invalida
+// ningun cache existente ni obliga a migrar archivos.
+const PROVIDER_CACHE_SUFFIX = {
+  claude: "usage-cache",
+  gemini: "quota-cache",
+  minimax: "usage-cache",
+  opencode: "usage-cache",
+  antigravity: "quota-cache",
+  codex: "probe-cache",
+};
+
+function accountSlug(id) {
+  const raw = String(id ?? "");
+  if (ACCOUNT_ID_RE.test(raw)) return raw;
+  // Defensa en profundidad: la validacion de config ya rechaza ids invalidos, pero un
+  // id que llegue por otra via nunca debe convertirse en un componente de ruta.
+  return `x${sha256Hex(raw).slice(0, 12)}`;
+}
+
+function providerCachePath(provider, accountId, suffix) {
+  const id = accountId || DEFAULT_ACCOUNT_ID;
+  const slug = id === DEFAULT_ACCOUNT_ID ? "" : `-${accountSlug(id)}`;
+  return path.join(CONFIG_DIR, `${provider}${slug}-${suffix}.json`);
+}
+
+function accountCachePath(account, suffix) {
+  const provider = account?.provider || "provider";
+  return providerCachePath(provider, account?.id, suffix || PROVIDER_CACHE_SUFFIX[provider] || "cache");
+}
+
+// Entorno del proceso hijo para una cuenta. Para la cuenta implicita "default" (o
+// cualquier credencial legacy) devuelve `undefined`: execFile recibe exactamente las
+// mismas opciones que antes del cambio, sin tocar el entorno.
+function accountEnv(account, extra = null) {
+  const envVar = PROVIDER_ISOLATION_ENV[account?.provider];
+  const isolate = envVar && account?.credential?.kind === "configDir" && account.credential.path;
+  if (!isolate && !extra) return undefined;
+  const env = { ...process.env, ...(extra || {}) };
+  if (isolate) env[envVar] = account.credential.path;
+  return env;
+}
+
+function sha256Hex(value) {
+  return createHash("sha256").update(String(value ?? "")).digest("hex");
+}
+
+function credentialFingerprint(value) {
+  if (!value) return null;
+  return sha256Hex(value).slice(0, 12);
+}
+
+function normalizeAccountCredential(provider, raw) {
+  if (!raw || typeof raw !== "object") return { kind: "legacy" };
+  const kind = String(raw.kind || "legacy");
+  if (!ACCOUNT_CREDENTIAL_KINDS.has(kind)) return null;
+  if (kind === "configDir") {
+    const dir = typeof raw.path === "string" ? raw.path.trim() : "";
+    if (!dir) return null;
+    return { kind, path: dir };
+  }
+  if (kind === "env") {
+    const name = typeof raw.var === "string" ? raw.var.trim() : "";
+    if (!name) return null;
+    return { kind, var: name };
+  }
+  return { kind: "legacy" };
+}
+
+// --- Preflight de credencial: clasifica la salud de una cuenta SIN lanzar un CLI. ---
+// Es el mayor ahorro disponible: descarta raices rotas (accessToken vacio o el literal
+// "[REDACTED-...]") antes de gastar un proceso de 30-45 s, y se re-evalua gratis.
+// "credential-expired" (access+refresh ambos vencidos, ver inspectClaudeAccountRoot) tambien
+// bloquea: sin esto, una cuenta con ambos tokens muertos igual gastaba un CLI de 30-45s por
+// refresh (y encima fallaba) en vez de fallar gratis via preflight, como las otras 2 causas.
+const ACCOUNT_BLOCKING_STATUSES = new Set(["unauthenticated", "credential-broken", "credential-expired"]);
+const PLACEHOLDER_TOKEN_RE = /^\s*(\[[^\]]*\]|<[^>]*>|redacted|changeme|todo|null|none)\s*$/i;
+
+function inspectClaudeAccountRoot(dir, { ambient = false } = {}) {
+  const credPath = path.join(dir, ".credentials.json");
+  if (!existsSync(credPath)) {
+    return { status: "unauthenticated", detail: "sin .credentials.json en la raiz declarada" };
+  }
+  const data = readJsonSafe(credPath);
+  const oauth = data?.claudeAiOauth && typeof data.claudeAiOauth === "object" ? data.claudeAiOauth : null;
+  if (!oauth) return { status: "credential-broken", detail: ".credentials.json sin bloque claudeAiOauth" };
+  const token = typeof oauth.accessToken === "string" ? oauth.accessToken.trim() : "";
+  if (!token) return { status: "credential-broken", detail: "accessToken vacio" };
+  if (PLACEHOLDER_TOKEN_RE.test(token)) {
+    return { status: "credential-broken", detail: "accessToken es un marcador, no un token real" };
+  }
+  const identity = readJsonSafe(path.join(dir, ".claude.json"))
+    || (ambient ? readJsonSafe(path.join(homedir(), ".claude.json")) : null);
+  const oauthAccount = identity?.oauthAccount || {};
+  const expiresAt = Number(oauth.expiresAt);
+  const refreshExpiresAt = Number(oauth.refreshTokenExpiresAt);
+  const hasRefresh = Boolean(oauth.refreshToken);
+  let status = "ok";
+  let detail = "";
+  if (Number.isFinite(expiresAt) && expiresAt > 0 && expiresAt <= Date.now()) {
+    const refreshDead = !hasRefresh
+      || (Number.isFinite(refreshExpiresAt) && refreshExpiresAt > 0 && refreshExpiresAt <= Date.now());
+    // Con refreshToken vivo el CLI renueva solo: no es un fallo, no bloquea el probe.
+    status = refreshDead ? "credential-expired" : "ok";
+    detail = refreshDead ? "accessToken y refreshToken vencidos" : "accessToken vencido; el CLI lo renovara";
+  }
+  return {
+    status,
+    detail,
+    plan: typeof oauth.subscriptionType === "string" ? oauth.subscriptionType : null,
+    // Fingerprint irreversible del accountUuid: sirve para detectar dos raices que
+    // apuntan a la MISMA suscripcion (dedupe) sin exponer el uuid ni el email.
+    identityFingerprint: oauthAccount.accountUuid ? credentialFingerprint(oauthAccount.accountUuid) : null,
+    expiresAt: Number.isFinite(expiresAt) && expiresAt > 0 ? new Date(expiresAt).toISOString() : null,
+  };
+}
+
+function inspectCodexAccountRoot(dir) {
+  const authPath = path.join(dir, "auth.json");
+  if (!existsSync(authPath)) return { status: "unauthenticated", detail: "sin auth.json en la raiz declarada" };
+  const data = readJsonSafe(authPath);
+  if (!data) return { status: "credential-broken", detail: "auth.json no parsea" };
+  const tokens = data.tokens && typeof data.tokens === "object" ? data.tokens : {};
+  const apiKey = typeof data.OPENAI_API_KEY === "string" ? data.OPENAI_API_KEY.trim() : "";
+  const accessToken = typeof tokens.access_token === "string" ? tokens.access_token.trim() : "";
+  const refreshToken = typeof tokens.refresh_token === "string" ? tokens.refresh_token.trim() : "";
+  if (!apiKey && !accessToken && !refreshToken) {
+    return { status: "credential-broken", detail: "auth.json sin tokens ni OPENAI_API_KEY" };
+  }
+  if (accessToken && PLACEHOLDER_TOKEN_RE.test(accessToken)) {
+    return { status: "credential-broken", detail: "access_token es un marcador, no un token real" };
+  }
+  const accountId = tokens.account_id || tokens.accountId || null;
+  return {
+    status: "ok",
+    detail: "",
+    authMode: data.auth_mode || (apiKey && !accessToken ? "apikey" : "oauth"),
+    identityFingerprint: accountId ? credentialFingerprint(accountId) : null,
+  };
+}
+
+function inspectGeminiAccountRoot(dir) {
+  const candidates = ["oauth_creds.json", "google_accounts.json", "settings.json"];
+  const found = candidates.find((name) => existsSync(path.join(dir, name)));
+  if (!found) return { status: "unauthenticated", detail: "sin credenciales de gemini-cli en la raiz declarada" };
+  return { status: "ok", detail: "" };
+}
+
+function inspectAccountCredential(provider, credential, { implicit = false } = {}) {
+  const kind = credential?.kind || "legacy";
+  if (kind === "env") {
+    const name = credential.var;
+    const value = process.env[name];
+    if (value === undefined || String(value).trim() === "") {
+      return { status: "unauthenticated", detail: `${name} sin valor en el entorno`, credentialRef: name };
+    }
+    return {
+      status: "ok",
+      detail: `${name} presente`,
+      credentialRef: name,
+      identityFingerprint: credentialFingerprint(value),
+    };
+  }
+  if (kind === "configDir") {
+    const dir = credential.path;
+    if (!existsSync(dir)) {
+      return { status: "unauthenticated", detail: "el directorio de credenciales no existe", credentialRef: dir };
+    }
+    let inspected;
+    if (provider === "claude") inspected = inspectClaudeAccountRoot(dir, { ambient: implicit });
+    else if (provider === "codex") inspected = inspectCodexAccountRoot(dir);
+    else if (provider === "gemini") inspected = inspectGeminiAccountRoot(dir);
+    else inspected = { status: "unknown", detail: "" };
+    return { ...inspected, credentialRef: dir };
+  }
+  // legacy: comportamiento historico. Nunca bloquea el probe (status "unknown"), pero
+  // reporta identidad best-effort para que el TUI/agente vea de que cuenta se trata.
+  if (provider === "claude") {
+    const ambientDir = process.env.CLAUDE_CONFIG_DIR || path.join(homedir(), ".claude");
+    const probe = existsSync(ambientDir)
+      ? inspectClaudeAccountRoot(ambientDir, { ambient: true })
+      : { status: "unknown", detail: "" };
+    return { ...probe, status: "unknown", observedStatus: probe.status, credentialRef: "ambiente" };
+  }
+  if (provider === "codex") {
+    const ambientDir = process.env.CODEX_HOME || path.join(homedir(), ".codex");
+    const probe = existsSync(ambientDir) ? inspectCodexAccountRoot(ambientDir) : { status: "unknown", detail: "" };
+    return { ...probe, status: "unknown", observedStatus: probe.status, credentialRef: "ambiente" };
+  }
+  return { status: "unknown", detail: "", credentialRef: "ambiente" };
+}
+
+// Umbrales de alerta con herencia cuenta > proveedor > raiz. Por defecto TODOS son
+// null (alertas apagadas) para que la salida en modo legacy siga siendo identica.
+function resolveAlertThresholds(...layers) {
+  const out = {
+    warnBelowPercent: null,
+    criticalBelowPercent: null,
+    notifyOnLimited: false,
+    notifyOnBrokenCredential: true,
+  };
+  for (const layer of layers) {
+    if (!layer || typeof layer !== "object") continue;
+    for (const key of Object.keys(out)) {
+      if (layer[key] === undefined || layer[key] === null) continue;
+      out[key] = typeof out[key] === "boolean" ? Boolean(layer[key]) : Number(layer[key]);
+    }
+  }
+  return out;
+}
+
+function implicitAccount(provider, providerConfig, rootConfig) {
+  const credential = { kind: "legacy" };
+  const health = inspectAccountCredential(provider, credential, { implicit: true });
+  return {
+    provider,
+    id: DEFAULT_ACCOUNT_ID,
+    label: PROVIDER_META[provider]?.label || provider,
+    enabled: true,
+    priority: 0,
+    implicit: true,
+    credential,
+    config: { ...(providerConfig || {}) },
+    alerts: resolveAlertThresholds(rootConfig?.alerts, providerConfig?.alerts),
+    health,
+  };
+}
+
+/**
+ * Resuelve la lista de cuentas de un proveedor.
+ * Fail-safe: cualquier error de configuracion cae a MODO LEGACY (una cuenta implicita)
+ * y se reporta en configErrors[]; nunca se adivina ni se falla en silencio.
+ */
+function resolveAccounts(provider, providerConfig = {}, rootConfig = {}) {
+  const configErrors = [];
+  const raw = Array.isArray(providerConfig?.accounts) ? providerConfig.accounts : [];
+  const legacyMode = (error) => {
+    if (error) configErrors.push(error);
+    return { accounts: [implicitAccount(provider, providerConfig, rootConfig)], multi: false, configErrors };
+  };
+  if (!raw.length) return legacyMode(null);
+  if (PROVIDER_SUPPORTS_MULTI_ACCOUNT[provider] === false && raw.length > 1) {
+    return legacyMode(
+      `${provider} no soporta multiples cuentas: su CLI fija la raiz de credenciales en el HOME. Usando modo legacy.`,
+    );
+  }
+
+  // `accounts` no hereda por deepMerge (los arrays se sobrescriben enteros): la herencia
+  // de los defaults del bloque del proveedor se hace explicitamente aqui.
+  const inherited = { ...(providerConfig || {}) };
+  delete inherited.accounts;
+  delete inherited.alerts;
+
+  const accounts = [];
+  const seenIds = new Set();
+  let legacyClaims = 0;
+  for (let index = 0; index < raw.length; index += 1) {
+    const entry = raw[index];
+    if (!entry || typeof entry !== "object") {
+      return legacyMode(`${provider}.accounts[${index}] no es un objeto.`);
+    }
+    const id = typeof entry.id === "string" ? entry.id.trim() : "";
+    if (!ACCOUNT_ID_RE.test(id) || id === "." || id === "..") {
+      return legacyMode(
+        `${provider}.accounts[${index}].id invalido (se exige ^[a-z0-9][a-z0-9._-]{0,31}$, sin separadores de ruta).`,
+      );
+    }
+    if (seenIds.has(id)) return legacyMode(`${provider}.accounts: el id "${id}" esta duplicado.`);
+    seenIds.add(id);
+    const credential = normalizeAccountCredential(provider, entry.credential);
+    if (!credential) return legacyMode(`${provider}.accounts[${index}].credential invalida o incompleta.`);
+    if (credential.kind === "configDir" && !PROVIDER_ISOLATION_ENV[provider]) {
+      return legacyMode(
+        `${provider} no admite credential.kind="configDir": no expone una env var que aisle su raiz.`,
+      );
+    }
+    if (credential.kind === "legacy") legacyClaims += 1;
+    const overrides = { ...entry };
+    for (const key of ["id", "label", "enabled", "priority", "credential", "alerts"]) delete overrides[key];
+    const config = { ...inherited, ...overrides };
+    const health = inspectAccountCredential(provider, credential, { implicit: false });
+    accounts.push({
+      provider,
+      id,
+      label: typeof entry.label === "string" && entry.label.trim() ? entry.label.trim() : id,
+      enabled: entry.enabled !== false,
+      priority: Number.isFinite(Number(entry.priority)) ? Number(entry.priority) : 0,
+      implicit: false,
+      credential,
+      config,
+      alerts: resolveAlertThresholds(rootConfig?.alerts, providerConfig?.alerts, entry.alerts),
+      health,
+    });
+  }
+  if (legacyClaims > 1) {
+    return legacyMode(
+      `${provider}.accounts: dos cuentas reclaman credential.kind="legacy" y no se puede adivinar cual usa el campo inline.`,
+    );
+  }
+
+  // DEDUPE: dos raices que resuelven a la MISMA suscripcion son UNA cuenta. Agregarlas
+  // como rutas alternativas duplicaria la capacidad aparente (el fallo mas caro posible
+  // porque es silencioso y en la direccion peligrosa).
+  const byFingerprint = new Map();
+  for (const account of accounts) {
+    const fingerprint = account.health?.identityFingerprint;
+    if (!fingerprint) continue;
+    if (byFingerprint.has(fingerprint)) {
+      account.duplicateOf = byFingerprint.get(fingerprint);
+      configErrors.push(
+        `${provider}.accounts: "${account.id}" apunta a la misma suscripcion que "${account.duplicateOf}"; se ignora para el agregado.`,
+      );
+    } else {
+      byFingerprint.set(fingerprint, account.id);
+    }
+  }
+
+  for (const account of accounts) {
+    const status = account.health?.status;
+    account.blocked = Boolean(account.duplicateOf)
+      || account.enabled === false
+      || ACCOUNT_BLOCKING_STATUSES.has(status);
+  }
+  return { accounts, multi: accounts.length > 1, configErrors };
+}
+
+function resolveAllAccounts(config) {
+  const out = {};
+  for (const provider of ACCOUNT_PROVIDER_ORDER) {
+    out[provider] = resolveAccounts(provider, config?.[provider] || {}, config || {});
+  }
+  return out;
+}
+
+// --- Agregacion entre cuentas -------------------------------------------------
+// Generaliza groupedQuotaAvailability() un nivel arriba: ventana -> grupo (MIN, AND)
+// -> cuenta (MAX entre grupos, ya existia) -> proveedor (MAX entre cuentas, nuevo).
+// Reutiliza availableGroups/limitingGroups porque es el MISMO concepto (rutas
+// alternativas abiertas/cerradas) y esos campos ya existen en el schema de salida.
+function aggregateAccountQuotas(entries) {
+  const availableGroups = [];
+  const limitingGroups = [];
+  const remains = [];
+  let considered = 0;
+  for (const entry of entries || []) {
+    const quota = entry?.quota;
+    // Una cuenta ROTA no es una cuenta AGOTADA: no debe arrastrar al proveedor a
+    // `limited`, o el hook publicaria "Claude AGOTADO" con las buenas intactas.
+    if (!quota || quota.ok === false || entry.blocked) continue;
+    considered += 1;
+    const remaining = finiteNumberOrNull(quota.effectiveRemainingPercent);
+    const isAvailable = quota.available === true
+      || (quota.limited !== true && remaining !== null && remaining > 0);
+    if (isAvailable) availableGroups.push(entry.accountId);
+    else if (quota.limited === true || (remaining !== null && remaining <= 0)) limitingGroups.push(entry.accountId);
+    if (remaining !== null) remains.push(remaining);
+  }
+  return {
+    available: availableGroups.length > 0,
+    limited: considered > 0 && availableGroups.length === 0 && limitingGroups.length > 0,
+    availableGroups,
+    limitingGroups,
+    // MAX y no suma: remainingPercent es un porcentaje POR CUENTA y sumar porcentajes
+    // entre cuentas es dimensionalmente invalido. MAX = "la mejor ruta unica abierta",
+    // que es justo la decision que toma el consumidor (un agente despacha a UNA cuenta).
+    effectiveRemainingPercent: remains.length ? Math.max(...remains) : null,
+  };
+}
+
+// Determinista para que el output sea estable entre refrescos:
+// 1o mayor effectiveRemainingPercent, 2o menor priority, 3o orden de declaracion.
+function selectAccountEntry(entries) {
+  const list = (entries || []).filter((entry) => entry && entry.quota);
+  if (!list.length) return null;
+  const usable = list.filter((entry) => !entry.blocked && entry.quota.ok !== false);
+  const pool = usable.length ? usable : list;
+  let best = pool[0];
+  for (const entry of pool.slice(1)) {
+    const candidate = finiteNumberOrNull(entry.quota.effectiveRemainingPercent);
+    const incumbent = finiteNumberOrNull(best.quota.effectiveRemainingPercent);
+    const candidateValue = candidate === null ? -1 : candidate;
+    const incumbentValue = incumbent === null ? -1 : incumbent;
+    if (candidateValue > incumbentValue) { best = entry; continue; }
+    if (candidateValue < incumbentValue) continue;
+    if (Number(entry.priority ?? 0) < Number(best.priority ?? 0)) best = entry;
+  }
+  return best;
+}
+
+/**
+ * Pliega N quotas por cuenta en el quota del proveedor.
+ * Con UNA sola cuenta devuelve el quota tal cual (identidad): ese es el mecanismo que
+ * garantiza que el modo legacy no cambie ni un byte.
+ */
+function foldProviderAccounts(entries) {
+  const list = (entries || []).filter(Boolean);
+  if (!list.length) return null;
+  if (list.length === 1) return list[0].quota;
+
+  const selected = selectAccountEntry(list) || list[0];
+  const base = selected.quota || {};
+  const aggregate = aggregateAccountQuotas(list);
+  // CRITICO: `windows` es la proyeccion de la cuenta SELECCIONADA, jamas la union.
+  // ai-usage-context.py hace min(remainingPercent) sobre providers[p].windows; con la
+  // union, una cuenta agotada publicaria "Claude 0%libre" teniendo otra al 80% libre.
+  const windows = (Array.isArray(base.windows) ? base.windows : [])
+    .map((window) => ({ ...window, accountId: selected.accountId }));
+  const folded = {
+    ...base,
+    windows,
+    available: aggregate.available,
+    limited: aggregate.limited,
+    availableGroups: aggregate.availableGroups,
+    limitingGroups: aggregate.limitingGroups,
+    effectiveRemainingPercent: aggregate.effectiveRemainingPercent,
+    selectedAccountId: selected.accountId,
+    accountCount: list.length,
+    accounts: list,
+  };
+  folded.ok = list.some((entry) => entry.quota?.ok !== false);
+  if (!aggregate.limited) delete folded.limitedRetry;
+  if (list.every((entry) => entry.quota?.needsAuth === true || entry.blocked)) folded.needsAuth = true;
+  else delete folded.needsAuth;
+  if (!aggregate.limited && Array.isArray(folded.limitingWindows) && !folded.limitingWindows.length) {
+    delete folded.limitingWindows;
+  }
+  return folded;
+}
+
 function conjunctiveQuotaAvailability(windows) {
   const numeric = (windows || []).filter((window) => finiteNumberOrNull(window.remainingPercent) !== null);
   const limitingWindows = numeric
@@ -931,15 +1648,57 @@ function annotateUnusable(quota, source) {
   return quota;
 }
 
-function buildQuotaState(sources, config) {
+/**
+ * Construye el quota final de UN proveedor plegando todas sus cuentas resueltas.
+ * `liveAccounts` es la lista que produce collectProviderAccountsLive() (forma
+ * {accountId, account, label, priority, blocked, health, live}); `fallbackLive` es
+ * el `sources.<p>Live`/`sources.<p>` historico, usado SOLO si la lista viene vacia
+ * (defensivo: un allSettled rechazado hoy deja `sources.<p>LiveAccounts = []`).
+ * `buildOne(entry)` arma el quota normalizado de esa cuenta con la MISMA firma que
+ * cada build<X>Quota ya usaba; con una sola cuenta (modo legacy, el 100% del parque
+ * hoy) foldProviderAccounts devuelve ese objeto SIN copiarlo, asi que el resto del
+ * pipeline (annotateUnusable, etc.) actua identico byte a byte al comportamiento previo.
+ */
+function foldedProviderQuota(liveAccounts, fallbackLive, buildOne) {
+  const source = Array.isArray(liveAccounts) && liveAccounts.length
+    ? liveAccounts
+    : [{ accountId: DEFAULT_ACCOUNT_ID, priority: 0, blocked: false, account: null, live: fallbackLive }];
+  const entries = source.map((entry) => ({
+    accountId: entry.accountId,
+    label: entry.label || entry.account?.label || entry.accountId,
+    priority: entry.priority,
+    blocked: Boolean(entry.blocked),
+    healthStatus: entry.health?.status || entry.account?.health?.status || null,
+    quota: buildOne(entry),
+  }));
+  return foldProviderAccounts(entries);
+}
+
+function buildQuotaState(sources, config, accounts = {}) {
+  // Cada builder recibe el config MERGEADO de SU cuenta (entry.account.config, que
+  // resolveAccounts ya arma como {...configDelProveedor, ...overridesDeLaCuenta}) en vez
+  // del config global del proveedor; para la cuenta implicita/legacy ambos son el MISMO
+  // contenido, asi que esto no cambia nada hoy y respeta overrides por cuenta el dia que
+  // alguien declare accounts[] con, p.ej., fiveHourTokens distintos por cuenta.
   const quotas = {
     configPath: config.configPath,
-    codex: buildCodexQuota(sources.codex, config.codex, sources.codexLive),
-    claude: buildClaudeQuota(sources.claude, sources.claudeBlocks, config.claude, sources.claudeLive),
-    gemini: buildGeminiQuota(sources.gemini, config.gemini, sources.geminiLive),
-    minimax: buildMiniMaxQuota(sources.minimax, config.minimax),
-    opencode: buildOpenCodeQuota(sources.opencodeLive, config.opencode, sources.opencodeServer),
-    antigravity: buildAntigravityQuota(sources.antigravity, config.antigravity, sources.antigravityLive),
+    codex: foldedProviderQuota(sources.codexLiveAccounts, sources.codexLive, (entry) =>
+      buildCodexQuota(sources.codex, entry.account?.config || config.codex, entry.live)),
+    claude: foldedProviderQuota(sources.claudeLiveAccounts, sources.claudeLive, (entry) =>
+      buildClaudeQuota(sources.claude, sources.claudeBlocks, entry.account?.config || config.claude, entry.live)),
+    gemini: foldedProviderQuota(sources.geminiLiveAccounts, sources.geminiLive, (entry) =>
+      buildGeminiQuota(sources.gemini, entry.account?.config || config.gemini, entry.live)),
+    // MiniMax no tiene un `usage` separado de la captura en vivo: `entry.live` ES el
+    // argumento `usage` que buildMiniMaxQuota siempre tomo (ver sources.minimax de antes).
+    minimax: foldedProviderQuota(sources.minimaxAccounts, sources.minimax, (entry) =>
+      buildMiniMaxQuota(entry.live, entry.account?.config || config.minimax)),
+    // opencodeServer (el override manual pegado por el usuario) sigue GLOBAL, no por
+    // cuenta: es una decision explicita, ver docs/multi-account (no hay señal de que
+    // deba variar por cuenta y opencodeServer no se captura por cuenta hoy).
+    opencode: foldedProviderQuota(sources.opencodeAccounts, sources.opencodeLive, (entry) =>
+      buildOpenCodeQuota(entry.live, entry.account?.config || config.opencode, sources.opencodeServer)),
+    antigravity: foldedProviderQuota(sources.antigravityLiveAccounts, sources.antigravityLive, (entry) =>
+      buildAntigravityQuota(sources.antigravity, entry.account?.config || config.antigravity, entry.live)),
   };
   // Propaga la razon de no-usable desde cada captura en vivo al quota final.
   annotateUnusable(quotas.claude, sources.claudeLive);
@@ -948,6 +1707,15 @@ function buildQuotaState(sources, config) {
   annotateUnusable(quotas.antigravity, sources.antigravityLive);
   annotateUnusable(quotas.minimax, sources.minimax);
   annotateUnusable(quotas.opencode, sources.opencodeLive);
+  // Errores de configuracion (id duplicado, credential invalida, proveedor sin soporte
+  // multi-cuenta, etc.) ya se calculan en resolveAccounts() pero hasta ahora se tiraban:
+  // se adjuntan al quota SOLO si hay alguno, para no tocar el output en el caso comun.
+  for (const provider of ["codex", "claude", "gemini", "minimax", "opencode", "antigravity"]) {
+    const errors = accounts?.[provider]?.configErrors;
+    if (Array.isArray(errors) && errors.length && quotas[provider]) {
+      quotas[provider].configErrors = errors;
+    }
+  }
   return quotas;
 }
 
@@ -961,10 +1729,9 @@ function fmtTimeInTz(date, tz) {
 }
 
 function parseCodexRetryTime(text) {
-  // Codex dice "try again at 5:43 AM" SIN zona ni fecha; formatea esa hora en la TZ LOCAL del
-  // host (aqui UTC). La parseamos en esa MISMA TZ local -> instante absoluto (proxima ocurrencia).
-  // Asi el countdown sale correcto y a prueba de zona: la web te lo muestra en TU hora, el CLI en
-  // la del host; el instante real es el mismo. Para mostrar tu hora local: fmtTimeInTz(date, tz).
+  // Codex dice "try again at 5:43 AM" SIN zona ni fecha desde el contenedor, cuya referencia es
+  // UTC. Construimos el instante explicitamente en UTC: usar setHours() lo reinterpretaba en la
+  // TZ de quien lanzara el test/TUI y desplazaba el retry al ejecutarlo desde la torre Bogota.
   const m = String(text || "").match(/(\d{1,2}):(\d{2})\s*([AP]M)?/i);
   if (!m) return null;
   let hour = Number(m[1]);
@@ -975,8 +1742,8 @@ function parseCodexRetryTime(text) {
   if (hour > 23 || min > 59) return null;
   const now = new Date();
   const d = new Date(now);
-  d.setHours(hour, min, 0, 0);
-  if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
+  d.setUTCHours(hour, min, 0, 0);
+  if (d.getTime() <= now.getTime()) d.setUTCDate(d.getUTCDate() + 1);
   return d;
 }
 
@@ -1739,7 +2506,11 @@ async function captureAntigravityUsage(config = {}) {
   }
 }
 
-async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false } = {}) {
+// NOTA: antigravity es SINGLE-ACCOUNT por diseno (resolveAccounts lo rechaza con >1
+// cuenta): su CLI fija la raiz en ~/.gemini/antigravity-cli y la captura es scraping por
+// PTY. Acepta `account` solo para que el runner generico lo llame igual que a los demas.
+async function collectAntigravityQuotaLive(config = {}, { ignoreCache = false, account = null } = {}) {
+  void account;
   // Cuota REAL del plan consumer de Antigravity (Gemini) via el backend
   // cloudcode-pa.googleapis.com:retrieveUserQuota, usando el oauth-token local.
   if (process.env.AI_USAGE_ANTIGRAVITY_LIVE === "0" || config.liveCapture === false) {
@@ -2179,9 +2950,10 @@ function buildOpenCodeQuota(usage, config = {}, server = null) {
   };
 }
 
-async function collectCodexLive(config = {}, { ignoreCache = false } = {}) {
+async function collectCodexLive(config = {}, { ignoreCache = false, account = null } = {}) {
   // Codex moderno ofrece account/rateLimits/read por app-server, sin crear una sesion ni gastar
   // tokens. codex-probe.py conserva el antiguo `codex exec` solo como fallback opt-in.
+  const cachePath = account ? accountCachePath(account, "probe-cache") : CODEX_PROBE_CACHE_PATH;
   if (process.env.AI_USAGE_CODEX_LIVE === "0" || config?.liveUsage === false) {
     return { ok: false, disabled: true, note: "Codex app-server desactivado." };
   }
@@ -2189,40 +2961,43 @@ async function collectCodexLive(config = {}, { ignoreCache = false } = {}) {
   const legacyCacheMinutes = Number(process.env.CODEX_PROBE_CACHE_MINUTES ?? config.probeCacheMinutes ?? 1);
   const cacheSeconds = Number(process.env.CODEX_USAGE_CACHE_SECONDS ?? config.liveUsageCacheSeconds ?? legacyCacheMinutes * 60);
   if (!ignoreCache) {
-    const cached = readJsonCache(CODEX_PROBE_CACHE_PATH, Math.max(0, cacheSeconds) * 1000);
+    const cached = readJsonCache(cachePath, Math.max(0, cacheSeconds) * 1000);
     if (cached) return { ...cached, cacheHit: true };
   }
   const helper = path.join(SCRIPT_DIR, "codex-probe.py");
   if (!existsSync(helper)) return { ok: false, unusable: true, reason: "not-installed", note: "falta codex-probe.py." };
   try {
+    // codex-probe.py hace Popen(...) sin env=, asi que hereda este entorno; CODEX_HOME
+    // llega tanto al app-server como al escaneo de sesiones (que ahora tambien lo respeta).
     const { stdout } = await execFileAsync("python3", [helper], {
       encoding: "utf8",
       maxBuffer: 4 * 1024 * 1024,
       timeout: 35000,
-      env: {
-        ...process.env,
+      env: accountEnv(account, {
         AI_USAGE_LIVE_VERSION: APP_VERSION,
         CODEX_PROBE_TIMEOUT: process.env.CODEX_PROBE_TIMEOUT || "16",
         CODEX_ALLOW_EXEC_PROBE: config.probe === true && process.env.AI_USAGE_CODEX_PROBE !== "0" ? "1" : "0",
-      },
+      }),
     });
     const parsed = JSON.parse(stdout);
     if (parsed?.ok) {
-      writeJsonCache(CODEX_PROBE_CACHE_PATH, parsed);
+      writeJsonCache(cachePath, parsed);
       return parsed;
     }
-    const stale = readJsonSafe(CODEX_PROBE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok) return { ...stale, cacheHit: true, cacheStale: true };
     return parsed || { ok: false };
   } catch (error) {
-    const stale = readJsonSafe(CODEX_PROBE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok) return { ...stale, cacheHit: true, cacheStale: true };
     return { ok: false, note: `codex probe fallo: ${shortError(error)}` };
   }
 }
 
 function collectCodexRateLimits() {
-  const root = path.join(homedir(), ".codex", "sessions");
+  // CODEX_HOME manda: sin esto el fallback de escaneo de sesiones de la cuenta B leeria
+  // los rate_limits de la cuenta A y los reportaria como suyos (bug silencioso).
+  const root = path.join(process.env.CODEX_HOME || path.join(homedir(), ".codex"), "sessions");
   if (!existsSync(root)) return null;
   const files = [];
   walkFiles(root, (file) => {
@@ -2269,14 +3044,17 @@ function collectCodexRateLimits() {
   return results.length === 1 ? results[0] : results;
 }
 
-async function collectClaudeUsageLive(config = {}, { ignoreCache = false } = {}) {
+async function collectClaudeUsageLive(config = {}, { ignoreCache = false, account = null } = {}) {
+  // Sin `account` (modo legacy) el cache y el entorno son EXACTAMENTE los de siempre.
+  const cachePath = account ? accountCachePath(account, "usage-cache") : CLAUDE_USAGE_CACHE_PATH;
+  const childEnv = accountEnv(account);
   if (process.env.AI_USAGE_CLAUDE_LIVE === "0" || config.liveUsage === false) {
     return { source: "claude", ok: false, disabled: true, note: "Claude /usage desactivado." };
   }
 
   const cacheSeconds = Number(config.liveUsageCacheSeconds ?? 300);
   if (!ignoreCache) {
-    const cached = readJsonCache(CLAUDE_USAGE_CACHE_PATH, Math.max(0, cacheSeconds) * 1000);
+    const cached = readJsonCache(cachePath, Math.max(0, cacheSeconds) * 1000);
     if (cached) return { ...cached, cacheHit: true };
   }
 
@@ -2285,10 +3063,17 @@ async function collectClaudeUsageLive(config = {}, { ignoreCache = false } = {})
   }
 
   try {
-    const { stdout } = await execFileAsync("claude", ["-p", "/usage", "--output-format", "json"], {
+    // Quota polling needs authentication but never user/project customizations. Loading the
+    // regular profile here starts channel plugins on every short-lived poll; detached Telegram
+    // and Clawbus Bun workers can then outlive Claude and leak CPU/RAM without bound.
+    const { stdout } = await execFileAsync("claude", ["--safe-mode", "-p", "/usage", "--output-format", "json"], {
       encoding: "utf8",
       maxBuffer: 4 * 1024 * 1024,
       timeout: 30000,
+      // accountEnv() devuelve undefined para la cuenta implicita: mismas opciones que antes.
+      // Con credential.kind="configDir" inyecta CLAUDE_CONFIG_DIR y aisla la credencial
+      // (verificado en claude 2.1.220: una raiz vacia no devuelve barras de uso).
+      ...(childEnv ? { env: childEnv } : {}),
     });
     let resultText = stdout;
     try {
@@ -2298,7 +3083,7 @@ async function collectClaudeUsageLive(config = {}, { ignoreCache = false } = {})
       // Some older builds may print plain text.
     }
     const parsed = parseClaudeUsageOutput(resultText);
-    const stale = readJsonSafe(CLAUDE_USAGE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
 
     // Claude /usage frequently omits the per-window bars when it is called too often (it
     // throttles them). Missing bars do NOT mean the plan is unlimited: every response now
@@ -2327,7 +3112,7 @@ async function collectClaudeUsageLive(config = {}, { ignoreCache = false } = {})
         cacheHit: false,
         note: "Claude no devolvio el uso por ventana; reintenta en unos minutos.",
       };
-      writeJsonCache(CLAUDE_USAGE_CACHE_PATH, output);
+      writeJsonCache(cachePath, output);
       return output;
     }
 
@@ -2339,10 +3124,10 @@ async function collectClaudeUsageLive(config = {}, { ignoreCache = false } = {})
       cacheHit: false,
       note: "Claude /usage detectado.",
     };
-    writeJsonCache(CLAUDE_USAGE_CACHE_PATH, output);
+    writeJsonCache(cachePath, output);
     return output;
   } catch (error) {
-    const stale = readJsonSafe(CLAUDE_USAGE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok) {
       return {
         ...stale,
@@ -2407,14 +3192,15 @@ function claudeWindowLabel(label) {
   return label;
 }
 
-async function collectGeminiQuotaLive(config = {}, { ignoreCache = false } = {}) {
+async function collectGeminiQuotaLive(config = {}, { ignoreCache = false, account = null } = {}) {
+  const cachePath = account ? accountCachePath(account, "quota-cache") : GEMINI_QUOTA_CACHE_PATH;
   if (process.env.AI_USAGE_GEMINI_LIVE === "0" || config.liveCapture === false) {
     return { source: "gemini", ok: false, disabled: true, note: "Gemini /stats model desactivado." };
   }
 
   const cacheMinutes = Number(config.liveCaptureCacheMinutes ?? 15);
   if (!ignoreCache) {
-    const cached = readJsonCache(GEMINI_QUOTA_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
+    const cached = readJsonCache(cachePath, Math.max(0, cacheMinutes) * 60000);
     if (cached) return { ...cached, cacheHit: true };
   }
 
@@ -2433,7 +3219,8 @@ async function collectGeminiQuotaLive(config = {}, { ignoreCache = false } = {})
       encoding: "utf8",
       maxBuffer: 4 * 1024 * 1024,
       timeout: (timeoutSeconds + 5) * 1000,
-      env: { ...process.env, AI_USAGE_GEMINI_TIMEOUT: String(timeoutSeconds) },
+      // gemini-quota-capture.py hace os.environ.copy(), asi que GEMINI_CLI_HOME se propaga.
+      env: accountEnv(account, { AI_USAGE_GEMINI_TIMEOUT: String(timeoutSeconds) }),
     });
     const parsed = JSON.parse(stdout);
     const output = {
@@ -2443,11 +3230,11 @@ async function collectGeminiQuotaLive(config = {}, { ignoreCache = false } = {})
       cacheHit: false,
     };
     if (output.ok) {
-      writeJsonCache(GEMINI_QUOTA_CACHE_PATH, output);
+      writeJsonCache(cachePath, output);
       return output;
     }
     if (output.needsAuth || output.authError) return output;
-    const stale = readJsonSafe(GEMINI_QUOTA_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok) {
       return {
         ...stale,
@@ -2458,7 +3245,7 @@ async function collectGeminiQuotaLive(config = {}, { ignoreCache = false } = {})
     }
     return output;
   } catch (error) {
-    const stale = readJsonSafe(GEMINI_QUOTA_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok) {
       return {
         ...stale,
@@ -2471,22 +3258,32 @@ async function collectGeminiQuotaLive(config = {}, { ignoreCache = false } = {})
   }
 }
 
-async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false } = {}) {
+async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false, account = null } = {}) {
   const config = quotaConfig || loadQuotaConfig();
-  const configEntry = config?.minimax || {};
-  const keyFromEnv = process.env.MINIMAX_API_KEY || "";
-  const keyFromFile = configEntry.apiKey || "";
+  const configEntry = account?.config || config?.minimax || {};
+  const cachePath = account ? accountCachePath(account, "usage-cache") : MINIMAX_USAGE_CACHE_PATH;
+  // Con credential.kind="env" la key sale de la env var declarada por la cuenta y se lee
+  // SOLO aqui, al construir el header. Sin cuenta (legacy) el orden env-primero es el de
+  // siempre. En ningun caso el valor sale al output, a los logs ni al TUI.
+  const credentialKind = account?.credential?.kind || "legacy";
+  const keyFromEnv = credentialKind === "env"
+    ? (process.env[account.credential.var] || "")
+    : (process.env.MINIMAX_API_KEY || "");
+  const keyFromFile = credentialKind === "env" ? "" : (configEntry.apiKey || "");
   const apiKey = keyFromEnv || keyFromFile;
+  const keySourceLabel = credentialKind === "env"
+    ? `env:${account.credential.var}`
+    : keyFromEnv ? "env" : keyFromFile ? "quotas.json" : "none";
   const debug = process.env.AI_USAGE_MINIMAX_DEBUG === "1";
   const liveDisabled = process.env.AI_USAGE_MINIMAX_LIVE === "0" || configEntry.liveCapture === false;
   const cacheMinutes = Number(process.env.MINIMAX_USAGE_CACHE_MINUTES ?? configEntry.liveCaptureCacheMinutes ?? 0);
-  const cached = readJsonCache(MINIMAX_USAGE_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
+  const cached = readJsonCache(cachePath, Math.max(0, cacheMinutes) * 60000);
   if (cached && (!ignoreCache || liveDisabled)) {
     if (debug) process.stderr.write(`[minimax] cache hit (age < ${cacheMinutes}m)\n`);
     return { ...cached, cacheHit: true };
   }
   if (liveDisabled) {
-    const stale = readJsonSafe(MINIMAX_USAGE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok) {
       return {
         ...stale,
@@ -2499,7 +3296,7 @@ async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false } =
   }
 
   if (debug) {
-    process.stderr.write(`[minimax] key source: ${keyFromEnv ? "env" : keyFromFile ? "quotas.json" : "none"} (${apiKey ? "present" : "empty"})\n`);
+    process.stderr.write(`[minimax] key source: ${keySourceLabel} (${apiKey ? "present" : "empty"})\n`);
   }
   if (!apiKey) {
     return {
@@ -2539,7 +3336,7 @@ async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false } =
     const baseResp = data?.base_resp || {};
     if (baseResp.status_code && baseResp.status_code !== 0 && baseResp.status_code !== 200) {
       const msg = baseResp.status_msg || `status_code ${baseResp.status_code}`;
-      const stale = readJsonSafe(MINIMAX_USAGE_CACHE_PATH);
+      const stale = readJsonSafe(cachePath);
       if (stale?.ok) {
         return {
           ...stale,
@@ -2568,10 +3365,10 @@ async function collectMiniMaxUsage(quotaConfig = null, { ignoreCache = false } =
       capturedAt: new Date().toISOString(),
       cacheHit: false,
     };
-    writeJsonCache(MINIMAX_USAGE_CACHE_PATH, output);
+    writeJsonCache(cachePath, output);
     return output;
   } catch (error) {
-    const stale = readJsonSafe(MINIMAX_USAGE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok) {
       return {
         ...stale,
@@ -2801,18 +3598,19 @@ async function collectOpenCodeServerUsage(config = {}, { ignoreCache = false } =
   }
 }
 
-async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } = {}) {
+async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false, account = null } = {}) {
   const config = quotaConfig || loadQuotaConfig();
-  const configEntry = config?.opencode || {};
+  const configEntry = account?.config || config?.opencode || {};
+  const cachePath = account ? accountCachePath(account, "usage-cache") : OPENCODE_USAGE_CACHE_PATH;
   const liveDisabled = process.env.AI_USAGE_OPENCODE_LIVE === "0" || configEntry.liveCapture === false;
   const cacheMinutes = Number(process.env.OPENCODE_USAGE_CACHE_MINUTES ?? configEntry.liveCaptureCacheMinutes ?? 5);
   const usageRangeKey = `${state.view}|${state.since || ""}|${state.until || ""}`;
-  const cached = readJsonCache(OPENCODE_USAGE_CACHE_PATH, Math.max(0, cacheMinutes) * 60000);
+  const cached = readJsonCache(cachePath, Math.max(0, cacheMinutes) * 60000);
   if (cached?.usageRangeKey === usageRangeKey && (!ignoreCache || liveDisabled)) {
     return { ...cached, cacheHit: true };
   }
   if (liveDisabled) {
-    const stale = readJsonSafe(OPENCODE_USAGE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok && stale.usageRangeKey === usageRangeKey) {
       return { ...stale, cacheHit: true, cacheStale: true, note: "OpenCode Go DB desactivado; usando cache local." };
     }
@@ -2971,10 +3769,10 @@ async function collectOpenCodeUsage(quotaConfig = null, { ignoreCache = false } 
       cacheHit: false,
       note: "Estimado local (opencode.db). Para valores exactos ve a opencode.ai/auth.",
     };
-    writeJsonCache(OPENCODE_USAGE_CACHE_PATH, output);
+    writeJsonCache(cachePath, output);
     return output;
   } catch (error) {
-    const stale = readJsonSafe(OPENCODE_USAGE_CACHE_PATH);
+    const stale = readJsonSafe(cachePath);
     if (stale?.ok && stale.usageRangeKey === usageRangeKey) {
       return { ...stale, cacheHit: true, cacheStale: true, note: `OpenCode Go DB fallo; usando cache anterior (${shortError(error)}).` };
     }
@@ -3150,7 +3948,7 @@ function handleKey(key) {
   else if (key === "c") setSource("claude");
   else if (key === "x") setSource("codex");
   else if (key === "g") setSource("gemini");
-  else if (key === "v") setSource("antigravity");
+  else if (key === "v") setSource("gemini"); // alias historico de Antigravity
   else if (key === "m") setSource("minimax");
   else if (key === "o") setSource("opencode");
   else if (key === "h") onHideToggle();
@@ -3321,7 +4119,7 @@ function render() {
 function draw(width, height) {
   const snap = state.lastSnapshot;
   const lines = [];
-  const title = `${colors.bold}${colors.cyan}AI Usage TUI${RESET} ${colors.gray}ccusage + Antigravity monitor${RESET}`;
+  const title = `${colors.bold}${colors.cyan}AI Usage TUI${RESET} ${colors.gray}ccusage + Agy quota monitor${RESET}`;
   lines.push(padLine(title, width));
   lines.push(
     padLine(
@@ -3378,7 +4176,7 @@ function drawQuotaGrid(width, maxHeight, quotas, order, selected) {
   const cols = Math.max(1, Math.floor((width + gap) / (targetW + gap)));
   const cardW = Math.max(30, Math.floor((width - (cols - 1) * gap) / cols));
 
-  const hiddenCount = displayConfig.hiddenProviders.length;
+  const hiddenCount = displayConfig.hiddenProviders.filter((provider) => PROVIDER_ORDER.includes(provider)).length;
   const footer = hiddenCount > 0
     ? `${colors.gray}oculto: ${hiddenCount} · h gestiona · H ${state.revealHidden ? "vuelve a ocultar" : "revela"}${RESET}`
     : null;
@@ -3415,6 +4213,12 @@ function drawQuotaGrid(width, maxHeight, quotas, order, selected) {
   return out;
 }
 
+// Multi-account providers need enough rows to identify every account. Keeping only three
+// silently hid the fourth account even though its quota had been collected successfully.
+function maxCardRows(quota) {
+  return quota?.accounts ? 4 : 3;
+}
+
 function renderQuotaCard(cardW, provider, quota, selected, hidden = false) {
   const meta = PROVIDER_META[provider] || { label: provider, color: colors.gray, icon: "?" };
   const inner = Math.max(4, cardW - 2);
@@ -3438,12 +4242,22 @@ function renderQuotaCard(cardW, provider, quota, selected, hidden = false) {
     const note = truncate(String(quota?.note || "sin datos"), Math.max(0, inner - 2));
     lines.push(bodyLine(` ${note} `));
   } else {
-    const labelW = 8;
     const pctMax = 5;
+    const shown = windows.filter((w) => !w.available).slice(0, maxCardRows(quota));
+    // Primero se identifica la cuenta y despues se dibuja la barra. Antes el nombre tenia
+    // apenas 8 columnas ("steven7.", "stevenv."), mientras la barra absorbia todo el resto.
+    // Reservamos el ancho natural del nombre cuando cabe; la barra usa TODO el espacio que
+    // queda despues de nombre y porcentaje, sin un tope fijo que deje media tarjeta vacia.
+    const naturalLabelW = Math.max(0, ...shown.map((w) => visibleLength(String(w.label || w.key || ""))));
+    const maxLabelW = Math.max(8, inner - pctMax - 4 - 5);
+    const labelW = Math.min(18, maxLabelW, Math.max(10, naturalLabelW));
     const barW = Math.max(5, inner - (labelW + pctMax + 4));
-    const shown = windows.filter((w) => !w.available).slice(0, 3);
     for (const w of shown) {
       const label = truncate(String(w.label || w.key || ""), labelW).padEnd(labelW);
+      if (w.remainingPercent === null || w.remainingPercent === undefined) {
+        lines.push(bodyLine(` ${label} ?  ${colors.gray}${truncate(String(w.status || "sin dato"), Math.max(6, barW + pctMax - 3))}${RESET} `));
+        continue;
+      }
       const pct = fmtPct(w.usedPercent);
       const bar = blockBar(w.usedPercent, barW, quotaColor(Number(w.remainingPercent)));
       const content = ` ${label} ${bar} ${pct.padStart(pctMax)} `;
@@ -3477,7 +4291,8 @@ function renderQuotaCard(cardW, provider, quota, selected, hidden = false) {
     const family = windows.find((w) => w.family)?.family;
     if (family) tag = ` [${family}]`;
   }
-  const more = windows.length > 3 ? ` +${windows.length - 3} \u21B5` : "";
+  const rowCap = maxCardRows(quota);
+  const more = windows.length > rowCap ? ` +${windows.length - rowCap} \u21B5` : "";
   const limitTag = quota?.limited ? ` [LIMITE${quota.limitedRetry ? ` ${quota.limitedRetry}` : ""}]` : "";
   const staleTag = quota?.stale ? " [viejo]" : "";
   const footContent = ` \u21BB ${cdText}${tag}${limitTag}${staleTag}${more} `;
@@ -3697,7 +4512,7 @@ function drawConsumoTab(width, maxHeight, snap) {
   lines.push(...sourceCards(width, snap));
   lines.push(hr(width));
 
-  if (state.source === "antigravity") {
+  if (state.source === "gemini") {
     lines.push(...antigravityPanel(width, snap.sources.antigravity));
   } else if (state.source === "minimax") {
     lines.push(...minimaxPanel(width, snap.sources.minimax, snap.quotas?.minimax));
@@ -3726,11 +4541,11 @@ function summaryCards(width, total, snap) {
 }
 
 function sourceCards(width, snap) {
-  const sources = ["claude", "codex", "gemini", "antigravity", "minimax", "opencode"];
+  const sources = ["claude", "codex", "gemini", "minimax", "opencode"];
   const max = Math.max(
     1,
     ...sources.map((source) => {
-      if (source === "antigravity") return snap.sources.antigravity?.modelSteps || 0;
+      if (source === "gemini") return snap.sources.antigravity?.modelSteps || 0;
       if (source === "opencode") return snap.sources.opencode?.data?.totalCost || 0;
       const totals = snap.sources[source]?.totals;
       return totals?.effectiveTokens ?? totals?.totalTokens ?? 0;
@@ -3740,10 +4555,10 @@ function sourceCards(width, snap) {
   const cardWidth = Math.max(18, Math.floor((width - gapWidth) / sources.length));
   const cards = sources.map((source) => {
     const meta = SOURCE_META[source];
-    if (source === "antigravity") {
+    if (source === "gemini") {
       const ag = snap.sources.antigravity;
       const body = [
-        `${ag.installed ? "instalado" : "no instalado"} | ${ag.sessions} sesiones`,
+        `${ag.installed ? "Agy OAuth" : "Agy no instalado"} | ${ag.sessions} sesiones`,
         bar(ag.modelSteps, max, cardWidth - 4, colors.yellow),
         `${fmtInt(ag.modelSteps)} pasos modelo`,
       ];
@@ -4084,6 +4899,7 @@ function visibleSources() {
   const snap = state.lastSnapshot;
   if (!snap) return [];
   if (state.source === "all") return ALL_SOURCES.map((source) => snap.sources[source]).filter(Boolean);
+  if (state.source === "gemini") return [snap.sources.antigravity].filter(Boolean);
   return [snap.sources[state.source]].filter(Boolean);
 }
 
@@ -4091,6 +4907,7 @@ function visibleModels() {
   const snap = state.lastSnapshot;
   if (!snap) return [];
   if (state.source === "all") return snap.sources.all?.models ?? [];
+  if (state.source === "gemini") return snap.sources.antigravity?.models ?? [];
   return snap.sources[state.source]?.models ?? [];
 }
 
@@ -4466,7 +5283,7 @@ function buildAgentQuotaSummary(snap) {
         resetInSeconds: Number.isFinite(resetMs) ? Math.max(0, Math.round((resetMs - nowMs) / 1000)) : null,
         resetAt: Number.isFinite(resetMs) ? new Date(resetMs).toISOString() : null,
       };
-      for (const key of ["key", "rawLabel", "limitId", "sourceWindow", "windowType", "model", "limitText", "usedText"]) {
+      for (const key of ["key", "rawLabel", "limitId", "sourceWindow", "windowType", "model", "limitText", "usedText", "accountId"]) {
         if (w[key] !== undefined && w[key] !== null && w[key] !== "") entry[key] = w[key];
       }
       if (typeof w.status === "string" && w.status) entry.status = w.status;
@@ -4555,6 +5372,41 @@ function buildAgentQuotaSummary(snap) {
         balance: credit.balance == null ? null : String(credit.balance),
       }));
     }
+    // Multi-cuenta: SOLO se emite cuando hay mas de una cuenta resuelta para el
+    // proveedor (foldProviderAccounts las agrega en `quota.accounts` desde v-multiaccount).
+    // Con 0 o 1 cuenta (el 100% del parque hoy, sin `accounts[]` en quotas.json) estos
+    // campos quedan ausentes y el output es identico al de antes de esta funcionalidad:
+    // el hook (min(remainingPercent) sobre providers[p].windows) y cualquier otro
+    // consumidor viejo siguen funcionando sin cambios.
+    if (Number(quota.accountCount) > 1 && Array.isArray(quota.accounts)) {
+      providerEntry.accountCount = quota.accountCount;
+      if (quota.selectedAccountId) providerEntry.selectedAccountId = quota.selectedAccountId;
+      providerEntry.accounts = quota.accounts.map((entry) => {
+        const accountQuota = entry.quota || {};
+        const item = {
+          id: entry.accountId,
+          label: entry.label || entry.accountId,
+          blocked: Boolean(entry.blocked),
+          healthStatus: entry.healthStatus || null,
+          ok: accountQuota.ok !== false,
+          available: Boolean(accountQuota.available),
+        };
+        const remaining = finiteNumberOrNull(accountQuota.effectiveRemainingPercent);
+        if (remaining !== null) item.effectiveRemainingPercent = agentRound(remaining);
+        if (Array.isArray(accountQuota.availableGroups) && accountQuota.availableGroups.length) {
+          item.availableGroups = accountQuota.availableGroups;
+        }
+        if (Array.isArray(accountQuota.limitingGroups) && accountQuota.limitingGroups.length) {
+          item.limitingGroups = accountQuota.limitingGroups;
+        }
+        return item;
+      });
+    }
+    // Errores de configuracion de cuentas (id duplicado, credencial invalida, proveedor
+    // sin soporte multi-cuenta, etc.) — nunca credenciales, solo texto diagnostico.
+    if (Array.isArray(quota.configErrors) && quota.configErrors.length) {
+      providerEntry.configErrors = quota.configErrors;
+    }
     out.providers[provider] = providerEntry;
   }
   return out;
@@ -4616,4 +5468,25 @@ export {
   fmtMoney,
   fmtInt,
   fmtCompact,
+  resolveAccounts,
+  resolveAllAccounts,
+  foldProviderAccounts,
+  aggregateAccountQuotas,
+  selectAccountEntry,
+  buildQuotaState,
+  collectProviderAccountsLive,
+  accountCachePath,
+  accountEnv,
+  inspectAccountCredential,
+  DEFAULT_ACCOUNT_ID,
 };
+
+// Arranque real: recien aca, al final del modulo (ver comentario junto a INVOKED_DIRECTLY
+// mas arriba), TODAS las const de nivel de modulo ya estan inicializadas.
+if (INVOKED_DIRECTLY) {
+  main().catch((error) => {
+    cleanup();
+    console.error(error?.stack || String(error));
+    process.exit(1);
+  });
+}
