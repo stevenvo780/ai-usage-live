@@ -20,6 +20,9 @@ install -m 0755 "$ROOT/ai-usage-mcp.mjs" "$BUILD_DIR/opt/ai-usage-live/ai-usage-
 install -m 0755 "$ROOT/gemini-quota-capture.py" "$BUILD_DIR/opt/ai-usage-live/gemini-quota-capture.py"
 install -m 0755 "$ROOT/antigravity-usage-capture.py" "$BUILD_DIR/opt/ai-usage-live/antigravity-usage-capture.py"
 install -m 0755 "$ROOT/codex-probe.py" "$BUILD_DIR/opt/ai-usage-live/codex-probe.py"
+# El renderizador vivia SOLO fuera del repo (~/.local/share/ai-usage-live/), asi
+# que cada maquina tenia su copia y divergian sin que nadie lo notara.
+install -m 0755 "$ROOT/ai-usage-context.py" "$BUILD_DIR/opt/ai-usage-live/ai-usage-context.py"
 install -m 0644 "$ROOT/package.json" "$BUILD_DIR/opt/ai-usage-live/package.json"
 install -m 0755 "$ROOT/ai-usage.sh" "$BUILD_DIR/opt/ai-usage-live/ai-usage.sh"
 install -m 0755 "$ROOT/ai-usage-quota" "$BUILD_DIR/opt/ai-usage-live/ai-usage-quota"

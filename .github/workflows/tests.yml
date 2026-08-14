@@ -1,0 +1,47 @@
+name: tests
+
+# Este repo tenia 6 ficheros de test y CERO workflows: nada los corria.
+#
+# Nota para quien venga de los repos privados de la cuenta: alli Actions muere en
+# `startup_failure` por facturacion (100% de los runs desde 2026-05-11). Este
+# repo es PUBLICO, y en los publicos si arranca — por eso este workflow puede ser
+# una puerta de verdad y no decorativa.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: tests de python (sin dependencias)
+        run: |
+          set -e
+          for t in test-codex-probe.py test-antigravity-parse.py \
+                   test-gemini-parse.py test-tui.py test-render-frescura.py; do
+            echo "::group::$t"
+            python3 "$t"
+            echo "::endgroup::"
+          done
+
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: tests de node (sin dependencias)
+        run: |
+          set -e
+          for t in test-units.mjs test-mcp.mjs; do
+            echo "::group::$t"
+            node "$t"
+            echo "::endgroup::"
+          done
