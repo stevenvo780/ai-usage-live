@@ -1,0 +1,72 @@
+name: tests
+
+# Este repo tenia 6 ficheros de test y CERO workflows: nada los corria.
+#
+# ☠️ AVISO: HOY ESTE WORKFLOW NO PUEDE PASAR, Y NO ES POR LOS TESTS.
+# La cuenta esta bloqueada por facturacion y GitHub ni siquiera arranca el job:
+#   "The job was not started because your account is locked due to a billing issue."
+# El job sale en rojo con CERO steps ejecutados y en ~3 segundos. Si ves este
+# check en rojo, mira si tiene steps antes de buscar el fallo en el codigo.
+#
+# Que el bloqueo es de la CUENTA ENTERA (no solo de los repos privados) ya estaba
+# medido antes con una sonda: repo nuevo, workflow de 7 lineas, volteado a
+# publico y tambien bloqueado. Esto solo lo reconfirma en un repo publico real.
+#
+# Lo que si quedaba sin explicar: yo citaba "8 exitos en repos publicos" como
+# prueba de que la variable era la VISIBILIDAD. No lo era. El control que lo
+# cierra esta dentro de UN MISMO repo publico (creador-imagenes-de-marca):
+# "Graph Update: pip in ..." sale en verde (lo corre la infraestructura de
+# GitHub, no gasta minutos) y "eikon-gates" sale en rojo 41 veces (necesita un
+# runner facturable). Mismo repo y mismo periodo => la variable es si el job
+# necesita RUNNER. Los "exitos publicos" eran todos de ese tipo no facturable.
+#
+# => NINGUN repo de la cuenta tiene CI ahora mismo, publico o privado. Este
+# fichero queda listo para ser la puerta el dia que se desbloquee la cuenta;
+# mientras tanto la unica puerta real es correr la suite a mano.
+# Verificado en local, con la misma secuencia de abajo: 7/7 en verde.
+# DISPARADOR MANUAL A PROPOSITO, mientras dure el bloqueo de facturacion.
+# Con `push`/`pull_request` este workflow pondria un check ROJO en cada push y en
+# cada PR sin haber ejecutado un solo test, y un rojo que no significa "fallo"
+# ensena a leer el rojo como ruido: el dia que haya un fallo de verdad, se tapa.
+# PARA REACTIVARLO el dia que la cuenta se desbloquee, descomentar las 3 lineas:
+# on:
+#   push:
+#     branches: [main]
+#   pull_request:
+#   workflow_dispatch:
+on:
+  workflow_dispatch:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: tests de python (sin dependencias)
+        run: |
+          set -e
+          for t in test-codex-probe.py test-antigravity-parse.py \
+                   test-gemini-parse.py test-tui.py test-render-frescura.py; do
+            echo "::group::$t"
+            python3 "$t"
+            echo "::endgroup::"
+          done
+
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: tests de node (sin dependencias)
+        run: |
+          set -e
+          for t in test-units.mjs test-mcp.mjs; do
+            echo "::group::$t"
+            node "$t"
+            echo "::endgroup::"
+          done
