@@ -2,10 +2,24 @@ name: tests
 
 # Este repo tenia 6 ficheros de test y CERO workflows: nada los corria.
 #
-# Nota para quien venga de los repos privados de la cuenta: alli Actions muere en
-# `startup_failure` por facturacion (100% de los runs desde 2026-05-11). Este
-# repo es PUBLICO, y en los publicos si arranca — por eso este workflow puede ser
-# una puerta de verdad y no decorativa.
+# ☠️ AVISO: HOY ESTE WORKFLOW NO PUEDE PASAR, Y NO ES POR LOS TESTS.
+# La cuenta esta bloqueada por facturacion y GitHub ni siquiera arranca el job:
+#   "The job was not started because your account is locked due to a billing issue."
+# El job sale en rojo con CERO steps ejecutados y en ~3 segundos. Si ves este
+# check en rojo, mira si tiene steps antes de buscar el fallo en el codigo.
+#
+# Yo mismo tenia mal la causa: creia que el corte dependia de si el repo era
+# PRIVADO. Es falso, y este workflow es la refutacion — este repo es PUBLICO y
+# tambien lo bloquean. El control que lo cierra es dentro de UN MISMO repo
+# publico (creador-imagenes-de-marca): "Graph Update: pip in ..." sale en verde
+# (lo corre la infraestructura de GitHub, no gasta minutos) y "eikon-gates" sale
+# en rojo 41 veces (necesita un runner facturable). La variable no es la
+# visibilidad: es si el job necesita RUNNER.
+#
+# => NINGUN repo de la cuenta tiene CI ahora mismo, publico o privado. Este
+# fichero queda listo para ser la puerta el dia que se desbloquee la cuenta;
+# mientras tanto la unica puerta real es correr la suite a mano.
+# Verificado en local, con la misma secuencia de abajo: 7/7 en verde.
 on:
   push:
     branches: [main]
