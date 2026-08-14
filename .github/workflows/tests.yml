@@ -24,10 +24,17 @@ name: tests
 # fichero queda listo para ser la puerta el dia que se desbloquee la cuenta;
 # mientras tanto la unica puerta real es correr la suite a mano.
 # Verificado en local, con la misma secuencia de abajo: 7/7 en verde.
+# DISPARADOR MANUAL A PROPOSITO, mientras dure el bloqueo de facturacion.
+# Con `push`/`pull_request` este workflow pondria un check ROJO en cada push y en
+# cada PR sin haber ejecutado un solo test, y un rojo que no significa "fallo"
+# ensena a leer el rojo como ruido: el dia que haya un fallo de verdad, se tapa.
+# PARA REACTIVARLO el dia que la cuenta se desbloquee, descomentar las 3 lineas:
+# on:
+#   push:
+#     branches: [main]
+#   pull_request:
+#   workflow_dispatch:
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 jobs:
